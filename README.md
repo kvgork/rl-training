@@ -30,11 +30,23 @@ conda-solved version): `setuptools<82`, `packaging<26`, `opencv<4.14`, `gymnasiu
 `[tool.pixi.system-requirements] cuda = "12"` so the `default` (gpu) environment locks on a host
 without a driver. After H1 (driver restored) re-pin `cuda-version` to the driver's CUDA.
 
-## Entry points
-
-`pixi task list` shows all tasks; tasks pointing at modules that later units create fail until then.
 
 Environments: `default` (sim+perception+train+gpu; locked but not installable while the driver is down),
 `cpu` (same with the CPU torch build; used for acceptance) and `robot` (perception + CPU torch, for the
 servo host process; it needs the `cpu` feature because the default conda `pytorch` solve otherwise
 picks a CUDA build that requires `__cuda`).
+
+Spike verdict for TD-MPC2 (vendored at `nicklashansen/tdmpc2` `e9f5932`, patched by
+`scripts/vendor_tdmpc2.py`): the state smoke train runs on CPU with the versions above
+(`pixi run -e cpu smoke-tdmpc2 --steps 1000 --device cpu`, about 2 minutes). Two upstream assumptions
+break on torch 2.11 and are patched (see `src/so101_rl/_vendor/tdmpc2/PATCHES.md`): hard-coded
+`cuda:0` devices and moving the meta-device Q-function template with `Module.to()`.
+
+## Entry points
+
+- `pixi run -e cpu test` runs the suite without hardware or GPU; `pixi run -e cpu ci` adds lint.
+- `pixi run -e cpu fetch-assets` / `extract-kinematics` regenerate `assets/so101/upstream/` and
+  `src/so101_rl/config/so101_kinematics.yaml` (pinned commit in `assets/so101/UPSTREAM.json`).
+- `pixi run -e cpu smoke-tdmpc2` state-only TD-MPC2 smoke train on the toy env.
+
+`pixi task list` shows all tasks; tasks pointing at modules that later units create fail until then.
