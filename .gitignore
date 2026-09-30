@@ -1,0 +1,18 @@
+# pixi
+.pixi/
+# pipeline state
+.agent-state/
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+# data / runs
+data/
+runs/
+checkpoints/
+wandb/
+*.hdf5
