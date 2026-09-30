@@ -8,13 +8,17 @@ strictly increasing (by 2 per write) when stable, 0 = never written. A repeated 
 record". The CRC32 covers every byte between ``seq`` and the ``crc32`` field, so torn-read detection does not
 depend on store ordering.
 
-NOTE: the plan (F3) asserts ``STATE_DTYPE.itemsize == 192``; the listed fields sum to 232 bytes with natural
-alignment. The fields are kept exactly as specified and the block stride is 256 (64-byte aligned).
+NOTE: ``STATE_DTYPE.itemsize == 232`` (the plan's F3 now says so too; it originally asserted 192, which the
+listed fields cannot fit with natural alignment). The block stride is 256 (64-byte aligned).
+
+Creation order: the creator fills version/sizes first and writes ``magic`` LAST, so an attacher that races the
+creator sees magic == 0 ("not ready") instead of a half-written header.
 """
 
 from __future__ import annotations
 
 import multiprocessing.resource_tracker as _rt
+import threading
 import zlib
 from enum import IntEnum
 from multiprocessing import shared_memory
@@ -195,18 +199,22 @@ class _Blocks:
         return self._state.last_seq
 
 
+_RT_LOCK = threading.Lock()  # serialises the temporary monkeypatch of resource_tracker.register
+
+
 def _attach_untracked(name: str) -> shared_memory.SharedMemory:
     """Attach without registering with the resource tracker (py3.12 has no ``track=False``).
 
     Registering and later unregistering would make the tracker unlink the servo-owned segment when a
     policy process exits, or raise KeyError noise when the tracker is shared with the creator.
     """
-    original = _rt.register
-    _rt.register = lambda *_args, **_kwargs: None  # type: ignore[assignment]
-    try:
-        return shared_memory.SharedMemory(name=name)
-    finally:
-        _rt.register = original
+    with _RT_LOCK:  # two threads attaching concurrently must not capture the no-op as "original"
+        original = _rt.register
+        _rt.register = lambda *_args, **_kwargs: None  # type: ignore[assignment]
+        try:
+            return shared_memory.SharedMemory(name=name)
+        finally:
+            _rt.register = original
 
 
 class ServoShm(_Blocks):
@@ -229,10 +237,10 @@ class ServoShm(_Blocks):
             stale.unlink()
             shm = shared_memory.SharedMemory(name=name, create=True, size=TOTAL_SIZE)
         header = np.frombuffer(shm.buf, dtype=HEADER_DTYPE, count=1)
-        header["magic"] = SHM_MAGIC
         header["version"] = SHM_LAYOUT_VERSION
         header["cmd_size"] = CMD_SIZE
         header["state_size"] = STATE_SIZE
+        header["magic"] = SHM_MAGIC  # last: publishes the header to racing attachers
         del header
         return cls(shm, owner=True)
 
@@ -244,16 +252,23 @@ class ServoShm(_Blocks):
             if shm.size < TOTAL_SIZE:
                 raise RuntimeError(f"shm {name!r}: segment is {shm.size} B, expected >= {TOTAL_SIZE}")
             header = np.frombuffer(shm.buf, dtype=HEADER_DTYPE, count=1).copy()
-            if int(header["magic"][0]) != SHM_MAGIC:
-                raise RuntimeError(f"shm {name!r}: bad magic {int(header['magic'][0]):#x}")
+            magic = int(header["magic"][0])
+            if magic == 0:
+                raise RuntimeError(f"shm {name!r}: not ready (bad magic 0x0: creator has not finished the header)")
+            if magic != SHM_MAGIC:
+                raise RuntimeError(f"shm {name!r}: bad magic {magic:#x}")
             if int(header["version"][0]) != SHM_LAYOUT_VERSION:
                 raise RuntimeError(f"shm {name!r}: layout version {int(header['version'][0])} != {SHM_LAYOUT_VERSION}")
             if int(header["cmd_size"][0]) != CMD_SIZE or int(header["state_size"][0]) != STATE_SIZE:
                 raise RuntimeError(f"shm {name!r}: record sizes differ from this build")
-        except RuntimeError:
-            shm.close()
+            return cls(shm, owner=False)
+        except BaseException:
+            # Any failure (validation, view construction, KeyboardInterrupt) must not leak the mapping.
+            try:
+                shm.close()
+            except BufferError:
+                pass
             raise
-        return cls(shm, owner=False)
 
     def close(self) -> None:
         if self._closed:

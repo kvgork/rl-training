@@ -1,3 +1,8 @@
+import ast
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 
 from so101_rl.safety.types import RESUME_BY_CAUSE, ResumePolicy, SmState, TripCause, Verdict
@@ -34,14 +39,49 @@ def test_verdict_dtypes():
     assert Verdict().target_ticks is not v.target_ticks  # no shared default arrays
 
 
-def test_safety_does_not_import_rl_wm_env():
-    import subprocess
-    import sys
+SAFETY_DIR = Path(__file__).parent.parent / "src" / "so101_rl" / "safety"
+FORBIDDEN = ("so101_rl.rl", "so101_rl.wm", "so101_rl.env")
 
+
+def _safety_modules() -> list[str]:
+    mods = []
+    for path in sorted(SAFETY_DIR.rglob("*.py")):
+        rel = path.relative_to(SAFETY_DIR).with_suffix("")
+        parts = rel.parts[:-1] if rel.name == "__init__" else rel.parts
+        mods.append(".".join(("so101_rl", "safety", *parts)))
+    return mods
+
+
+def test_safety_module_walk_finds_modules():
+    assert "so101_rl.safety" in _safety_modules() and "so101_rl.safety.types" in _safety_modules()
+
+
+def test_safety_does_not_import_rl_wm_env():
+    """Import EVERY safety module (present and future) in a fresh interpreter and check sys.modules."""
+    mods = _safety_modules()
     code = (
-        "import sys, so101_rl.safety, so101_rl.safety.types; "
-        "bad = [m for m in sys.modules if m.startswith(('so101_rl.rl', 'so101_rl.wm', 'so101_rl.env'))]; "
-        "assert not bad, bad"
+        "import importlib, sys\n"
+        f"for m in {mods!r}: importlib.import_module(m)\n"
+        f"bad = [m for m in sys.modules if m.startswith({FORBIDDEN!r})]\n"
+        "assert not bad, bad\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False)
     assert out.returncode == 0, out.stderr
+
+
+def test_safety_sources_have_no_forbidden_import_statements():
+    """Static check too: catches lazy imports inside functions that a plain import would not execute."""
+    bad = []
+    for path in sorted(SAFETY_DIR.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = "." * node.level + (node.module or "")
+                names = [base] + [f"{base}.{a.name}" for a in node.names]
+            for n in names:
+                stripped = n.lstrip(".")
+                if stripped.startswith(FORBIDDEN) or stripped.split(".")[0] in ("rl", "wm", "env"):
+                    bad.append(f"{path.name}: {n}")
+    assert not bad, bad

@@ -1,6 +1,5 @@
 import time
 
-import numpy as np
 import pytest
 
 from so101_rl.servo.timing import FakeClock, RealClock, TickStats
@@ -45,10 +44,16 @@ def test_tick_stats_percentiles_known_distribution():
 
 def test_tick_stats_overruns_and_ring_wrap():
     stats = TickStats(period_ns=1_000, capacity=8)
-    for _ in range(20):
-        stats.record(0, 2_000)  # each duration exceeds the period
+    stats.record(500_000_000, 900_000_000)  # spike: must be evicted from the percentile ring ...
+    for i in range(1, 20):  # ... by 19 more samples; only the last 8 (i = 12..19) stay
+        stats.record(i * 1_000_000, i * 1_000_000)  # distinct values, each duration exceeds the period
     assert stats.overruns == 20 and stats.samples == 20
-    assert stats.duration_p99_ms == pytest.approx(0.002)  # only the last 8 remain in the ring
+    # ring holds 12..19 ms: a non-wrapping implementation would see the 500 ms spike and 1..11 ms
+    assert stats.p50_ms == pytest.approx(15.5)
+    assert stats.p99_ms == pytest.approx(12 + 0.99 * 7)
+    assert stats.duration_p99_ms == pytest.approx(12 + 0.99 * 7)
+    # max is a running max over every sample, so it still remembers the evicted spike
+    assert stats.max_ms == 500.0 and stats.duration_max_ms == 900.0
     assert stats.summary()["overruns"] == 20
 
 
@@ -63,6 +68,11 @@ def test_real_clock_sleeps_until_deadline():
     c.sleep_until(t)
     now = c.monotonic_ns()
     assert now >= t
-    assert now - t < 5_000_000
-    c.sleep_until(now - 1)  # past deadline returns immediately
-    assert isinstance(np.int64(c.monotonic_ns()), np.int64)
+    # Upper bound is only a sanity check against sleeping far too long; scheduler noise on a loaded CI host
+    # can exceed a few ms, so it is deliberately generous (the real jitter budget is measured by H2).
+    assert now - t < 250_000_000
+    before = c.monotonic_ns()
+    c.sleep_until(before - 1)  # past deadline returns immediately, never sleeps a period
+    assert c.monotonic_ns() - before < 250_000_000
+    assert isinstance(c.monotonic_ns(), int)
+    assert c.monotonic_ns() >= now  # monotonic

@@ -24,8 +24,10 @@ JOINT_NAMES: Final[tuple[str, ...]] = (
 )
 N_JOINTS: Final[int] = 6
 
-# LeRobot homes every joint so that the middle of its range of motion reads 2047 (post-homing-offset).
-# The MJCF (so101_new_calib.xml) is defined relative to the same pose, so qpos = 0 <-> tick CENTER_TICK.
+# LeRobot homing puts the middle of the range of motion of the ARM joints at 2047 (the servo firmware applies
+# homing_offset, so Present_Position is already homed and the conversions below never touch homing_offset).
+# The MJCF (so101_new_calib.xml) is defined relative to the same pose, so arm qpos = 0 <-> tick CENTER_TICK.
+# The gripper's range is NOT centred on 2047; its 0-100 % <-> rad mapping lives in sim/ (uses range_min/max).
 CENTER_TICK: Final[int] = 2047
 _RAD_PER_TICK: Final[float] = 2.0 * math.pi / TICKS_PER_REV
 
@@ -46,7 +48,10 @@ def _signs(calib: dict[str, MotorCalibration]) -> np.ndarray:
 
 
 def ticks_to_rad(ticks: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray:
-    """Present_Position ticks (homing offset already applied by the servo) -> joint angle [rad], shape [6]."""
+    """Present_Position ticks (homing offset already applied by the servo) -> joint angle [rad], shape [6].
+
+    Arm joints only: the gripper is not centred on CENTER_TICK (see above).
+    """
     t = np.asarray(ticks, dtype=np.float64)
     return _signs(calib) * (t - CENTER_TICK) * _RAD_PER_TICK
 

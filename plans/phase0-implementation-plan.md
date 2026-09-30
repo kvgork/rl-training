@@ -61,7 +61,7 @@ TICKS_PER_REV: Final[int] = 4096
 JOINT_NAMES: Final[tuple[str, ...]] = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 N_JOINTS: Final[int] = 6
 
-def ticks_to_rad(ticks: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray: ...   # uses homing_offset; result shape [6]
+def ticks_to_rad(ticks: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray: ...   # does NOT apply homing_offset (servo firmware applies it; Present_Position is already homed); drive_mode gives the sign; result shape [6]
 def rad_to_ticks(q: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray: ...      # int32, NOT clipped
 
 @dataclass(frozen=True)
@@ -650,7 +650,7 @@ Tests marked `@pytest.mark.hardware` are skipped unless `SO101_HW=1`; `@pytest.m
 - **Files:** `src/so101_rl/safety/fk.py`, `tests/test_fk.py`
 - **Specialist:** kinematics-specialist
 - **Dependencies:** U0 (0.3 yaml)
-- **Steps:** `KinematicChain.from_yaml(path)`; `So101FK.gripper_xyz` composes 5 rigid transforms + fixed tip offset (preallocated 4×4 buffers); `ticks_to_rad` via calibration `homing_offset` and the yaml's zero convention; `in_box`.
+- **Steps:** `KinematicChain.from_yaml(path)`; `So101FK.gripper_xyz` composes 5 rigid transforms + fixed tip offset (preallocated 4×4 buffers); `ticks_to_rad` via calibration `drive_mode` sign and the yaml's zero convention (no `homing_offset`: the firmware already applies it); `in_box`.
 - **Tests:** rest pose gives a plausible xyz (z > table, x within box); FK is deterministic and allocation-free (`tracemalloc` delta 0 over 1000 calls); `in_box` boundaries; the MuJoCo cross-check lives in 3.6 (needs U4).
 - **Acceptance:** `pixi run -e cpu pytest tests/test_fk.py -q` → pass.
 - **Est.:** 30 min. `parallelizable-via-worktree: true`

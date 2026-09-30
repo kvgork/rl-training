@@ -2,10 +2,15 @@
 
     python scripts/vendor_tdmpc2.py [--sha <commit>]   # (re)generate the tree
     python scripts/vendor_tdmpc2.py --check            # rebuild in memory, compare byte-for-byte
+    python scripts/vendor_tdmpc2.py --verify-manifest  # OFFLINE: hash every vendored file vs the manifest
+    python scripts/vendor_tdmpc2.py --refetch          # discard a corrupt cached tarball and download again
 
 The vendored tree is generated: never edit it by hand. Add a patch to PATCHES below instead, re-run the
 script and commit the result. PATCHES.md (generated) lists every changed file as a unified diff.
-The upstream tarball is cached in ~/.cache/so101_rl/vendor/.
+The upstream tarball is cached in ~/.cache/so101_rl/vendor/ and its sha256 is verified against the
+`tarball_sha256` recorded in UPSTREAM.json on every read; a mismatch is an error (never a silent refetch).
+scripts/vendor_tdmpc2.manifest.json holds the sha256 of every vendored file so that hand-edits are caught
+offline (`--verify-manifest`, tests/test_vendor_tdmpc2.py).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import difflib
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import tarfile
@@ -26,6 +32,7 @@ DEFAULT_SHA = "e9f59321933cbc8e11a002b842adc7d4ffae8ff1"
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "so101_rl" / "_vendor" / "tdmpc2"
 CACHE = Path.home() / ".cache" / "so101_rl" / "vendor"
+MANIFEST = Path(__file__).with_name("vendor_tdmpc2.manifest.json")
 
 # Upstream paths (relative to tdmpc2/tdmpc2/) that are copied. envs/ is deliberately left out.
 COPY_FILES = ("__init__.py", "tdmpc2.py", "train.py", "evaluate.py", "config.yaml")
@@ -285,27 +292,75 @@ def rewrite_imports(rel: str, text: str) -> str:
     return text
 
 
-def fetch_tarball(sha: str) -> bytes:
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def recorded_tarball_sha256(sha: str) -> str | None:
+    """``tarball_sha256`` from the committed UPSTREAM.json, if it pins this commit."""
+    meta_path = OUT / "UPSTREAM.json"
+    if not meta_path.exists():
+        return None
+    meta = json.loads(meta_path.read_text())
+    return meta.get("tarball_sha256") if meta.get("sha") == sha else None
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def fetch_tarball(sha: str, *, expected_sha256: str | None = None, refetch: bool = False) -> bytes:
+    """Cached upstream tarball. The bytes are verified against ``expected_sha256`` on EVERY read.
+
+    A cached file whose hash differs raises; it is only replaced when ``refetch`` is set. A freshly downloaded
+    file must match too. With no expected hash (new pin) the download is trusted once and its hash recorded.
+    """
     CACHE.mkdir(parents=True, exist_ok=True)
     cached = CACHE / f"tdmpc2-{sha}.tar.gz"
-    if cached.exists():
-        return cached.read_bytes()
+    if cached.exists() and not refetch:
+        data = cached.read_bytes()
+        if expected_sha256 is not None and sha256_hex(data) != expected_sha256:
+            raise SystemExit(
+                f"cached tarball {cached} has sha256 {sha256_hex(data)}, recorded {expected_sha256}: "
+                "corrupt or tampered. Delete it or re-run with --refetch."
+            )
+        return data
     url = f"https://codeload.github.com/{REPO}/tar.gz/{sha}"
     req = urllib.request.Request(url, headers={"User-Agent": "so101-rl-vendor"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = resp.read()
-    cached.write_bytes(data)
+    if expected_sha256 is not None and sha256_hex(data) != expected_sha256:
+        raise SystemExit(f"downloaded tarball sha256 {sha256_hex(data)} != recorded {expected_sha256}")
+    _write_atomic(cached, data)
     return data
+
+
+def safe_member_parts(name: str) -> tuple[str, ...]:
+    """Path parts of a tar member name; absolute paths and ``..`` components are refused."""
+    path = Path(name)
+    if path.is_absolute() or name.startswith(("/", "\\")) or ".." in path.parts or ".." in name.split("\\"):
+        raise SystemExit(f"unsafe tar member name {name!r}")
+    return path.parts
 
 
 def read_upstream(tarball: bytes) -> tuple[dict[str, str], str]:
     files: dict[str, str] = {}
     license_text = ""
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tar:
-        for member in tar.getmembers():
+        members = tar.getmembers()
+        for member in members:  # validate every member first, wanted or not
+            safe_member_parts(member.name)
+        for member in members:
             if not member.isfile():
                 continue
-            parts = Path(member.name).parts[1:]  # strip <repo>-<sha>/
+            parts = safe_member_parts(member.name)[1:]  # strip <repo>-<sha>/
+            if not parts:
+                continue
             rel = "/".join(parts)
             sub = "/".join(parts[1:]) if parts[0] == "tdmpc2" else ""
             wanted = sub in COPY_FILES or sub.split("/")[0] in COPY_DIRS
@@ -319,9 +374,9 @@ def read_upstream(tarball: bytes) -> tuple[dict[str, str], str]:
     return files, license_text
 
 
-def build(sha: str) -> tuple[dict[str, str], dict[str, str]]:
+def build(sha: str, *, refetch: bool = False) -> tuple[dict[str, str], dict[str, str]]:
     """Returns (upstream files, patched files) keyed by path relative to the vendored dir."""
-    tarball = fetch_tarball(sha)
+    tarball = fetch_tarball(sha, expected_sha256=recorded_tarball_sha256(sha), refetch=refetch)
     upstream, license_text = read_upstream(tarball)
     upstream["LICENSE"] = license_text
     patched = {rel: rewrite_imports(rel, text) for rel, text in upstream.items()}
@@ -338,7 +393,7 @@ def build(sha: str) -> tuple[dict[str, str], dict[str, str]]:
                 "repo": f"https://github.com/{REPO}",
                 "sha": sha,
                 "license": "MIT",
-                "tarball_sha256": hashlib.sha256(tarball).hexdigest(),
+                "tarball_sha256": sha256_hex(tarball),
                 "copied": sorted(upstream),
                 "excluded": ["envs/"],
                 "generated_by": "scripts/vendor_tdmpc2.py",
@@ -388,26 +443,52 @@ def write(patched: dict[str, str]) -> None:
         path = OUT / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+    write_manifest(current_tree())
 
 
 def current_tree() -> dict[str, str]:
-    return {p.relative_to(OUT).as_posix(): p.read_text() for p in sorted(OUT.rglob("*")) if p.is_file() and "__pycache__" not in p.parts}
+    return {
+        p.relative_to(OUT).as_posix(): p.read_text()
+        for p in sorted(OUT.rglob("*"))
+        if p.is_file() and "__pycache__" not in p.parts
+    }
+
+
+def manifest_of(tree: dict[str, str]) -> dict[str, str]:
+    return {rel: sha256_hex(text.encode()) for rel, text in sorted(tree.items())}
+
+
+def write_manifest(tree: dict[str, str]) -> None:
+    MANIFEST.write_text(json.dumps(manifest_of(tree), indent=2, sort_keys=True) + "\n")
+
+
+def verify_manifest() -> list[str]:
+    """OFFLINE: differences between the vendored tree on disk and the committed manifest (empty = clean)."""
+    want = json.loads(MANIFEST.read_text())
+    have = manifest_of(current_tree())
+    return sorted(set(want) ^ set(have)) + sorted(k for k in have if k in want and have[k] != want[k])
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sha", default=None)
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--verify-manifest", action="store_true")
+    ap.add_argument("--refetch", action="store_true", help="replace a cached tarball that fails its hash check")
     args = ap.parse_args()
+    if args.verify_manifest:
+        diff = verify_manifest()
+        print("vendored tree matches the manifest" if not diff else f"MANIFEST MISMATCH: {diff}")
+        return 1 if diff else 0
     if args.check:
         sha = json.loads((OUT / "UPSTREAM.json").read_text())["sha"]
-        _, patched = build(sha)
+        _, patched = build(sha, refetch=args.refetch)
         have = current_tree()
         diff = sorted(set(have) ^ set(patched)) + sorted(k for k in patched if k in have and have[k] != patched[k])
         print("vendored tree matches" if not diff else f"MISMATCH: {diff}")
         return 1 if diff else 0
     sha = args.sha or DEFAULT_SHA
-    _, patched = build(sha)
+    _, patched = build(sha, refetch=args.refetch)
     write(patched)
     (OUT.parent / "__init__.py").touch()
     print(f"vendored {len(patched)} files at {sha} into {OUT}")

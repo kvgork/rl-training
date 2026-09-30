@@ -46,7 +46,8 @@ rates:
 safe_state:
   bound_s: 5.0
   ramp_ticks_per_tick: 8
-  # PLACEHOLDERS (middle of range, LeRobot homing pose) until H5 measures a gravity-stable rest pose.
+  # PLACEHOLDERS (middle of range, LeRobot homing pose). NEEDS H5: home and rest must be measured on the real
+  # arm (gravity-stable rest pose) before verified_on_hardware may be set to true.
   home_ticks: [2047, 2047, 2047, 2047, 2047, 2047]
   rest_ticks: [2047, 2047, 2047, 2047, 2047, 2047]
   torque_off_order: [gripper, wrist_roll, wrist_flex, elbow_flex, shoulder_lift, shoulder_pan]
