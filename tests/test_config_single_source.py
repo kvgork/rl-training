@@ -11,7 +11,9 @@ EXCLUDED_DIRS = {"config", "_vendor"}
 NAMES = ("max_delta_ticks", "tracking_error_ticks", "trip_c", "resume_c", "stale_cmd_ms", "bound_s")
 # name [: annotation] (= | :) [ ( or [ ] number
 PATTERN = re.compile(
-    r"""\b(?:%s)\b["']?\s*(?::\s*[\w\[\], .|]+?)?\s*[:=]\s*[\[\(]?\s*-?\d""" % "|".join(NAMES)
+    r"""\b(?:"""
+    + "|".join(NAMES)
+    + r""")\b["']?\s*(?::\s*[\w\[\], .|]+?)?\s*[:=]\s*[\[\(]?\s*-?\d"""
 )
 
 

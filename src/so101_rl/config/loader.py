@@ -95,7 +95,7 @@ def _vec(value: Any, key: str, dtype: Any = np.int32) -> np.ndarray:
 def _read_yaml(path: Path) -> dict[str, Any]:
     raw = yaml.safe_load(Path(path).read_text())
     if not isinstance(raw, dict):
-        raise ValueError(f"{path}: top level must be a mapping")
+        raise TypeError(f"{path}: top level must be a mapping")
     _walk_finite(raw)
     return raw
 

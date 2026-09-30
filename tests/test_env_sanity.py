@@ -29,7 +29,7 @@ def test_import_lerobot_motors_no_torch_init():
         "import lerobot.motors.feetech, torch; "
         "assert not torch.cuda.is_initialized(); print('ok')"
     )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=90)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=90, check=False)
     assert out.returncode == 0, out.stderr
     assert "ok" in out.stdout
 
