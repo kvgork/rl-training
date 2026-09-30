@@ -1,0 +1,32 @@
+{
+  "repo": "https://github.com/nicklashansen/tdmpc2",
+  "sha": "e9f59321933cbc8e11a002b842adc7d4ffae8ff1",
+  "license": "MIT",
+  "tarball_sha256": "3e01756e99b09535e3f11145edde468c4d272858aec351831ca85ac7989ccbe4",
+  "copied": [
+    "LICENSE",
+    "__init__.py",
+    "common/__init__.py",
+    "common/buffer.py",
+    "common/init.py",
+    "common/layers.py",
+    "common/logger.py",
+    "common/math.py",
+    "common/parser.py",
+    "common/scale.py",
+    "common/seed.py",
+    "common/world_model.py",
+    "config.yaml",
+    "evaluate.py",
+    "tdmpc2.py",
+    "train.py",
+    "trainer/__init__.py",
+    "trainer/base.py",
+    "trainer/offline_trainer.py",
+    "trainer/online_trainer.py"
+  ],
+  "excluded": [
+    "envs/"
+  ],
+  "generated_by": "scripts/vendor_tdmpc2.py"
+}

@@ -61,7 +61,7 @@ TICKS_PER_REV: Final[int] = 4096
 JOINT_NAMES: Final[tuple[str, ...]] = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 N_JOINTS: Final[int] = 6
 
-def ticks_to_rad(ticks: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray: ...   # uses homing_offset; result shape [6]
+def ticks_to_rad(ticks: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray: ...   # does NOT apply homing_offset (servo firmware applies it; Present_Position is already homed); drive_mode gives the sign; result shape [6]
 def rad_to_ticks(q: np.ndarray, calib: dict[str, MotorCalibration]) -> np.ndarray: ...      # int32, NOT clipped
 
 @dataclass(frozen=True)
@@ -199,7 +199,7 @@ STATE_DTYPE = np.dtype([                   # written by servo, read by policy
     ("clamped_mask", "<u1", (6,)),
     ("fault_bits", "<u4"), ("sm_state", "<u4"), ("last_cmd_seq", "<u8"), ("hb_ok", "<u1"),
     ("crc32", "<u4"),
-], align=True)                              # itemsize asserted == 192
+], align=True)                              # itemsize asserted == 232 (corrected 2026-09-30: natural alignment; block stride 256 B)
 
 class SeqlockBlock:                         # single writer, many readers, no locks
     def __init__(self, buf: memoryview, dtype: np.dtype) -> None: ...
@@ -584,7 +584,7 @@ Tests marked `@pytest.mark.hardware` are skipped unless `SO101_HW=1`; `@pytest.m
 - **Specialist:** real-time-control-specialist
 - **Dependencies:** 0.2
 - **Steps:** implement F3 with `zlib.crc32` over a `memoryview` of the payload (no allocation per write beyond ints); `attach()` calls `multiprocessing.resource_tracker.unregister(shm._name, "shared_memory")` on 3.12; `conftest.py` registers markers, skips `hardware` unless `SO101_HW=1`, `gpu` unless `torch.cuda.is_available()`, provides `fake_clock`, `cfg` (loads `so101.yaml` + the real calibration JSON copied into `tests/data/so101_follower.calib.json`), and asserts `src/so101_rl` is not on `sys.path`.
-- **Tests:** `test_shm.py`: dtype itemsizes are 64/192; header magic/version mismatch → `RuntimeError` at attach; **torn-read stress**: a writer *process* writes records whose payload is filled with `seq`, a reader hammers for 2 s and never accepts a record whose payload ≠ its seq or whose CRC fails; reader sees a repeated seq as "no new"; `FakeClock.sleep_until` advances exactly; `TickStats` percentiles on a known distribution.
+- **Tests:** `test_shm.py`: dtype itemsizes are 64/232; header magic/version mismatch → `RuntimeError` at attach; **torn-read stress**: a writer *process* writes records whose payload is filled with `seq`, a reader hammers for 2 s and never accepts a record whose payload ≠ its seq or whose CRC fails; reader sees a repeated seq as "no new"; `FakeClock.sleep_until` advances exactly; `TickStats` percentiles on a known distribution.
 - **Acceptance:** `pixi run -e cpu pytest tests/test_shm.py tests/test_timing.py tests/test_types.py -q` → pass.
 - **Est.:** 40 min.
 
@@ -650,7 +650,7 @@ Tests marked `@pytest.mark.hardware` are skipped unless `SO101_HW=1`; `@pytest.m
 - **Files:** `src/so101_rl/safety/fk.py`, `tests/test_fk.py`
 - **Specialist:** kinematics-specialist
 - **Dependencies:** U0 (0.3 yaml)
-- **Steps:** `KinematicChain.from_yaml(path)`; `So101FK.gripper_xyz` composes 5 rigid transforms + fixed tip offset (preallocated 4×4 buffers); `ticks_to_rad` via calibration `homing_offset` and the yaml's zero convention; `in_box`.
+- **Steps:** `KinematicChain.from_yaml(path)`; `So101FK.gripper_xyz` composes 5 rigid transforms + fixed tip offset (preallocated 4×4 buffers); `ticks_to_rad` via calibration `drive_mode` sign and the yaml's zero convention (no `homing_offset`: the firmware already applies it); `in_box`.
 - **Tests:** rest pose gives a plausible xyz (z > table, x within box); FK is deterministic and allocation-free (`tracemalloc` delta 0 over 1000 calls); `in_box` boundaries; the MuJoCo cross-check lives in 3.6 (needs U4).
 - **Acceptance:** `pixi run -e cpu pytest tests/test_fk.py -q` → pass.
 - **Est.:** 30 min. `parallelizable-via-worktree: true`
