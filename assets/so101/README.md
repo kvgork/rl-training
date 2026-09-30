@@ -9,7 +9,7 @@
   - default classes `jaw_col` (primitive jaw collision geoms) and `die`.
   - a later `<compiler meshdir="upstream/assets">`, because upstream's `meshdir="assets"` is relative to the main file.
 
-## Always load through `so101_rl.sim.load_model()`
+## Always load through `so101_rl.sim.model.load_model()`
 
 MJCF cannot add geoms or sites to a body that comes from an `<include>`, so `load_model()` compiles the scene through
 `MjSpec` and adds, in code:
