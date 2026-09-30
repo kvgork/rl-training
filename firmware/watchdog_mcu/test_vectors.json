@@ -1,0 +1,772 @@
+{
+ "comment": "Shared vectors. Each step advances the clock by dt ms, updates the persistent inputs (vbus_mv default 12000, estop/btn/jumper default false), runs poll(), then feeds tx; 'out' is the hex of every byte the MCU sends in that step. 'portable' vectors use only serial input and time, and must also hold for FakeMcu and the real MCU (H3).",
+ "vectors": [
+  {
+   "name": "boot_is_disarmed_reason_mcu_reset",
+   "doc": "Fresh boot: relay open, DISARMED, reason 6 (MCU_RESET).",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "e0",
+     "out": "60"
+    }
+   ]
+  },
+  {
+   "name": "heartbeat_while_disarmed_is_answered_but_inert",
+   "doc": "Heartbeat before ARM changes nothing.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 5,
+     "tx": "a510ef",
+     "out": "60"
+    },
+    {
+     "dt": 1100,
+     "tx": "e0",
+     "out": "60"
+    }
+   ]
+  },
+  {
+   "name": "arm_and_heartbeat_stream",
+   "doc": "ARM then in-sequence heartbeats; the first heartbeat after ARM sets the seq base.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 100,
+     "tx": "a510ef",
+     "out": "05"
+    },
+    {
+     "dt": 100,
+     "tx": "a511ee",
+     "out": "05"
+    },
+    {
+     "dt": 100,
+     "tx": "a512ed",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "first_heartbeat_any_seq",
+   "doc": "First heartbeat after ARM may carry any seq.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a5807f",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a5817e",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "seq_wraps_255_to_0",
+   "doc": "seq8 wraps modulo 256.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a5fe01",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a5ff00",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a500ff",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a501fe",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "timeout_999_armed_1001_latched",
+   "doc": "No heartbeat: 999 ms still ARMED, 1001 ms LATCHED reason 1 (TIMEOUT).",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 999,
+     "tx": "e0",
+     "out": "05"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "12"
+    }
+   ]
+  },
+  {
+   "name": "heartbeats_defer_timeout",
+   "doc": "Heartbeats restart the 1 s window.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 900,
+     "tx": "a510ef",
+     "out": "05"
+    },
+    {
+     "dt": 900,
+     "tx": "a511ee",
+     "out": "05"
+    },
+    {
+     "dt": 999,
+     "tx": "e0",
+     "out": "05"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "12"
+    }
+   ]
+  },
+  {
+   "name": "heartbeat_after_timeout_does_not_revive",
+   "doc": "A late heartbeat cannot un-latch.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 1500,
+     "tx": "a510ef",
+     "out": "12"
+    },
+    {
+     "dt": 10,
+     "tx": "a511ee",
+     "out": "12"
+    },
+    {
+     "dt": 10,
+     "tx": "5a",
+     "out": "12"
+    }
+   ]
+  },
+  {
+   "name": "seq_gap_latches_reason_3",
+   "doc": "Skipped seq -> LATCHED reason 3 (SEQ_ERROR).",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a510ef",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a512ed",
+     "out": "32"
+    },
+    {
+     "dt": 10,
+     "tx": "e0",
+     "out": "32"
+    }
+   ]
+  },
+  {
+   "name": "repeated_seq_latches_reason_3",
+   "doc": "A stuck sender repeating the same seq is rejected.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a510ef",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a510ef",
+     "out": "32"
+    }
+   ]
+  },
+  {
+   "name": "bad_complement_latches_reason_3",
+   "doc": "~seq mismatch -> SEQ_ERROR.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a510ee",
+     "out": "32"
+    }
+   ]
+  },
+  {
+   "name": "serial_cannot_clear_latch",
+   "doc": "Serial ARM/garbage/STATUS never clears a latch.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 1100,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 1,
+     "tx": "5a",
+     "out": "12"
+    },
+    {
+     "dt": 1,
+     "tx": "00ff7f5a",
+     "out": "12"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 5000,
+     "tx": "e0",
+     "out": "12"
+    }
+   ]
+  },
+  {
+   "name": "garbage_bytes_ignored",
+   "doc": "Unknown bytes produce no output and no state change.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "00ff7f1234",
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "tx": "e0",
+     "out": "60"
+    }
+   ]
+  },
+  {
+   "name": "multiple_frames_one_write",
+   "doc": "Three frames in one write give three status bytes.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5aa510efe0",
+     "out": "050505"
+    }
+   ]
+  },
+  {
+   "name": "frame_split_across_writes",
+   "doc": "A heartbeat split across writes answers on the last byte.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "a5",
+     "out": ""
+    },
+    {
+     "dt": 1,
+     "tx": "10",
+     "out": ""
+    },
+    {
+     "dt": 1,
+     "tx": "ef",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "wrap_safe_timeout",
+   "doc": "Timeout is correct across the 2**32 tick wrap (start 500 ms before the wrap).",
+   "start_ms": 4294966796,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 400,
+     "tx": "a510ef",
+     "out": "05"
+    },
+    {
+     "dt": 400,
+     "tx": "a511ee",
+     "out": "05"
+    },
+    {
+     "dt": 999,
+     "tx": "e0",
+     "out": "05"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "12"
+    }
+   ]
+  },
+  {
+   "name": "disarmed_never_times_out",
+   "doc": "A DISARMED MCU stays DISARMED forever.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 5000,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 100000,
+     "tx": "e0",
+     "out": "60"
+    }
+   ]
+  },
+  {
+   "name": "estop_latches_reason_4",
+   "doc": "E-stop input while ARMED -> LATCHED reason 4.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 5,
+     "tx": "e0",
+     "out": "05"
+    },
+    {
+     "dt": 5,
+     "estop": true,
+     "tx": "e0",
+     "out": "42"
+    },
+    {
+     "dt": 5,
+     "tx": "e0",
+     "out": "42"
+    }
+   ]
+  },
+  {
+   "name": "estop_blocks_arm",
+   "doc": "ARM refused while the e-stop is asserted.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "estop": true,
+     "tx": "5a",
+     "out": "60"
+    }
+   ]
+  },
+  {
+   "name": "reset_button_500ms_clears_to_disarmed",
+   "doc": "Latch clears only after the button is held 500 ms; then DISARMED (reason kept until ARM) and ARM works again.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 1100,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 0,
+     "btn": true,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 499,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "10"
+    },
+    {
+     "dt": 1,
+     "btn": false,
+     "tx": "5a",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "reset_button_released_early_restarts",
+   "doc": "Releasing the button restarts the 500 ms hold.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 1100,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 0,
+     "btn": true,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 300,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 1,
+     "btn": false,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 10,
+     "btn": true,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 499,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "10"
+    }
+   ]
+  },
+  {
+   "name": "reset_blocked_while_estop_asserted",
+   "doc": "The button cannot clear a latch while the e-stop is still pressed.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 5,
+     "estop": true,
+     "tx": "e0",
+     "out": "42"
+    },
+    {
+     "dt": 0,
+     "btn": true,
+     "tx": "e0",
+     "out": "42"
+    },
+    {
+     "dt": 2000,
+     "tx": "e0",
+     "out": "42"
+    },
+    {
+     "dt": 0,
+     "estop": false,
+     "tx": "e0",
+     "out": "42"
+    },
+    {
+     "dt": 499,
+     "tx": "e0",
+     "out": "42"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "40"
+    }
+   ]
+  },
+  {
+   "name": "undervolt_latches_after_50ms",
+   "doc": "V_bus below threshold for >50 ms -> LATCHED reason 2; bit3 follows the live voltage.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "vbus_mv": 8000,
+     "tx": "e0",
+     "out": "0d"
+    },
+    {
+     "dt": 49,
+     "tx": "e0",
+     "out": "0d"
+    },
+    {
+     "dt": 2,
+     "tx": "e0",
+     "out": "2a"
+    },
+    {
+     "dt": 1,
+     "vbus_mv": 12000,
+     "tx": "e0",
+     "out": "22"
+    }
+   ]
+  },
+  {
+   "name": "undervolt_blip_under_50ms_recovers",
+   "doc": "A dip shorter than 50 ms does not trip; the timer restarts on the next dip.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "vbus_mv": 8000,
+     "tx": "e0",
+     "out": "0d"
+    },
+    {
+     "dt": 30,
+     "vbus_mv": 12000,
+     "tx": "e0",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "vbus_mv": 8000,
+     "tx": "e0",
+     "out": "0d"
+    },
+    {
+     "dt": 45,
+     "tx": "e0",
+     "out": "0d"
+    },
+    {
+     "dt": 10,
+     "tx": "e0",
+     "out": "2a"
+    }
+   ]
+  },
+  {
+   "name": "arm_refused_when_undervolt",
+   "doc": "ARM refused with V_bus below threshold.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "vbus_mv": 8000,
+     "tx": "5a",
+     "out": "68"
+    },
+    {
+     "dt": 1,
+     "vbus_mv": 12000,
+     "tx": "5a",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "test_drop_measures_ms",
+   "doc": "TEST_DROP with jumper: relay opens, status then drop_ms uint16 LE when V_bus < 1 V.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "jumper": true,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "e1",
+     "out": "52"
+    },
+    {
+     "dt": 37,
+     "vbus_mv": 500,
+     "out": "2500"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "5a"
+    }
+   ]
+  },
+  {
+   "name": "test_drop_refused_without_jumper",
+   "doc": "TEST_DROP ignored (still ARMED) without the physical TEST jumper.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "e1",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "e0",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "test_drop_timeout_reports_2000",
+   "doc": "If V_bus never falls, drop_ms is reported at the 2000 ms cap.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "jumper": true,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 10,
+     "tx": "e1",
+     "out": "52"
+    },
+    {
+     "dt": 2000,
+     "out": "d007"
+    }
+   ]
+  }
+ ]
+}
