@@ -11,7 +11,7 @@ from typing import Self
 
 import numpy as np
 
-from so101_rl.servo.shm import SeqlockBlock, _attach_untracked
+from so101_rl.servo.shm import SeqlockBlock, attach_untracked
 
 MAX_OBJECTS = 8
 
@@ -80,7 +80,7 @@ class ObjectTableShm:
     @classmethod
     def attach(cls, name: str) -> ObjectTableShm:
         """Reader side; never unlinks, never registers with the resource tracker."""
-        shm = _attach_untracked(name)
+        shm = attach_untracked(name)
         if shm.size < OBJECT_TABLE_SIZE:
             shm.close()
             raise RuntimeError(f"object table {name!r}: segment is {shm.size} B, expected >= {OBJECT_TABLE_SIZE}")

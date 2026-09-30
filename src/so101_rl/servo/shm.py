@@ -302,3 +302,7 @@ class LocalIpc(_Blocks):
         view = memoryview(self._mem)
         self._cmd = SeqlockBlock(view[CMD_OFFSET : CMD_OFFSET + CMD_SIZE], CMD_DTYPE)
         self._state = SeqlockBlock(view[STATE_OFFSET : STATE_OFFSET + STATE_SIZE], STATE_DTYPE)
+
+
+# Public name for other packages (perception/object_table.py); same behaviour.
+attach_untracked = _attach_untracked
