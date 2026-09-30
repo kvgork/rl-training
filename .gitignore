@@ -11,8 +11,10 @@ __pycache__/
 build/
 dist/
 # data / runs
-data/
-runs/
-checkpoints/
+/data/
+/runs/
+/checkpoints/
 wandb/
 *.hdf5
+# agent worktrees
+.claude/worktrees/
