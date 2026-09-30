@@ -1,0 +1,53 @@
+<mujoco model="so101_rl_scene">
+  <!-- RL scene: upstream SO-101 arm + table, 16 mm die, 60 mm target zone, fiducial.
+       Upstream files are NOT modified. Load through so101_rl.sim.load_model(): it compiles this file through
+       MjSpec and then adds what plain MJCF cannot express on an included body (primitive jaw collision geoms,
+       the gripper_tip site, mesh-jaw collision disable). See assets/so101/README.md. -->
+  <include file="upstream/so101_new_calib.xml"/>
+  <!-- Later <compiler> wins: upstream's meshdir="assets" is relative to the MAIN file, ours lives one level up. -->
+  <compiler angle="radian" meshdir="upstream/assets" autolimits="true"/>
+
+  <default>
+    <!-- Primitive jaw collision geoms (plan sec. 6: mesh-mesh grasp contact is unstable and slow).
+         contype 2 / conaffinity 2: collides with the die and the table, never with the (contype 1) arm meshes. -->
+    <default class="jaw_col">
+      <geom type="box" contype="2" conaffinity="2" group="4" rgba="0.9 0.2 0.2 0.3" friction="1.2 0.01 0.001" condim="4" margin="0.0005"/>
+    </default>
+    <default class="die">
+      <geom type="box" size="0.008 0.008 0.008" mass="0.004" contype="2" conaffinity="3" friction="1.0 0.01 0.001" condim="4" rgba="0.8 0.1 0.1 1"/>
+    </default>
+  </default>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+  </visual>
+
+  <asset>
+    <texture type="2d" name="table_tex" builtin="checker" mark="edge" rgb1="0.75 0.75 0.72" rgb2="0.7 0.7 0.67" markrgb="0.4 0.4 0.4" width="300" height="300"/>
+    <material name="table_mat" texture="table_tex" texuniform="true" texrepeat="5 5" reflectance="0.05"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <!-- Table top at TABLE_Z_M = -0.02 (sim/model.py) -->
+    <geom name="table" type="plane" size="0.6 0.6 0.05" pos="0 0 -0.02" material="table_mat" contype="3" conaffinity="3" friction="0.8 0.01 0.001"/>
+    <site name="base" pos="0 0 0" size="0.003" group="3"/>
+    <!-- Target zone, 60 x 60 mm, flat on the table -->
+    <site name="zone" type="box" pos="0.22 0.10 -0.0195" size="0.03 0.03 0.0005" rgba="0.1 0.7 0.2 0.5" group="1"/>
+    <!-- ArUco-sized fiducial (30 mm) for hand-eye calibration -->
+    <site name="fiducial" type="box" pos="0.10 -0.16 -0.0195" size="0.015 0.015 0.0005" rgba="0 0 0 1" group="1"/>
+    <body name="die" pos="0.20 -0.05 -0.012">
+      <freejoint name="die_free"/>
+      <geom name="die_geom" class="die"/>
+      <site name="die_center" size="0.002" group="3"/>
+    </body>
+  </worldbody>
+
+  <!-- Placeholders consistent with config/so101.yaml safe_state (home = rest = tick 2047 on every joint = 0 rad on the
+       arm joints; gripper 2047 ticks on the 2011..3488 calibration = 2.4 % open). NEEDS H5: replace by the measured
+       gravity-stable rest pose; tests/test_sim_model.py checks this stays consistent with the config. -->
+  <keyframe>
+    <key name="rest" qpos="0 0 0 0 0 -0.1277  0.20 -0.05 -0.012 1 0 0 0" ctrl="0 0 0 0 0 -0.1277"/>
+    <key name="home" qpos="0 0 0 0 0 -0.1277  0.20 -0.05 -0.012 1 0 0 0" ctrl="0 0 0 0 0 -0.1277"/>
+  </keyframe>
+</mujoco>
