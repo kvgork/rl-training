@@ -42,7 +42,7 @@ def test_status_byte_bit_layout():
 
 def test_powers_up_disarmed_with_relay_open(mcu, link):
     assert (mcu.relay_on, mcu.armed, mcu.latched) == (False, False, False)
-    assert link.status() == McuStatus(False, False, False, False, hb.REASON_NONE)
+    assert link.status() == McuStatus(False, False, False, False, hb.REASON_MCU_RESET)  # matches firmware boot (PROTOCOL.md)
 
 
 def test_arm_only_from_disarmed(mcu, link):

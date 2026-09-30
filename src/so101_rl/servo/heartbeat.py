@@ -88,7 +88,7 @@ class FakeMcu:
         self.relay_on = False
         self.latched = False
         self.armed = False
-        self.reason = REASON_NONE
+        self.reason = REASON_MCU_RESET  # firmware boots with reason 6 (PROTOCOL.md)
         self.undervolt = False
         self.test_jumper = False
         self.drop_time_ms = 12  # what TEST_DROP reports
