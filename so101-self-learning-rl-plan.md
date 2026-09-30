@@ -230,7 +230,7 @@ These are developed **in parallel, off the critical path**, and attach when thei
     - **Test 1:** intercept `sync_write` and assert the same Goal_Position delta in ticks (0.088° per tick) for a unit action in both backends.
     - **Test 2:** block the arm (an obstacle in sim, a stop on hardware) and assert that |target − present| never exceeds E.
     - **Test 3:** an out-of-range command is rejected before serialisation, and 0 ≤ goal ≤ 4095 always holds.
-  - **[v2] Reuse:** `robot_data_runner/safety_limits.py` (clamp_action and NaN handling), `safety.py` (safe_connect, stuck-action watchdog, SIGINT handler) and `lerobot_isaac_deploy/arm_motor_writer.py` (joint floor and ramped_home). All three already run on this arm.
+  - **[v2] Reuse:** `LIT/src/robot-data-runner/src/robot_data_runner/safety_limits.py` (clamp_action and NaN handling), `safety.py` (same folder) (safe_connect, stuck-action watchdog, SIGINT handler) and `lerobot_isaac_deploy/arm_motor_writer.py` (joint floor and ramped_home). All three already run on this arm.
   - **[v2] Known issues:**
     - LeRobot #1342 (a negative Homing_Offset written as unsigned) is handled by sign-magnitude encoding in 0.6.0. The connect-time read-back check stays, to guard against calibration drift and partial writes.
     - Pin `--robot.id=so101_follower`, and ignore the legacy `robots/so101_follower/` directory and the `None.json` files.
