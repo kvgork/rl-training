@@ -21,8 +21,16 @@ def clock():
 
 
 @pytest.fixture
-def mcu(clock):
+def raw_mcu(clock):
+    """Straight out of an MCU reset: LATCHED, reason MCU_RESET."""
     return FakeMcu(clock)
+
+
+@pytest.fixture
+def mcu(raw_mcu):
+    """An MCU whose boot latch was cleared with the physical reset button: DISARMED, ready for ARM."""
+    raw_mcu.reset_button(500)
+    return raw_mcu
 
 
 @pytest.fixture
@@ -40,9 +48,137 @@ def test_status_byte_bit_layout():
     assert McuStatus.from_byte(0x12) == McuStatus(False, True, False, False, 1)
 
 
-def test_powers_up_disarmed_with_relay_open(mcu, link):
-    assert (mcu.relay_on, mcu.armed, mcu.latched) == (False, False, False)
-    assert link.status() == McuStatus(False, False, False, False, hb.REASON_MCU_RESET)  # matches firmware boot (PROTOCOL.md)
+def test_powers_up_latched_with_relay_open(raw_mcu):
+    link = FakeHeartbeatLink(raw_mcu)
+    assert (raw_mcu.relay_on, raw_mcu.armed, raw_mcu.latched) == (False, False, True)
+    st = link.status()
+    assert st == McuStatus(
+        False, True, False, False, hb.REASON_MCU_RESET
+    )  # firmware boot status 0x62 (PROTOCOL.md)
+    assert st.to_byte() == 0x62
+
+
+def test_boot_latch_refuses_serial_arm_and_only_the_button_clears_it(raw_mcu, clock):
+    link = FakeHeartbeatLink(raw_mcu)
+    for _ in range(3):
+        assert link.arm().armed is False
+        assert link.send(0) is False
+        assert link.status().latched
+        clock.advance(2000 * MS)
+    assert raw_mcu.state == "LATCHED" and not raw_mcu.relay_on
+    raw_mcu.reset_button(499)
+    assert raw_mcu.state == "LATCHED"
+    raw_mcu.reset_button(500)
+    assert raw_mcu.state == "DISARMED" and raw_mcu.reason == hb.REASON_MCU_RESET  # reason kept until ARM
+    assert link.arm().armed and raw_mcu.reason == hb.REASON_NONE
+
+
+def test_boot_latch_not_cleared_while_estop_asserted(raw_mcu):
+    raw_mcu.set_estop(True)
+    raw_mcu.reset_button(2000)
+    assert raw_mcu.state == "LATCHED"
+    raw_mcu.set_estop(False)
+    raw_mcu.reset_button(500)
+    assert raw_mcu.state == "DISARMED"
+
+
+def test_set_button_level_hold_is_timed_on_the_clock(raw_mcu, clock):
+    raw_mcu.set_button(True)
+    clock.advance(499 * MS)
+    raw_mcu.poll()
+    assert raw_mcu.latched
+    clock.advance(1 * MS)
+    raw_mcu.poll()
+    assert raw_mcu.state == "DISARMED"
+    raw_mcu.set_button(False)
+
+
+def test_timeout_is_ge_exactly_1000_ms_latches(mcu, link, clock):
+    link.arm()
+    link.send(0)
+    clock.advance(999 * MS)
+    mcu.poll()
+    assert mcu.state == "ARMED"
+    clock.advance(1 * MS)  # exactly 1000 ms: the firmware uses >=
+    mcu.poll()
+    assert mcu.latched and mcu.reason == hb.REASON_TIMEOUT
+
+
+def test_heartbeat_at_exactly_1000_ms_cannot_rescue(mcu, link, clock):
+    link.arm()
+    link.send(0)
+    clock.advance(1000 * MS)
+    assert link.send(1) is False
+    assert mcu.reason == hb.REASON_TIMEOUT
+
+
+def test_arm_checks_psu_side_not_servo_side(mcu, link):
+    """B4: with the relay open the servo side reads 0 V; ARM must not look at it, and a sagging servo side while
+    ARMED is not an undervolt."""
+    mcu.set_servo_voltage(0.0)
+    assert link.arm().armed
+    mcu.set_servo_voltage(0.5)
+    assert link.send(0) is True and mcu.state == "ARMED" and not mcu.undervolt
+
+
+def test_psu_side_undervolt_refuses_arm_even_if_servo_side_is_fine(mcu, link):
+    mcu.set_bus_voltage(8.0)  # servo side follows the relay (0 V): only the PSU-side reading can refuse here
+    assert link.arm().armed is False and link.status().undervolt
+
+
+def test_arm_refused_while_servo_side_still_live(mcu, link):
+    mcu.set_servo_voltage(3.0)
+    assert link.arm().armed is False
+    mcu.set_servo_voltage(0.0)
+    assert link.arm().armed
+
+
+def test_relay_weld_detected_and_cannot_be_cleared_while_live(mcu, link, clock):
+    link.arm()
+    link.send(0)
+    mcu.set_servo_voltage(12.0)  # relay will open on the timeout, but the servo bus stays up
+    clock.advance(1001 * MS)
+    mcu.poll()
+    assert mcu.reason == hb.REASON_TIMEOUT
+    clock.advance(499 * MS)
+    mcu.poll()
+    assert mcu.reason == hb.REASON_TIMEOUT
+    clock.advance(1 * MS)
+    mcu.poll()
+    assert mcu.latched and mcu.reason == hb.REASON_WELD and not mcu.relay_on
+    mcu.reset_button(600)
+    assert mcu.latched and mcu.reason == hb.REASON_WELD  # the weld timer keeps running: re-latched at once
+    assert link.arm().armed is False
+    mcu.set_servo_voltage(None)  # bus finally dead
+    mcu.reset_button(600)
+    assert mcu.state == "DISARMED" and mcu.reason == hb.REASON_WELD  # reason kept until ARM
+    assert link.arm().armed
+
+
+def test_servo_side_decay_after_trip_is_not_a_weld(mcu, link, clock):
+    mcu.drop_time_ms = 200
+    link.arm()
+    link.send(0)
+    clock.advance(1001 * MS)
+    mcu.poll()
+    clock.advance(1000 * MS)
+    mcu.poll()
+    assert mcu.reason == hb.REASON_TIMEOUT
+
+
+def test_partial_frame_dropped_after_100ms(mcu):
+    mcu.feed(bytes([0x5A]))
+    mcu.feed(bytes([0xA5, 0]))
+    mcu.clock.advance(100 * MS)
+    assert mcu.feed(bytes([0xFF])) == b""  # the stale head was discarded; 0xFF is line noise
+    assert mcu.feed(bytes([0xA5, 0, 0xFF])) == bytes([mcu.status_byte()])
+
+
+def test_partial_frame_gap_of_99ms_still_completes(mcu):
+    mcu.feed(bytes([0x5A]))
+    mcu.feed(bytes([0xA5, 0]))
+    mcu.clock.advance(99 * MS)
+    assert mcu.feed(bytes([0xFF])) == bytes([mcu.status_byte()])
 
 
 def test_arm_only_from_disarmed(mcu, link):
@@ -142,7 +278,9 @@ def test_reset_button_500ms_returns_to_disarmed(mcu, link, clock):
     assert mcu.latched
     mcu.reset_button(500)
     assert mcu.state == "DISARMED" and not mcu.latched and not mcu.relay_on
+    assert mcu.reason == hb.REASON_TIMEOUT  # the firmware keeps the trip reason until the next ARM
     assert link.arm().armed  # and it can be armed again
+    assert mcu.reason == hb.REASON_NONE
 
 
 def test_reset_button_does_not_arm_and_not_when_disarmed(mcu):
@@ -195,18 +333,62 @@ def test_test_drop_returns_ms_with_jumper(mcu, link):
     assert mcu.latched and mcu.reason == hb.REASON_TEST and not mcu.relay_on
 
 
-def test_test_drop_rejected_without_jumper(mcu, link):
+def test_test_drop_reports_2000_when_bus_never_falls(mcu, link):
+    mcu.test_jumper = True
     link.arm()
-    with pytest.raises(RuntimeError, match="TEST"):
+    mcu.set_servo_voltage(12.0)
+    assert link.test_drop() == 2000
+
+
+def test_test_drop_rejected_without_jumper_returns_promptly(mcu, link, clock):
+    link.arm()
+    t0 = clock.monotonic_ns()
+    with pytest.raises(hb.TestDropRefused, match="TEST") as exc:
         link.test_drop()
+    assert clock.monotonic_ns() - t0 < 10 * MS  # no 2 s wait
+    assert exc.value.status.armed and isinstance(exc.value, RuntimeError)
     assert mcu.state == "ARMED"
 
 
-def test_power_cycle_reports_mcu_reset_and_opens_relay(mcu, link):
+def test_test_drop_when_not_armed_is_refused_without_sending_e1(mcu, link):
+    mcu.test_jumper = True
+    with pytest.raises(hb.TestDropRefused):
+        link.test_drop()  # DISARMED
+    assert mcu.state == "DISARMED" and mcu.reason == hb.REASON_MCU_RESET
+
+
+def test_test_drop_without_jumper_matches_firmware_status_only(mcu):
+    """Firmware: 0xE1 without the jumper is answered with the status byte, nothing else, state unchanged."""
+    mcu.feed(bytes([0x5A]))
+    assert mcu.feed(bytes([0xE1])) == bytes([mcu.status_byte()])
+    assert mcu.state == "ARMED" and mcu.poll() == b""
+
+
+def test_test_drop_while_latched_does_not_overwrite_reason(mcu):
+    mcu.test_jumper = True
+    mcu.feed(bytes([0x5A]))
+    mcu.clock.advance(1000 * MS)
+    mcu.poll()
+    assert mcu.reason == hb.REASON_TIMEOUT
+    mcu.feed(bytes([0xE1]))
+    assert mcu.reason == hb.REASON_TIMEOUT
+
+
+def test_power_cycle_reports_mcu_reset_latched_and_opens_relay(mcu, link):
     link.arm()
     mcu.power_cycle()
     s = link.status()
-    assert not s.relay_on and not s.armed and s.reason == hb.REASON_MCU_RESET
+    assert not s.relay_on and not s.armed and s.latched and s.reason == hb.REASON_MCU_RESET
+    assert link.arm().armed is False  # an MCU reset needs the button again
+    mcu.reset_button(500)
+    assert link.arm().armed
+
+
+def test_fake_link_unplug_returns_false_and_reports_dead(mcu, link):
+    link.arm()
+    assert link.send(0) and link.dead is False
+    link.unplug()
+    assert link.send(1) is False and link.dead is True
 
 
 def test_fake_link_write_timeout_returns_false_and_frame_is_lost(mcu, link, clock):
@@ -239,19 +421,30 @@ class FakeSerial:
         self._rx = bytearray()
         self.writes = []
         self.raise_timeout = False
+        self.unplugged: Exception | None = None  # set to an exception: every port access raises it
+        self.touched_after_unplug = 0
         self.swallow_reply = 0  # next n replies never arrive
         self.closed = False
         FakeSerial.instances.append(self)
 
+    def _check(self):
+        if self.unplugged is not None:
+            self.touched_after_unplug += 1
+            raise self.unplugged
+
     @property
     def in_waiting(self):
+        self._check()
+        self._rx += FakeSerial.mcu.poll()  # the MCU loop runs concurrently: late drop_ms bytes arrive here
         return len(self._rx)
 
     def read(self, n=1):
+        self._check()
         data, self._rx = bytes(self._rx[:n]), self._rx[n:]
         return data
 
     def write(self, data):
+        self._check()
         if self.raise_timeout:
             raise serial.SerialTimeoutException("write timeout")
         self.writes.append(bytes(data))
@@ -320,6 +513,49 @@ def test_serial_link_latched_echo_returns_false(ser_link, mcu, clock):
     assert mcu.latched
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        serial.SerialException("device disconnected"),
+        OSError(5, "Input/output error"),
+        ValueError("closed port"),
+    ],
+    ids=["SerialException", "OSError", "ValueError"],
+)
+@pytest.mark.parametrize("where", ["write", "in_waiting"])
+def test_serial_link_unplug_returns_false_and_reports_dead(ser_link, exc, where, monkeypatch):
+    link, ser = ser_link
+    link.arm()
+    assert link.send(0) and link.dead is False
+    if where == "write":
+        monkeypatch.setattr(ser, "write", lambda data: (_ for _ in ()).throw(exc))
+    else:
+        monkeypatch.setattr(FakeSerial, "in_waiting", property(lambda self: (_ for _ in ()).throw(exc)))
+    assert link.send(1) is False  # must not raise in the tick path
+    assert link.dead is True and link.last_error is exc
+
+
+def test_serial_link_dead_link_no_longer_touches_the_port(ser_link):
+    link, ser = ser_link
+    link.arm()
+    ser.unplugged = serial.SerialException("gone")
+    assert link.send(0) is False and link.dead
+    before = ser.touched_after_unplug
+    for seq in range(1, 6):
+        assert link.send(seq) is False
+    assert ser.touched_after_unplug == before
+
+
+def test_serial_link_write_timeout_is_transient_not_dead(ser_link):
+    link, ser = ser_link
+    link.arm()
+    assert link.send(0)
+    ser.raise_timeout = True
+    assert link.send(1) is False and link.dead is False
+    ser.raise_timeout = False
+    assert link.send(2) is True  # a timed-out write is just a missed heartbeat: the link recovers at once
+
+
 def test_serial_link_arm_times_out_without_reply(ser_link):
     link, ser = ser_link
     ser.swallow_reply = 1
@@ -333,6 +569,36 @@ def test_serial_link_test_drop(ser_link, mcu):
     mcu.drop_time_ms = 258  # needs both bytes of the uint16
     link.arm()
     assert link.test_drop() == 258
+
+
+def test_serial_link_test_drop_refused_without_jumper_is_prompt(ser_link, mcu, clock):
+    link, ser = ser_link
+    link.arm()
+    t0 = clock.monotonic_ns()
+    with pytest.raises(hb.TestDropRefused, match="TEST") as exc:
+        link.test_drop()
+    assert (
+        clock.monotonic_ns() - t0 < 10 * MS
+    )  # the refused 0xE1 gets a status byte: no 2 s wait, no TimeoutError
+    assert exc.value.status.armed
+    assert mcu.state == "ARMED"
+    assert ser.writes[-1] == b"\xe1"
+
+
+def test_serial_link_test_drop_when_disarmed_does_not_send_e1(ser_link, mcu):
+    link, ser = ser_link
+    mcu.test_jumper = True
+    with pytest.raises(hb.TestDropRefused):
+        link.test_drop()
+    assert b"\xe1" not in ser.writes
+
+
+def test_serial_link_test_drop_reports_2000_if_bus_never_falls(ser_link, mcu):
+    link, _ = ser_link
+    mcu.test_jumper = True
+    link.arm()
+    mcu.set_servo_voltage(12.0)
+    assert link.test_drop() == 2000
 
 
 def test_serial_link_close(ser_link):

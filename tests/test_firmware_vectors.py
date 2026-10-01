@@ -29,21 +29,34 @@ def _load_main():
 fw = _load_main()
 
 
-def tdiff(a: int, b: int) -> int:
-    """Host equivalent of time.ticks_diff for a 32-bit counter."""
-    return ((a - b + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+def tdiff_bits(bits: int):
+    """Host equivalent of time.ticks_diff for a counter that wraps at 2**bits (RP2040 MicroPython: 30)."""
+    mod, half = 1 << bits, 1 << (bits - 1)
+    return lambda a, b: ((a - b + half) & (mod - 1)) - half
+
+
+tdiff = tdiff_bits(32)
+INPUT_KEYS = {"dt", "tx", "out", "vbus_mv", "servo_mv", "estop", "btn", "jumper"}
 
 
 def run_vector(vec: dict) -> list[str]:
     """Replay a vector on Core; return the per-step output hex (empty string for no output)."""
-    now = vec["start_ms"]
-    core = fw.Core(now, tdiff)
-    inp = {"vbus_mv": 12000, "estop": False, "btn": False, "jumper": False}
+    bits = vec.get("wrap_bits", 32)
+    now = vec["start_ms"] & ((1 << bits) - 1)
+    core = fw.Core(now, tdiff_bits(bits))
+    inp = {"vbus_mv": 12000, "servo_mv": None, "estop": False, "btn": False, "jumper": False}
     outs = []
     for step in vec["steps"]:
-        now = (now + step["dt"]) & 0xFFFFFFFF
+        assert set(step) <= INPUT_KEYS, step
+        now = (now + step["dt"]) & ((1 << bits) - 1)
         inp.update({k: step[k] for k in inp if k in step})
-        out = core.poll(now, inp["vbus_mv"], inp["estop"], inp["btn"])
+        # servo_mv absent/None: the servo side follows the relay (PSU voltage while the previous step ended ARMED)
+        smv = (
+            inp["servo_mv"]
+            if inp["servo_mv"] is not None
+            else (inp["vbus_mv"] if core.state == fw.ARMED else 0)
+        )
+        out = core.poll(now, inp["vbus_mv"], inp["estop"], inp["btn"], smv)
         out += core.feed(now, bytes.fromhex(step.get("tx", "")), inp["jumper"])
         outs.append(out.hex())
     return outs
@@ -67,62 +80,115 @@ def test_vectors_cover_protocol_invariants():
         "wrap_safe_timeout",
         "test_drop_measures_ms",
         "test_drop_refused_without_jumper",
+        "boot_is_latched_reason_mcu_reset",
+        "boot_serial_arm_refused",
+        "boot_button_exactly_500ms_clears",
+        "boot_button_blocked_while_estop",
+        "timeout_exactly_1000_latched",
+        "heartbeat_at_exactly_1000_cannot_rescue",
+        "undervolt_exactly_50ms_still_armed",
+        "reset_button_exactly_500ms_clears",
+        "wrap_safe_timeout_30bit",
+        "test_drop_with_jumper_but_disarmed_refused",
+        "test_drop_with_jumper_but_latched_refused",
+        "arm_uses_psu_side_not_servo_side",
+        "arm_refused_while_servo_side_live",
+        "relay_weld_latches_reason_7",
+        "test_drop_then_weld",
+        "partial_frame_discarded_after_100ms",
+        "partial_frame_99ms_completes",
     ):
         assert required in names
-    # every status byte in every expectation is a legal byte: reason nibble <= 6
+    # every status byte in every expectation is a legal byte: reason nibble <= 7
     for v in VECTORS:
         for s in v["steps"]:
             out = bytes.fromhex(s["out"])
             if s.get("tx") and out and "drop" not in v["name"]:
-                assert out[0] >> 4 <= 6
+                assert out[0] >> 4 <= 7
+
+
+def clear_boot_latch(core, t0: int) -> int:
+    """Hold the (simulated) reset button for exactly 500 ms starting at t0; returns the time afterwards."""
+    core.poll(t0, 12000, False, True)
+    core.poll(t0 + 500, 12000, False, True)
+    core.poll(t0 + 500, 12000, False, False)
+    return t0 + 500
 
 
 def test_status_byte_layout():
     c = fw.Core(0, tdiff)
-    assert c.status() == 0x60  # boot: DISARMED, reason MCU_RESET
+    assert c.status() == 0x62  # boot: LATCHED, reason MCU_RESET
     c.feed(0, b"\x5a", False)
+    assert c.status() == 0x62  # serial ARM refused while latched
+    clear_boot_latch(c, 0)
+    assert c.status() == 0x60  # DISARMED, reason MCU_RESET kept
+    c.feed(1000, b"\x5a", False)
     assert c.status() == 0x05  # relay_on | armed
-    c.poll(1, 12000, True, False)  # e-stop
+    c.poll(1001, 12000, True, False)  # e-stop
     assert c.status() == 0x42  # latched, reason 4
-    c.poll(2, 5000, True, False)
+    c.poll(1002, 5000, True, False)
     assert c.status() & 0x08  # undervolt bit follows live voltage
 
 
 def test_relay_follows_armed_only():
     """Relay must be energised only in ARMED: every other reachable state maps to 'off'."""
     c = fw.Core(0, tdiff)
-    assert c.state != fw.ARMED
-    c.feed(0, b"\x5a", False)
+    assert c.state == fw.LATCHED
+    t = clear_boot_latch(c, 0)
+    assert c.state == fw.DISARMED
+    c.feed(t, b"\x5a", False)
     assert c.state == fw.ARMED
-    c.poll(1500, 12000, False, False)
+    c.poll(t + 1500, 12000, False, False, 12000)
     assert c.state == fw.LATCHED
 
 
 def test_firmware_line_budget():
-    assert len((FW / "main.py").read_text().splitlines()) <= 80
+    """Budget 80 -> 95 (wave-1 fix B): the second ADC (PSU-side vs servo-side divider, B4), the MCU_RESET boot latch
+    (S7), relay-weld detection (B4) and the 100 ms partial-frame timeout (NIT) are real behaviour that the host
+    vectors pin down; the extra lines are logic, not comments. Keep it reviewable."""
+    assert len((FW / "main.py").read_text().splitlines()) <= 95
 
 
-def test_fakemcu_satisfies_portable_vectors():
-    """FakeMcu (U1) and the firmware must agree on the serial-only vectors. Skipped until U1 has merged."""
+def run_vector_fake(vec: dict) -> list[str]:
+    """Replay a vector through FakeMcu's public API (no private attributes)."""
     hb = pytest.importorskip("so101_rl.servo.heartbeat")
-    if not hasattr(hb, "FakeMcu"):
-        pytest.skip("FakeMcu not merged yet")
     from so101_rl.servo.timing import FakeClock
 
-    for vec in (v for v in VECTORS if v["portable"] and v["start_ms"] == 0):
-        clock = FakeClock()
-        mcu = hb.FakeMcu(clock)
-        got = []
-        for step in vec["steps"]:
-            clock.advance(step["dt"] * 1_000_000)
-            mcu.poll()
-            got.append(mcu.feed(bytes.fromhex(step.get("tx", ""))).hex())
-        assert got == [s["out"] for s in vec["steps"]], vec["name"]
+    clock = FakeClock(
+        vec["start_ms"] * 1_000_000
+    )  # unwrapped: wrap-safety is the firmware's concern, outputs must match
+    mcu = hb.FakeMcu(clock)
+    mcu.drop_time_ms = 0  # vectors force or follow the servo side explicitly
+    outs = []
+    for step in vec["steps"]:
+        clock.advance(step["dt"] * 1_000_000)
+        if "estop" in step:
+            mcu.set_estop(step["estop"])
+        if "vbus_mv" in step:
+            mcu.set_bus_voltage(step["vbus_mv"] / 1000)
+        if "servo_mv" in step:
+            mcu.set_servo_voltage(None if step["servo_mv"] is None else step["servo_mv"] / 1000)
+        if "btn" in step:
+            mcu.set_button(step["btn"])
+        if "jumper" in step:
+            mcu.test_jumper = step["jumper"]
+        out = mcu.poll()
+        out += mcu.feed(bytes.fromhex(step.get("tx", "")))
+        outs.append(out.hex())
+    return outs
+
+
+@pytest.mark.parametrize("vec", VECTORS, ids=[v["name"] for v in VECTORS])
+def test_fakemcu_satisfies_every_vector(vec):
+    """FakeMcu must produce byte-identical output to the firmware for EVERY vector (not only the portable ones),
+    so drift between the two models (timeout `>=`, TEST_DROP refusal, reset reason, boot latch, weld) is caught."""
+    assert run_vector_fake(vec) == [s["out"] for s in vec["steps"]]
 
 
 def _install_stubs(monkeypatch, rx: list[bytes]):
     """Stub machine/micropython/select/time so main() can run a few loop iterations on the host."""
     log = {"kbd_intr": None, "wdt_timeout": None, "wdt_feeds": 0, "relay_init": None, "relay": [], "tx": []}
+    ticks = {"t": 0}
 
     class Pin:
         OUT, IN, PULL_UP = 1, 0, 2
@@ -134,16 +200,20 @@ def _install_stubs(monkeypatch, rx: list[bytes]):
 
         def value(self, x=None):
             if x is None:
-                # GP14 estop (HIGH = asserted) healthy -> LOW; GP13/GP12 released/absent -> HIGH
-                return {14: 0, 13: 1, 12: 1}[self.n]
+                # GP14 estop (HIGH = asserted) healthy -> LOW; GP12 absent -> HIGH;
+                # GP13 reset button: pressed (LOW) for the first 900 ms to clear the boot latch
+                return {14: 0, 13: 0 if ticks["t"] <= 900 else 1, 12: 1}[self.n]
             log["relay"].append(bool(x))
 
     class ADC:
         def __init__(self, n):
-            pass
+            self.n = n
 
         def read_u16(self):
-            return int(65535 * (12.0 / 5.7) / 3.3)  # 12 V through the divider
+            volts = 12.0  # GP26: PSU side, always 12 V. GP27: servo side, live only while the relay is closed
+            if self.n == 27 and not (log["relay"] and log["relay"][-1]):
+                volts = 0.0
+            return int(65535 * (volts / 5.7) / 3.3)
 
     class WDT:
         def __init__(self, timeout):
@@ -155,8 +225,6 @@ def _install_stubs(monkeypatch, rx: list[bytes]):
     class Stop(Exception):
         pass
 
-    ticks = {"t": 0}
-
     def sleep_ms(ms):
         ticks["t"] += 400  # 400 ms per loop iteration
         if ticks["t"] > 4000:
@@ -167,7 +235,9 @@ def _install_stubs(monkeypatch, rx: list[bytes]):
             pass
 
         def poll(self, _):
-            return bool(rx)
+            return (
+                bool(rx) and ticks["t"] >= 1200
+            )  # the host sends ARM only after the button cleared the latch
 
     class Buf:
         def read(self, n):
@@ -193,8 +263,9 @@ def _install_stubs(monkeypatch, rx: list[bytes]):
 
 
 def test_main_with_stubbed_machine(monkeypatch):
-    """main() wires the pins as documented: relay LOW at start, WDT 250 ms, Ctrl-C disabled, ARM closes the relay,
-    and the relay opens again after the heartbeat timeout."""
+    """main() wires the pins as documented: relay LOW at start, WDT 250 ms, Ctrl-C disabled, the boot latch needs the
+    button, ARM then closes the relay (servo-side ADC reads live, no false weld), and the relay opens again after the
+    heartbeat timeout."""
     log, stop = _install_stubs(monkeypatch, [b"\x5a"])
     mod = _load_main()
     with pytest.raises(stop):
