@@ -444,6 +444,8 @@ Each decision is recorded here once it is made, so it is not argued again.
 | 2026-09-30 | Stage A perception | HSV colour + depth. SAM2 and Grounding DINO move to Stage B. | Saves VRAM, and one red die needs nothing more |
 | 2026-09-30 | RL order | SAC + HER first on the real arm, then TD-MPC2 + HER | Gets a first real result faster. Goal-conditioning TD-MPC2 is custom work. |
 | 2026-09-30 | Overlap | This plan supersedes `01-Projects/hil-digital-twin-package-plan.md` and reuses its D1, D4 and D13 assets | User answer |
+| 2026-10-01 | Thermal cooldown | On a thermal trip the arm goes through the safe-state sequence to the rest pose, then torque off. It never holds pose while energised. It resumes only through a full re-energise. | User answer to the wave-1 review, which found the Phase 0 plan and code contradicting the main plan |
+| 2026-10-01 | MCU reset | The watchdog MCU boots LATCHED (reason MCU_RESET), so only the physical reset button re-enables power after any MCU reset | User answer to the wave-1 review |
 | 2026-09-30 | RL algorithm | TD-MPC2 as main, plus a SAC + HER baseline on reach | Tests whether the world model helps. Fitting in 10 GB is a hypothesis to be measured in Phase 2. TD-MPC2 is **vendored** (MIT licence, no packaging files in the repo). |
 | 2026-09-30 | Simulator | MuJoCo, using the official TheRobotStudio MJCF, system-identified | Light on VRAM, good contacts. Supersedes the Isaac choice from the earlier plans for this project. |
 | 2026-09-30 | Autonomy | Hardware e-stop, then tiers: attended until the 30-minute soak test passes, then unattended with a watchdog that cuts power | Resolves the conflict between minimal human time and the current consent rule. |
