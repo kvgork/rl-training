@@ -1,5 +1,7 @@
+import dataclasses
 import inspect
 
+import mujoco
 import numpy as np
 import pytest
 
@@ -26,7 +28,8 @@ def _hold_ticks(bus) -> np.ndarray:
 
 
 def test_implements_bus_protocol(bus):
-    # Bus is a plain (non runtime_checkable) Protocol in U0's frozen file: check structurally, incl. signatures.
+    assert isinstance(bus, Bus)  # Bus is @runtime_checkable (presence of members only) ...
+    # ... so also check signatures structurally.
     assert set(PROTOCOL_MEMBERS) >= {
         "connect", "disconnect", "ping_all", "read_block", "write_goal", "set_torque",
         "read_reg", "write_reg", "read_calibration_regs",
@@ -169,3 +172,63 @@ def test_reset_to_keyframe_restores_gains_and_clears_state(bus):
 
 def test_joint_order_matches_constants(bus):
     assert [bus.model.joint(i).name for i in range(6)] == list(JOINT_NAMES)
+
+
+def test_nan_goal_state_is_a_hard_error_and_leaves_no_mujoco_log(bus, tmp_path, monkeypatch):
+    """Intentional instability: a NaN in qvel makes the first mj_step warn "Nan, Inf or huge value in QACC".
+
+    MuJoCo would silently reset the state and write MUJOCO_LOG.TXT into the cwd; ``step_ticks`` raises instead, and
+    the C-level warning handler is swapped for a collector so no log file is created.
+    """
+    monkeypatch.chdir(tmp_path)
+    seen: list[str] = []
+    previous = mujoco.get_mju_user_warning()
+    mujoco.set_mju_user_warning(seen.append)
+    try:
+        bus.data.qvel[0] = np.nan
+        with pytest.raises(RuntimeError, match="unstable"):
+            bus.step_ticks(1)
+    finally:
+        mujoco.set_mju_user_warning(previous)
+    assert any("QACC" in m or "Nan" in m for m in seen), seen
+    assert not (tmp_path / "MUJOCO_LOG.TXT").exists()
+
+
+def test_velocity_sign_follows_drive_mode(calibration, cfg):
+    model, data = load_model()
+    flipped = {n: dataclasses.replace(c, drive_mode=1 - c.drive_mode) for n, c in calibration.items()}
+    a, b = MujocoBus(model, data, calibration, cfg), MujocoBus(model, data, flipped, cfg)
+    a.connect()
+    b.connect()
+    data.qvel[a.dof_adr] = 0.2
+    va, vb = BlockRead(), BlockRead()
+    a.read_block(va)
+    b.read_block(vb)
+    assert (va.velocity != 0).all()
+    np.testing.assert_array_equal(va.velocity, -vb.velocity)
+    for i, n in enumerate(JOINT_NAMES):
+        assert (va.velocity[i] < 0) == bool(calibration[n].drive_mode)
+
+
+def test_goal_clipped_to_calibrated_position_limits(bus, calibration):
+    lo = np.array([calibration[n].range_min for n in JOINT_NAMES], np.int32)
+    hi = np.array([calibration[n].range_max for n in JOINT_NAMES], np.int32)
+
+    def ctrl() -> np.ndarray:
+        return bus.data.ctrl[bus.act_ids].copy()  # fancy indexing copies: re-read after every write
+
+    assert bus.write_goal(np.zeros(6, np.int32))
+    below = ctrl()
+    assert bus.write_goal(lo)
+    np.testing.assert_allclose(below, ctrl(), atol=1e-12)  # 0 ticks lands exactly on range_min
+    assert bus.write_goal(np.full(6, 4095, np.int32))
+    above = ctrl()
+    assert bus.write_goal(hi)
+    np.testing.assert_allclose(above, ctrl(), atol=1e-12)
+    assert bus.read_reg("Goal_Position", 1) == hi[0]  # the register keeps what was last written
+    # a tightened servo limit register is honoured too
+    bus.write_reg("Max_Position_Limit", 1, int(lo[0]) + 10)
+    assert bus.write_goal(hi)
+    tight = ctrl()[0]
+    assert tight == pytest.approx(bus.ticks_to_q(lo + 10)[0], abs=1e-12)
+    assert tight != pytest.approx(above[0], abs=1e-6)
