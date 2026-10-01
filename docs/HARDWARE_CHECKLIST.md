@@ -37,21 +37,28 @@ have seen it fail on purpose and the system caught it.
 ```
  mains -> [PSU 12 V >= 8-10 A, fused, enclosed]
             |+12 V                                       0 V (common, star point at the PSU)
-            +--[Fuse 15 A]--[E-STOP, DC-13, latching NC]--[RELAY contacts NO 30/40 A]--+--[TVS 15-16 V bidirectional]-+
-                                                                                        |   (across the servo-side bus)
-                                                                                        +--> servo bus / 6 servos
-                                                                                        +--> divider 47k/10k -> RP2040 GP26
+            +--[Fuse 15 A]--+--[E-STOP, DC-13, latching NC]--[RELAY contacts NO 30/40 A]--+--[TVS 15-16 V bidirectional]-+
+                            |                                                             |   (across the servo-side bus)
+                            |                                                             +--> servo bus / 6 servos
+                            |                                                             +--> divider B 47k/10k -> RP2040 GP27
+                            +--> divider A 47k/10k -> RP2040 GP26  (PSU side: before the e-stop and the relay)
+
+ Divider A (PSU side, GP26): ARM undervolt check, undervolt bit and trip. It stays live with the relay open, so ARM
+ can be judged. Divider B (servo side, GP27): relay drop time (0xE1), "servo bus dead" check before ARM, and relay
+ weld detection (relay commanded open but divider B still reads >= 1 V for 500 ms -> reason 7). Each divider is
+ 47k (top) / 10k (bottom) with 100 nF across the 10k; Vbus = Vadc x 5.7. A single divider on the servo side would
+ read ~0 V with the relay open and ARM would be refused forever.
 
  Relay coil (12 V, from the PSU +12 V through the fuse, NOT from the contact side):
 
    +12 V (coil supply) --+-------------- coil ---------+
                          |                              |
                       [1N4007 / UF4007 flyback,         +--- collector/drain
-                       cathode to +12 V]                     NPN (e.g. BC337 / 2N2222) or logic-level N-MOSFET
+                       cathode to +12 V]                     NPN (e.g. BC337 / 2N2222) or a 3.3 V-gate MOSFET
                          +-------------- coil ---------+     emitter/source -> 0 V
                                                         base: RP2040 GP15 --[1 k]-- base   (+ [100 k] base -> 0 V pulldown)
 
- RP2040:  GP14 <- e-stop NC aux contact -> GND (HIGH = asserted/broken)   GP13 <- reset button (NO) -> GND
+ RP2040:  GP14 <- e-stop NC aux contact -> GND (HIGH = asserted/broken)   GP13 <- reset button (NO) -> GND (boots LATCHED)
           GP12 <- TEST jumper -> GND                                        USB-CDC <-> host (dedicated port)
 ```
 
@@ -67,18 +74,18 @@ pushed while power is cut).
 |---|---|---|---|
 | PSU | 12 V DC, >= 8-10 A continuous, enclosed, fused mains input | 1 | One stalled servo must not brown out the bus. Verify servo voltage range of the STS3215 before choosing 12 V |
 | Relay | 12 V coil automotive relay, SPST normally open, 30/40 A DC contacts (Bosch-style 4-pin) with socket | 1 | Coil current about 150-200 mA. Socket with screw or 6.3 mm spade terminals |
-| Coil driver | NPN BC337 / 2N2222 (Ic >= 500 mA) or logic-level N-MOSFET (e.g. 2N7000 / IRLZ44N), 1 k base resistor, 100 k pulldown | 1 set | GP15 must drive via the transistor; GPIO never sources the coil |
+| Coil driver | NPN BC337 / 2N2222 (Ic >= 500 mA), 1 k base resistor, 100 k pulldown (default). A MOSFET only if Rds(on) is **guaranteed at Vgs = 2.5-3.3 V** (e.g. IRLML6344, AO3400A) | 1 set | GP15 must drive via the transistor; GPIO never sources the coil. **Do not use a 2N7000**: its Rds(on) is specified at 4.5-10 V and Vgs(th) can reach 3 V, so at the Pico's 3.3 V gate drive it is marginal and may not pull the coil in reliably. Measure coil current and the transistor drop in H2 whichever part is used |
 | Flyback diode | 1N4007 or UF4007 across the coil, cathode to +12 V | 1 | Polarity check with a meter |
 | TVS | Bidirectional, 15-16 V standoff (e.g. SMCJ15CA / P6KE16CA), >= 600 W | 1 | Across the servo-side bus, short leads |
 | E-stop | Latching (twist-release) mushroom, **DC-13 rated >= supply current**, NC load contact(s) + NC auxiliary contact | 1 | Aux contact feeds GP14. AC-13-only parts are not acceptable |
 | Fuse | 15 A blade fuse + holder, in the +12 V feed at the PSU | 1 | Coil supply taps after the fuse |
 | Wire | 14-16 AWG, red/black, crimped ferrules/ring terminals | - | Short, star-grounded |
 | MCU | Raspberry Pi Pico (RP2040) + MicroPython UF2 | 1 | Dedicated USB cable, separate from the servo controller |
-| Divider | 47 k (top), 10 k (bottom), 1 % + 100 nF across the 10 k | 1 set | Vbus = Vadc x 5.7 |
-| Reset button | Momentary NO panel button | 1 | Physically reachable, not remotely actuatable |
+| Dividers | 2 sets of 47 k (top), 10 k (bottom), 1 % + 100 nF across the 10 k | 2 sets | A: PSU side (after the fuse, before e-stop/relay) to GP26; B: servo side (after the relay) to GP27. Vbus = Vadc x 5.7 |
+| Reset button | Momentary NO panel button | 1 | Physically reachable, not remotely actuatable. Also the only way out of the boot latch after any MCU reset |
 | TEST jumper | 2-pin header + shunt | 1 | Fitted only during `0xE1` tests |
 | Dummy load | 12 V 50 W halogen/lamp or 10 ohm 50 W resistor | 1 | Bench tests before any servo is connected |
-| Instruments | Multimeter, optional scope (preferred for drop timing), camera/phone for photos | - | |
+| Instruments | Multimeter, **2-channel scope or logic analyser with an analog channel (>= 10 kS/s) - required for the H2 e-stop timing**, camera/phone for photos | - | The e-stop timing must not rely on the MCU relay path (see H2) |
 | Servo fan | Small 12 V or 5 V fan + mount | 1 | H4 |
 | Foam, clamps | Foam pad under the arm, base clamp | - | H5, H6 |
 
@@ -119,36 +126,73 @@ Header (append one row per artifact; the H-track, not the software waves, writes
      known. Press the e-stop: load drops.
   4. Measure: bus voltage at the dummy load under load (sag < 0.5 V), TVS not warm, relay contacts not warm
      after 10 minutes at the dummy load's current.
-  5. E-stop timing: use the MCU ADC via `0xE1` (H3 firmware, TEST jumper) or a scope on the bus; press the
-     e-stop with the relay closed; V_bus must be < 1 V within 50 ms.
-  6. Photograph the assembled power path (labels visible).
-- **Artifacts:** photo; `runs/hw/power-path-<ts>.json {psu_a, relay_part, tvs_part, estop_rating}`;
-  `runs/hw/estop-<ts>.json {drop_ms, v_after}`.
-- **Pass:** continuity open when de-energised; e-stop opens the load path; `drop_ms` <= 50 and `v_after` < 1 V;
-  estop_rating is DC-13 >= psu_a; no USB/GPIO relay and no AC SSR in the path.
+  5. **E-stop contact timing, measured independently of the relay command path.** The `0xE1` TEST_DROP measures
+     the *relay* (the MCU opens it and times the bus), so it says nothing about the e-stop contact and must not be
+     used for this step. Instead:
+     1. Close the relay with the **hand-driven coil jumper from step 3** (MCU GP15 disconnected, or the MCU not
+        powered), so that nothing but the e-stop contact can open the load path. Dummy load running at its
+        rated current.
+     2. Scope ch1 on the e-stop's own contact: the voltage across the NC load contact (or the aux contact line to
+        GND), triggered on its edge = the instant the contact opens. Scope ch2 on the servo-side bus (divider B
+        input or the bus itself, probe ground at the star point). Same-timebase capture, >= 10 kS/s, 100 ms/div or
+        faster. (Equivalent: a second, independent MCU/logic analyser sampling those two nodes with its own clock;
+        never the watchdog MCU's ADC.)
+     3. Press the e-stop firmly 5 times, each time starting from the relay closed and the bus at full voltage;
+        keep the 5 captures.
+     4. Per capture, read `t_open` (contact edge) and `t_below_1v` (servo bus < 1 V) and compute
+        `drop_ms = t_below_1v - t_open`. Report the worst of the five.
+     5. Then repeat once with the MCU live and ARMED (normal operation): additionally the MCU must latch
+        reason 4 (`0x42`) and the relay must open; the contact timing above must not change.
+  6. Photograph the assembled power path (labels visible) and the scope screenshots.
+- **Artifacts:** photo + scope captures; `runs/hw/power-path-<ts>.json {psu_a, relay_part, tvs_part, estop_rating}`;
+  `runs/hw/estop-<ts>.json {drop_ms_worst, drop_ms_each[5], method: "scope" | "independent_logger", v_after,
+  relay_driven_by: "hand_jumper"}`.
+- **Pass:** continuity open when de-energised; e-stop opens the load path; worst `drop_ms` <= 50 and `v_after`
+  < 1 V, measured with the relay driven by the hand jumper (a number obtained through `0xE1` or through the MCU
+  ADC does not count for H2); estop_rating is DC-13 >= psu_a; no USB/GPIO relay and no AC SSR in the path.
 - **Shown-to-fail:** remove the coil supply (pull the relay socket or the coil fuse) with the dummy load running:
-  the load must drop. Also confirm that unplugging the USB cable to the MCU (H3) opens the relay.
+  the load must drop. Also confirm that unplugging the USB cable to the MCU (H3) opens the relay. Add a second
+  shown-to-fail for the timing method itself: with the coil jumper still driving the relay, release the e-stop
+  (twist) and confirm the scope shows the bus coming back (the test setup can see both edges).
 
 ## H3 - Watchdog MCU bring-up (deadman)
 
 - **Parts:** RP2040 Pico, MicroPython, transistor driver board from H2, reset button, TEST jumper, e-stop aux
-  contact, divider. **Dummy load on the relay, no servos.**
+  contact, both dividers (A: PSU side GP26, B: servo side GP27). **Dummy load on the relay, no servos.**
 - **Needs:** `firmware/watchdog_mcu/main.py` (7.1), `SerialHeartbeatLink` (1.3), servo process (3.2).
 - **Procedure:**
-  1. Flash per `firmware/watchdog_mcu/README.md` (manual). Check the boot status byte is `0x60`.
-  2. Wire GP15 (via 1 k to the transistor), GP14 (e-stop aux), GP13 (reset), GP12 (TEST), GP26 (divider).
-  3. Replay `firmware/watchdog_mcu/test_vectors.json` against the real MCU over serial (all steps; vectors that
-     set `vbus_mv`/`estop`/`btn`/`jumper` need the matching physical action - at least run every `portable` vector
-     and the e-stop, reset-button and undervolt ones by hand).
-  4. No-heartbeat timing: ARM, stop sending; scope or ADC log: relay opens at 1.0 +/- 0.1 s.
-  5. With the servo process heartbeating: `kill -9` it -> relay opens <= 1.5 s. Unplug the MCU USB -> open
+  1. Flash per `firmware/watchdog_mcu/README.md` (manual). Check the boot status byte is `0x62` (**LATCHED**,
+     reason MCU_RESET; the MCU never boots armed or disarmed).
+  2. Wire GP15 (via 1 k to the transistor), GP14 (e-stop aux), GP13 (reset), GP12 (TEST), GP26 (divider A, PSU
+     side), GP27 (divider B, servo side).
+  3. Boot-latch proof: serial `0x5A` right after boot must answer `0x62` and leave the relay open; hold the reset
+     button 500 ms (not with the e-stop pressed): `0xE0` answers `0x60`; only now `0x5A` arms (`0x05`). Also
+     power-cycle the MCU (unplug/replug USB) while ARMED: relay open and `0x62` again.
+     Then ARM with the relay open and the servo bus at 0 V (divider B reads about 0): must be accepted, i.e. the
+     ARM check uses divider A.
+  4. Replay `firmware/watchdog_mcu/test_vectors.json` against the real MCU over serial (all steps; vectors that
+     set `vbus_mv`/`servo_mv`/`estop`/`btn`/`jumper` need the matching physical action - at least run every
+     `portable` vector and the e-stop, reset-button, undervolt, relay-weld and TEST_DROP ones by hand. Every
+     vector begins with the 500 ms button press that clears the boot latch, except the `boot_*` ones).
+  5. No-heartbeat timing: ARM, stop sending; scope or ADC log: relay opens at 1.0 +/- 0.1 s.
+  6. With the servo process heartbeating: `kill -9` it -> relay opens <= 1.5 s. Unplug the MCU USB -> open
      <= 1.5 s. Reboot the host -> relay stays/opens open.
-  6. Latch persistence: after any trip the relay stays open; a serial `0x5A` ARM does not close it.
-     Only the physical button held 500 ms returns the MCU to DISARMED (status `0x1_`/`0x4_`, relay open until ARM).
+  7. Latch persistence: after any trip the relay stays open; a serial `0x5A` ARM does not close it.
+     Only the physical button held 500 ms returns the MCU to DISARMED (status `0x1_`/`0x4_`, relay open until
+     ARM; the trip reason is kept until the next ARM).
+  8. Relay-weld detection (dummy load only, servo disconnected): with the relay open (DISARMED or tripped), feed
+     12 V from a **current-limited bench supply (<= 100 mA)** directly into divider B only (never into the servo
+     bus or the PSU rail). After 0.5 s the status must become `0x72` (reason 7); the button must not hold DISARMED
+     while the injection stays; ARM must be refused. Remove the injection, press the button, ARM works.
+  9. TEST_DROP: with the TEST jumper fitted and ARMED, `0xE1` -> status `0x52` then `drop_ms` (informational
+     here; the e-stop timing is measured in H2 step 5). Without the jumper, or when not ARMED, `0xE1` must be
+     answered with a plain status byte and no `drop_ms`.
 - **Artifact:** `runs/hw/deadman-<ts>.json {timeout_s, kill9_s, usb_unplug_s, host_reboot_open, latch_persists,
-  serial_reset_rejected, vectors_passed}`.
+  serial_reset_rejected, boot_latched, button_required_after_reset, arm_ok_with_relay_open, weld_detected,
+  vectors_passed}`.
 - **Pass:** timeout 1.0 +/- 0.1 s; kill -9 <= 1.5 s; USB unplug <= 1.5 s; host reboot opens; latch persists;
-  serial reset rejected; all vectors pass on the real MCU.
+  serial reset rejected; boots `0x62` and needs the button after every MCU reset; ARM accepted with the relay
+  open (divider A); weld injection gives `0x72`; all vectors pass on the real MCU.
 - **Shown-to-fail:** deliberately try to clear a latch over serial (`0x5A`, garbage, repeated STATUS) and
   record that the latch stays (`serial_reset_rejected: true`). Also ARM with the e-stop pressed and with V_bus
   below 9 V (bench supply turned down): ARM must be refused.
