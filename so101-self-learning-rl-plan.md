@@ -208,7 +208,7 @@ These are developed **in parallel, off the critical path**, and attach when thei
         - **Supply:** the PSU is at least 8–10 A at 12 V, so that one stalled servo cannot brown out the bus.
       - **Safe-state sequence for non-emergency trips** (thermal, stuck action, NaN, out-of-distribution, lost camera):
         - **Sequence:** ramp home at low speed, set the arm down in the rest pose, then turn torque off. Cutting power is reserved for emergencies and deadman loss.
-        - **Bounds:** the sequence is **bounded to 5 s**. After that it falls through to torque-off in place, and finally to the deadman.
+        - **Bounds:** the sequence is **bounded by `bound_s` (20 s; see §10, 2026-10-01)**. After that it falls through to torque-off in place, and finally to the deadman.
         - **Rest pose:** it rests on the base or the table, so turning torque off causes no motion. Verify this by turning torque off from that pose.
         - **Process exits:** SIGINT, exceptions and disconnects all go through this sequence. Set `disable_torque_on_disconnect` explicitly, because LeRobot's default drops the arm wherever it is.
       - **Sag map:** limp falls are sampled *on hardware*, from the safety-box corners and the highest poses, with foam underneath. Each is recorded with the camera. MuJoCo does not model the gearbox's back-drive friction. None of the falls may touch the D435 mount.
@@ -446,6 +446,7 @@ Each decision is recorded here once it is made, so it is not argued again.
 | 2026-09-30 | Overlap | This plan supersedes `01-Projects/hil-digital-twin-package-plan.md` and reuses its D1, D4 and D13 assets | User answer |
 | 2026-10-01 | Thermal cooldown | On a thermal trip the arm goes through the safe-state sequence to the rest pose, then torque off. It never holds pose while energised. It resumes only through a full re-energise. | User answer to the wave-1 review, which found the Phase 0 plan and code contradicting the main plan |
 | 2026-10-01 | MCU reset | The watchdog MCU boots LATCHED (reason MCU_RESET), so only the physical reset button re-enables power after any MCU reset | User answer to the wave-1 review |
+| 2026-10-01 | Safe-state bound | Keep the slow 240 ticks/s ramp (about 21°/s) with `bound_s` = 20 s. The loader computes the minimum from the calibration. This replaces the earlier 5 s figure, which cannot be met at that speed. | User answer. The worst case (joint limit → home → rest) is 16.8 s. |
 | 2026-09-30 | RL algorithm | TD-MPC2 as main, plus a SAC + HER baseline on reach | Tests whether the world model helps. Fitting in 10 GB is a hypothesis to be measured in Phase 2. TD-MPC2 is **vendored** (MIT licence, no packaging files in the repo). |
 | 2026-09-30 | Simulator | MuJoCo, using the official TheRobotStudio MJCF, system-identified | Light on VRAM, good contacts. Supersedes the Isaac choice from the earlier plans for this project. |
 | 2026-09-30 | Autonomy | Hardware e-stop, then tiers: attended until the 30-minute soak test passes, then unattended with a watchdog that cuts power | Resolves the conflict between minimal human time and the current consent rule. |

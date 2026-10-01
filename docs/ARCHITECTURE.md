@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.4 (2026-09-30). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.5 (2026-10-01). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 >
@@ -113,7 +113,7 @@ rl-trainer/
 │   │                             #   feetech_bus.py: real STS3215
 │   │                             #   fake_bus.py: plant, thermal and fault injection
 │   │                             # heartbeat.py: MCU link + FakeMcu; timing; shm
-│   ├── safety/                   # clamp, fk (pure-numpy FK + box), thermal, stuck, safe_state, reenergize,
+│   ├── safety/                   # clamp, fk (pure-numpy FK + box), transit (rest<->home transit-zone planner), thermal, stuck, safe_state, reenergize,
 │   │                             # calib_check, state_machine, pipeline. Never imports rl, wm or env.
 │   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface)
 │   ├── perception/               # camera (D435 by serial, FakeCamera), die_tracker (HSV + depth, None when occluded),
@@ -152,15 +152,38 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - `Bus` is `@runtime_checkable`.
 
 **Safety (U2).**
-- `SafetyPipeline.apply` runs only in RUN. In the HOLD, COOLDOWN and SAFE_STOPPING states the core must call `monitor_only(block, v)` every tick, so the thermal dwell keeps advancing.
-- Call `resync(present)` when `SmOutputs.resync_target` is set, and call `SafetyStateMachine.mark_energized()` after `reenergize`.
+- `SafetyPipeline.apply` runs only in RUN. In every other state (HOLD, SAFE_STOPPING, TORQUE_OFF) the core must call `monitor_only(block, v)` every tick, so the thermal dwell keeps advancing.
+- Call `resync(present)` when `SmOutputs.resync_target` is set.
+- When `SmOutputs.reenergize_requested` is set, run `reenergize(..., tick_hook=hb)`. Then call `mark_energized()` if it succeeded, or `notify_reenergize_failed()` if it failed.
+- `reenergize(bus, cfg, calibration, clock, block, *, timeout_s=5.0, tick_hook=None, heartbeat_gap_s=0.8, fk=None)`.
+  - It calls `tick_hook(ok)` once per servo tick, with ok = the read succeeded AND the write was accepted. The core sends the heartbeat only when ok is true.
+  - With a hook, the first good tick and every later one must come within 0.8 s.
+  - It raises `UnsafeStartPose` if the start pose is neither within `rest_tolerance_ticks` of rest nor inside the box.
+- `SafeStateSequencer(cfg, clock, *, tracking_error_ticks, motor_ids, fk)` has no defaults: all three arguments are required, so none of its protections can be dropped silently. `run(bus, block, *, servo_hz, tick_hook)` is the blocking driver used for shutdown.
+- **Box tolerance:** BOX_PRESENT trips only when the present pose is more than `box.present_tolerance_m` (5 mm) outside the box. The commanded target is clamped to the exact box.
+- **Calibration check:** `calib_check` does not compare `drive_mode`, because no servo register holds it. A motion-sign test is needed instead, on the hardware track or in U3.
+- **In TORQUE_OFF** the core keeps writing goal = present and keeps sending the heartbeat. Otherwise the MCU would latch during the thermal dwell and the automatic resume would need a human.
 - `So101FK(chain, calibration)` needs the calibration, or the `drive_mode` signs default to +1.
 - The stuck monitor is fed the sanitized *commanded* delta, because under anti-windup the post-clamp delta of a blocked joint decays to 0.
-- **Known gap:** the placeholder `home_ticks` / `rest_ticks` (2047, which is q = 0) put the tip at x = 0.39 m, outside the box. H5 must measure real values before the pipeline can run on hardware.
+- **Rest and home poses.** Both are marked NEEDS H5.
+  - *rest* is the gravity-stable pose measured on 2026-09-30: [2050, 2200, 2301, 2745, 2040, 2065], tip at z = −0.012 m.
+  - *home* is an in-box placeholder: [2047, 960, 2700, 2748, 2047, 2047], tip at (0.20, 0, 0.15).
+- **What the loader checks:**
+  - FK(home) is at least 10 mm inside the box.
+  - FK(rest) is at least 5 mm above the table and inside the box's x/y footprint. This approximates "clear of the D435", because the camera mount pose is not in the config.
+  - Replaying the exact rest-to-home and home-to-rest transits tick by tick never takes the tip below the table plus 5 mm.
+  - `bound_s` is at least the worst limit-to-home time plus the home-to-rest time plus 1 s.
+  - The replay assumes the arm follows perfectly. At run time the time bounds end any stall with torque off.
 
 **Sim (U4).**
 - `load_model()` compiles `so101_rl_scene.xml` through `MjSpec`. It adds primitive jaw box geoms and a `gripper_tip` site, and disables collisions on the jaw meshes.
 - `MujocoBus` implements `Bus` using the real calibration.
+  - **Registers:** `Present_Position`, `Goal_Position`, `Torque_Enable`, `Present_Temperature` and `Present_Voltage` are live. Every other register is stored and read back.
+  - **Limits and signs:** `write_goal` clips to the Min/Max_Position_Limit registers, and the reported velocity follows the `drive_mode` sign.
+  - **Torque:** it starts **de-energised**, like FakeBus and the real arm. `reset_to_keyframe` energises the bus.
+  - **Unstable simulation:** `step_ticks` raises `RuntimeError` if MuJoCo reports a non-finite state, instead of resetting silently.
+  - **Keyframes:** the scene's `rest` and `home` keyframes follow the config ticks.
+- `reenergize` is tested end to end on FakeBus and on MujocoBus (`tests/test_reenergize_backends.py`).
 - The gripper uses its own linear map between the calibration `range_min`/`range_max` and the MJCF joint range.
 - `so101_rl.sim` re-exports lazily, so importing it does not load `mujoco`.
 
@@ -207,8 +230,25 @@ These are ordered from the outermost layer to the innermost.
      - Each complete frame gets one status byte back: bit0 relay, bit1 latched, bit2 armed, bit3 undervolt, bits4–7 reason.
      - The first heartbeat after ARM sets the sequence baseline, and every later one must be +1 mod 256.
      - A gap, a repeated seq or a bad complement latches the MCU with reason 3.
-     - The MCU boots with reason 6 (MCU_RESET).
-     - The spec is `firmware/watchdog_mcu/PROTOCOL.md`. `FakeMcu` is cross-checked against the same test vectors.
+     - The MCU **boots LATCHED** with reason 6 (MCU_RESET) after every reset, whether from power, the hardware WDT or USB re-enumeration (status `0x62`). Only the physical button re-enables power.
+     - Trip reasons:
+
+       | Code | Reason |
+       |---|---|
+       | 1 | TIMEOUT (≥ 1000 ms) |
+       | 2 | UNDERVOLT |
+       | 3 | SEQ_ERROR |
+       | 4 | ESTOP_PIN |
+       | 5 | TEST |
+       | 6 | MCU_RESET |
+       | 7 | WELD |
+     - A partial heartbeat frame is dropped after 100 ms.
+     - The spec is `firmware/watchdog_mcu/PROTOCOL.md`. `FakeMcu` is kept byte-identical to the firmware `Core` by replaying every test vector through both.
+   - **Voltage sensing (two dividers):**
+     - The PSU-side divider sits before the e-stop and relay (GP26). It gates ARM on undervoltage.
+     - The servo-side divider sits after the relay (GP27). It is used for drop timing, and for a "bus dead" check before ARM.
+     - It also detects a welded relay: if the relay is commanded open but the servo side reads at least 1 V for 500 ms, the MCU latches with reason 7 (WELD).
+   - **Host link:** `SerialHeartbeatLink.send` never raises. Any serial failure, such as a USB unplug, returns False and sets `dead`. A refused TEST_DROP raises `TestDropRefused` immediately.
    - **Latching:**
      - Trips latch in the MCU. Only the physical reset button, held for 500 ms and not while the e-stop is asserted, clears them. Serial never can.
      - The e-stop input is wired through an NC contact, so a broken wire reads as asserted.
@@ -228,30 +268,40 @@ These are ordered from the outermost layer to the innermost.
    7. `check_range` (integer dtype, 0..4095), always the last call before `write_goal`.
 
    Clamps (TRACKING, JOINT_LIMIT, BOX) never change the state-machine state.
-4. **Safe-state sequence, bounded to 5 s.**
-   - It ramps home, rests the arm in a gravity-stable pose, then turns torque off.
+4. **Safe-state sequence, bounded by `bound_s` (20 s).**
+   - The user decided on 2026-10-01 to keep the slow 240 ticks/s ramp. The loader computes the minimum `bound_s` from the calibration.
+   - The sequence ramps home, then to the gravity-stable rest pose, through the transit zone (`safety/transit.py`):
+     - it lifts first;
+     - the target tip never goes below the table plus 5 mm;
+     - otherwise it holds.
+   - It then turns torque off.
    - If it cannot finish, it falls back to torque-off in place, then to the deadman.
+   - The heartbeat continues through `tick_hook`.
+   - A refused torque-off (3 attempts) raises.
    - All process exits go through it.
 5. **Resume policy, by cause.**
 
    | Cause | State path | Resume |
    |---|---|---|
-   | Thermal | RUN/HOLD → COOLDOWN → RUN (`resync_target`). A 4th trip within 1 h goes → SAFE_STOPPING → TORQUE_OFF. | Automatic, at most 3 per hour; after that, a human |
+   | Thermal | RUN/HOLD → SAFE_STOPPING (to rest) → TORQUE_OFF → after the dwell → CHECK (`reenergize_requested`) → full `reenergize` → RUN (resync on a good read). It never holds pose energised; COOLDOWN is unused (decided 2026-10-01). | Automatic, at most 3 per hour, counted by the state machine. A 4th trip, or a failed re-energise, needs a human. |
    | NaN, stuck action, OOD, RANGE, BOX_PRESENT, N stale commands | → SAFE_STOPPING → TORQUE_OFF | A fresh process and a checkpoint |
    | Protection bit, calibration mismatch, user stop | → SAFE_STOPPING → TORQUE_OFF | A human |
    | Heartbeat failure, MCU latched, deadman, 3 consecutive bus failures | → LATCHED (absorbing) | A human and a physical reset |
 
+   - Every resume requires `block_ok`.
+   - LATCHED and TORQUE_OFF send torque-off every tick.
+
    **Re-energise order** (`safety/reenergize.py`):
    1. `ping_all`
    2. calibration registers
-   3. the other registers
-   4. a block read
-   5. goal = present
+   3. Lock = 0, check that Torque_Enable == 0, write every register, then read every register back
+   4. a block read. The start pose must be near rest or inside the box, temperatures below the trip and not 0 or 255, and Status 0.
+   5. goal = present (this is the first heartbeat tick)
    6. read back Goal_Position
    7. `set_torque(True)`
-   8. ramp home
+   8. ramp home through the transit zone, re-checking temperatures on every read
 
-   A failure after torque is on leaves torque on, and the caller must run the shutdown sequence.
+   Any failure after torque is on turns torque off (3 attempts), then re-raises.
 6. **Autonomy tiers.**
    - Tier 0 is attended.
    - Tier 1 is unattended, and is allowed only after the soak gates pass: 30 minutes, then 2 hours goal-directed, with p99.9 tick overrun below 5 ms.
@@ -328,3 +378,4 @@ Bump the version line at the top and add an entry below.
 | 0.2 | 2026-09-30 | Wave 0 (U0): pixi features/environments/tasks and solver pins (§8), `scripts/`, `assets/so101/upstream/`, `config/so101_kinematics.yaml` and `tests/data` (§4), links to the plan's F-sections and the F3 state-size deviation (§5) |
 | 0.3 | 2026-09-30 | U0 review fixes: strict config/calibration validation (§5), homing_offset semantics in ticks<->rad documented (§5), F3 state size now 232 in the plan, shm attach/create hardening, vendor tarball checksum and committed vendored-file manifest (§8) |
 | 0.4 | 2026-09-30 | Wave 1 integrated (U1, U2, U4, U5, U6, U7): the servo backends and heartbeat link, the safety layer, the MuJoCo backend, Stage A perception, episode logging, and the watchdog firmware with its hardware checklist (§4). Interface behaviour and the binding log convention (§5). The F4 wire protocol and latch semantics, the implemented check order, and the resume state paths (§6). The sysid check (§7). The `hand-eye` task fixed and `compare-real` added (§8). |
+| 0.5 | 2026-10-01 | Wave-1 review fixes (`plans/reviews/2026-09-30-wave1-review.md`). §4: `safety/transit.py`. §5: the `reenergize` and sequencer signatures, `tick_hook`, the TORQUE_OFF duties, the measured rest pose and in-box home, the loader geometry and time-bound checks, the box tolerance, live MujocoBus registers with a de-energised start. §6: the MCU boots latched, the two voltage dividers and weld detection, the never-raising host link, the 20 s safe-state bound and transit zone, thermal → rest → torque off → re-energise, and the hardened re-energise order. |
