@@ -24,6 +24,14 @@ DEFAULT_TEMPERATURE_C = 35  # trivial thermal model: constant, overridable via `
 SUPPLY_VOLTAGE_DV = 120  # 12.0 V in 0.1 V units
 MOVING_EPS_RAD_S = 1e-3
 LOAD_FULL_SCALE = 1000  # 1000 = 100 % of the actuator force range
+# MuJoCo warnings that mean the state is no longer finite/sane. MuJoCo silently resets such a state and writes
+# MUJOCO_LOG.TXT into the cwd; ``step_ticks`` turns them into a hard error instead.
+_FATAL_WARNINGS = (
+    mujoco.mjtWarning.mjWARN_BADQPOS,
+    mujoco.mjtWarning.mjWARN_BADQVEL,
+    mujoco.mjtWarning.mjWARN_BADQACC,
+    mujoco.mjtWarning.mjWARN_BADCTRL,
+)
 
 
 class MujocoBus(Bus):
@@ -62,6 +70,8 @@ class MujocoBus(Bus):
         self._force_scale = np.maximum(np.abs(model.actuator_forcerange[self.act_ids]).max(axis=1), 1e-9)
         self._ticks_per_rad = np.full(N_JOINTS, 4096.0 / (2.0 * np.pi))
         self._ticks_per_rad[GRIPPER] = gripper_ticks_per_rad(calibration)
+        # d(ticks)/d(rad) is negative for drive_mode = 1 (arm joints and gripper alike), so velocity follows the sign.
+        self._vel_sign = np.array([-1.0 if calibration[n].drive_mode else 1.0 for n in JOINT_NAMES])
         self._steps_per_tick = max(1, round((1.0 / cfg.rates.servo_hz) / model.opt.timestep))
 
         self.temperature_c = np.full(N_JOINTS, DEFAULT_TEMPERATURE_C, dtype=np.int32)
@@ -71,6 +81,7 @@ class MujocoBus(Bus):
         self._saved_gain = model.actuator_gainprm[self.act_ids].copy()
         self._saved_bias = model.actuator_biasprm[self.act_ids].copy()
         self._delay: deque[np.ndarray] = deque()
+        self._goal: np.ndarray | None = None  # last accepted goal (raw ticks); None until the first write
         self._regs: dict[tuple[str, int], int] = {}
         for n in JOINT_NAMES:
             c = calibration[n]
@@ -113,7 +124,7 @@ class MujocoBus(Bus):
         q = d.qpos[self.qpos_adr]
         qd = d.qvel[self.dof_adr]
         out.position[:] = self.q_to_ticks(q)
-        out.velocity[:] = np.rint(qd * self._ticks_per_rad).astype(np.int32)
+        out.velocity[:] = np.rint(qd * self._ticks_per_rad * self._vel_sign).astype(np.int32)
         force = d.actuator_force[self.act_ids]
         out.load[:] = np.clip(np.rint(force / self._force_scale * LOAD_FULL_SCALE), -LOAD_FULL_SCALE, LOAD_FULL_SCALE)
         out.voltage_dv[:] = SUPPLY_VOLTAGE_DV
@@ -133,8 +144,13 @@ class MujocoBus(Bus):
             return False
         if g.min() < 0 or g.max() > 4095:
             return False
-        goal = g.astype(np.int32, copy=True)
-        self.written_goals.append(goal)
+        raw = g.astype(np.int32, copy=True)
+        self.written_goals.append(raw)
+        self._goal = raw.copy()
+        # The servo clamps its goal to its Min/Max_Position_Limit registers (calibrated range_min/max by default).
+        lo_t = np.array([self._regs[("Min_Position_Limit", i)] for i in self._ids], dtype=np.int32)
+        hi_t = np.array([self._regs[("Max_Position_Limit", i)] for i in self._ids], dtype=np.int32)
+        goal = np.clip(raw, lo_t, hi_t)
         if self.action_delay_ticks:
             if not self._delay:  # first write: until the first goal arrives the arm holds where it is
                 hold = self.q_to_ticks(self.data.qpos[self.qpos_adr])
@@ -164,6 +180,22 @@ class MujocoBus(Bus):
         return True
 
     def read_reg(self, name: str, motor_id: int) -> int:
+        """Live registers as on ``FakeBus``: position, goal and torque come from the simulation state."""
+        if motor_id not in self._ids:
+            raise ValueError(f"unknown motor id {motor_id}")
+        j = self._ids.index(motor_id)
+        if name == "Present_Position":
+            return int(self.q_to_ticks(self.data.qpos[self.qpos_adr])[j])
+        if name == "Goal_Position":
+            if self._goal is None:  # nothing written yet: the servo holds where it is
+                return int(self.q_to_ticks(self.data.qpos[self.qpos_adr])[j])
+            return int(self._goal[j])
+        if name == "Torque_Enable":
+            return int(self._torque[j])
+        if name == "Present_Temperature":
+            return int(self.temperature_c[j])
+        if name == "Present_Voltage":
+            return SUPPLY_VOLTAGE_DV
         try:
             return self._regs[(name, motor_id)]
         except KeyError:
@@ -172,6 +204,9 @@ class MujocoBus(Bus):
     def write_reg(self, name: str, motor_id: int, value: int) -> None:
         if motor_id not in self._ids:
             raise ValueError(f"unknown motor id {motor_id}")
+        if name == "Torque_Enable":
+            self.set_torque(bool(value), [motor_id])
+            return
         self._regs[(name, motor_id)] = int(value)
 
     def read_calibration_regs(self) -> dict[str, MotorCalibration]:
@@ -185,8 +220,12 @@ class MujocoBus(Bus):
 
     def step_ticks(self, n: int = 1) -> None:
         """Advance physics by ``n`` servo ticks (``n x round((1/servo_hz)/timestep)`` mj_steps)."""
+        before = [self.data.warning[w].number for w in _FATAL_WARNINGS]
         for _ in range(int(n) * self._steps_per_tick):
             mujoco.mj_step(self.model, self.data)
+        for w, b in zip(_FATAL_WARNINGS, before, strict=True):
+            if self.data.warning[w].number > b:
+                raise RuntimeError(f"MuJoCo simulation unstable: {mujoco.mju_warningText(w, 0)}")
 
     def reset_to_keyframe(self, name: str = "rest") -> None:
         """Reset physics to a keyframe, clear the delay FIFO and the intercept, restore torque."""
@@ -195,6 +234,7 @@ class MujocoBus(Bus):
         mujoco.mj_forward(self.model, self.data)
         self._delay.clear()
         self.written_goals.clear()
+        self._goal = None
 
     def _restore_gains(self) -> None:
         self.model.actuator_gainprm[self.act_ids] = self._saved_gain
