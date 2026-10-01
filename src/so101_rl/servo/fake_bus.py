@@ -133,12 +133,14 @@ class FakeBus:
         thermal: ThermalModel | None = None,
         initial_ticks: Sequence[int] | None = None,
         load_gain: float = 5.0,
+        record_writes: bool = True,
     ) -> None:
         self.clock = clock
         self.plant = plant if plant is not None else FirstOrderPlant()
         self.faults = faults if faults is not None else FaultInjector()
         self.thermal = thermal if thermal is not None else ThermalModel()
         self.load_gain = load_gain
+        self.record_writes = record_writes  # False: no written_goals / torque_events growth (long soaks)
         self.calibration = calibration or {
             n: MotorCalibration(id=i + 1, drive_mode=0, homing_offset=0, range_min=0, range_max=_TICK_MAX)
             for i, n in enumerate(JOINT_NAMES)
@@ -249,8 +251,9 @@ class FakeBus:
         for j, motor_id in enumerate(self._ids):
             if not self.faults.is_dropped(int(motor_id)):  # un-acked sync write: a dead motor is silent
                 self._goal[j] = float(goal[j])
-        self.written_goals.append(goal.astype(np.int32, copy=True))
-        self.written_goal_t_ns.append(self.clock.monotonic_ns())
+        if self.record_writes:
+            self.written_goals.append(goal.astype(np.int32, copy=True))
+            self.written_goal_t_ns.append(self.clock.monotonic_ns())
         return True
 
     def set_torque(self, enabled: bool, ids: Sequence[int] | None = None) -> bool:
@@ -264,7 +267,8 @@ class FakeBus:
         for j, motor_id in enumerate(self._ids):
             if int(motor_id) in target:
                 self._torque[j] = enabled
-        self.torque_events.append((self.clock.monotonic_ns(), bool(enabled), target))
+        if self.record_writes:
+            self.torque_events.append((self.clock.monotonic_ns(), bool(enabled), target))
         return True
 
     def torque_enabled(self) -> np.ndarray:

@@ -4,7 +4,7 @@
 >
 > Scope discipline (anti-hypertrophy): Phase 0 deliverables plus *scaffolding* (frozen interfaces, skeletons, smoke tests) for the five Stage A critical-path items. No Stage B/C work, no C++/Rust, no ROS2, no SAM2/GDINO, no pixel world model, no sysid parameter fitting, no `pip install` support.
 
-> **Status note (2026-10-01):** wave 0 and wave 1 are built, reviewed and fixed (`plans/reviews/2026-09-30-wave1-review.md`). Where this plan's frozen interfaces differ from the code, **`docs/ARCHITECTURE.md` §5–§6 (v0.5+) is authoritative**; the F5 signatures below have been updated to the as-built versions. Hardware risk to measure in H-track: the re-energise register phase (~132 single-register transactions) must fit the 0.8 s pre-torque heartbeat budget over USB-serial; if not, switch to sync_write/sync_read.
+> **Status note (2026-10-01, updated after U3):** wave 2 (U3, servo core/process/soak) is built on the fake and MuJoCo backends; F6 below is annotated as-built (keyword-only additions to `ServoCore` and `run`). Wave 0 and wave 1 are built, reviewed and fixed (`plans/reviews/2026-09-30-wave1-review.md`). Where this plan's frozen interfaces differ from the code, **`docs/ARCHITECTURE.md` §5–§6 (v0.5+) is authoritative**; the F5 signatures below have been updated to the as-built versions. Hardware risk to measure in H-track: the re-energise register phase (~132 single-register transactions) must fit the 0.8 s pre-torque heartbeat budget over USB-serial; if not, switch to sync_write/sync_read.
 
 ## Overview
 
@@ -210,7 +210,7 @@ class SeqlockBlock:                         # single writer, many readers, no lo
 
 class ServoShm:
     @classmethod
-    def create(cls, name: str) -> "ServoShm": ...          # servo process only; unlinks on close
+    def create(cls, name: str) -> "ServoShm": ...          # servo process only; unlinks on close. As built (U3, C1): holds an exclusive flock on /dev/shm/<name>.so101.lock until close(); a live owner -> ServoAlreadyRunning
     @classmethod
     def attach(cls, name: str) -> "ServoShm": ...          # policy side; unregisters from resource_tracker (py3.12)
     def write_state(self, rec: np.ndarray) -> None: ...
@@ -379,13 +379,19 @@ class TickStats: p50_ms, p99_ms, p999_ms, max_ms, overruns: int, samples: int; d
 @dataclass
 class TickResult: ok: bool; state: SmState; trips: TripCause; wrote: bool; hb_sent: bool; overrun_ns: int
 class ServoCore:
-    def __init__(self, cfg: So101Config, bus: Bus, ipc: ServoIpc, heartbeat: HeartbeatLink | None, pipeline: SafetyPipeline, sm: SafetyStateMachine, safe: SafeStateSequencer, clock: Clock, tick_log: RingWriter | None = None) -> None
-    def start(self) -> None                      # reenergize(); state → RUN only after it completes
-    def tick(self) -> TickResult                 # read_block → ipc.read_cmd (dedupe by seq) → sm.step → pipeline.apply → check_range → bus.write_goal → heartbeat.send → ipc.write_state
-    def shutdown(self, reason: TripCause) -> None   # runs SafeStateSequencer to completion (bounded), then torque off, then disconnect. SIGINT/SIGTERM/exceptions all route here.
+    # AS BUILT (U3, 2026-10-01): keyword-only additions; reenergize needs calibration + fk, the state machine needs ThermalMonitor.may_resume()
+    def __init__(self, cfg: So101Config, bus: Bus, ipc: ServoIpc, heartbeat: HeartbeatLink | None, pipeline: SafetyPipeline, sm: SafetyStateMachine, safe: SafeStateSequencer, clock: Clock, tick_log: RingWriter | None = None, *, calibration: dict[str, MotorCalibration], fk: So101FK, thermal: ThermalMonitor, log: Callable[[str], None] | None = None) -> None
+    def start(self, *, should_abort: Callable[[], bool] | None = None, arm_timeout_s: float | None = None) -> None   # BOOT → button + ARM → heartbeat → reenergize(); state → RUN only after it completes; StartupError otherwise
+    def tick(self, deadline_ns: int | None = None) -> TickResult   # as built: returns the SAME preallocated TickResult every call
+    # (F6 original) def tick(self) -> TickResult  # read_block → ipc.read_cmd (dedupe by seq) → sm.step → pipeline.apply → check_range → bus.write_goal → heartbeat.send → ipc.write_state
+    def shutdown(self, reason: TripCause = TripCause.USER_STOP) -> None   # runs SafeStateSequencer to completion (bounded), then torque off, then disconnect. SIGINT/SIGTERM/exceptions all route here. Idempotent.
+def build_servo_core(cfg, calibration, bus, ipc, heartbeat, clock, *, chain=None, tick_log=None, log=None) -> ServoCore   # as built: calls safety.config_check.validate_geometry, wires the stack
+TICK_LOG_DTYPE: np.dtype                         # as built: one tick-log record per tick (jitter, duration, state, flags, trips, present, target, temps, latencies)
+def log_row(last_rec_of_step, first_rec_of_next_step) -> dict   # as built: the F8 log-convention pairing of two STATE_DTYPE records
 
 # servo/process.py
-def run(cfg: So101Config, bus_factory: Callable[[], Bus], hb_factory: Callable[[], HeartbeatLink | None], *, require_rt: bool, max_ticks: int | None = None) -> int
+def run(cfg: So101Config, bus_factory: Callable[[], Bus], hb_factory: Callable[[], HeartbeatLink | None], *, require_rt: bool, max_ticks: int | None = None,
+        clock=None, ipc=None, calibration=None, tick_log_path=None, summary_path=None, arm_timeout_s=None, install_signals=True, freeze_gc=True, on_core=None) -> int   # as built: kw-only extras for tests and the CLI; exit codes 0 ok, 1 exception, 2 start-up, 3 RT required, 4 shm owned
 #   sets SCHED_FIFO(50) + sched_setaffinity + mlockall (best effort unless require_rt), gc.collect/freeze/disable, absolute-deadline loop with resync-on-large-overrun, returns exit code
 # servo/main.py  — CLI: so101-servo --backend {feetech,fake,mujoco} --port --heartbeat-port --shm-name --require-rt --max-ticks
 # servo/soak.py  — soak harness: runs the servo with a random-policy client for --minutes, writes runs/soak-<ts>/report.json

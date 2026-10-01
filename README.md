@@ -48,5 +48,11 @@ break on torch 2.11 and are patched (see `src/so101_rl/_vendor/tdmpc2/PATCHES.md
 - `pixi run -e cpu fetch-assets` / `extract-kinematics` regenerate `assets/so101/upstream/` and
   `src/so101_rl/config/so101_kinematics.yaml` (pinned commit in `assets/so101/UPSTREAM.json`).
 - `pixi run -e cpu smoke-tdmpc2` state-only TD-MPC2 smoke train on the toy env.
+- `pixi run -e cpu servo-fake --max-ticks 300` runs the servo process on the fake backend (FakeBus plus a FakeMcu
+  that boots latched, with a simulated button press). `pixi run servo --backend {feetech,fake,mujoco} ...` is the
+  general CLI (`--heartbeat-port`, `--require-rt`, `--tick-log`, `--summary`, ...; see `docs/ARCHITECTURE.md` §3).
+  The feetech backend drives the real arm: only attended, on the hardware track.
+- `pixi run -e cpu soak --backend fake --minutes 0.1` runs a soak (servo child + random-policy client) and writes
+  `runs/soak-<ts>/report.json`; the gate is strict only when the servo got real-time scheduling (`rt_active`).
 
 `pixi task list` shows all tasks; tasks pointing at modules that later units create fail until then.

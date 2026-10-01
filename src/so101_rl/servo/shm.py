@@ -11,13 +11,21 @@ depend on store ordering.
 NOTE: ``STATE_DTYPE.itemsize == 232`` (the plan's F3 now says so too; it originally asserted 192, which the
 listed fields cannot fit with natural alignment). The block stride is 256 (64-byte aligned).
 
+Single instance (review carry-forward C1): :meth:`ServoShm.create` first takes an exclusive, non-blocking
+``flock`` on ``/dev/shm/<name>.so101.lock`` and keeps it until :meth:`ServoShm.close`. A second servo process for
+the same segment name gets :class:`ServoAlreadyRunning` instead of silently replacing the live segment. The kernel
+drops the lock when its owner dies (even by ``kill -9``), so a stale segment of a crashed servo is still replaced.
+
 Creation order: the creator fills version/sizes first and writes ``magic`` LAST, so an attacher that races the
 creator sees magic == 0 ("not ready") instead of a half-written header.
 """
 
 from __future__ import annotations
 
+import fcntl
 import multiprocessing.resource_tracker as _rt
+import os
+import tempfile
 import threading
 import zlib
 from enum import IntEnum
@@ -217,10 +225,63 @@ def _attach_untracked(name: str) -> shared_memory.SharedMemory:
             _rt.register = original
 
 
+class ServoAlreadyRunning(RuntimeError):
+    """Another live process holds the single-instance lock of this servo shm segment."""
+
+
+def _lock_dir() -> str:
+    return "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+
+
+def lock_path(name: str) -> str:
+    """Path of the single-instance lock file of segment ``name`` (the file is never unlinked: unlinking a lock
+    file that another process may have just opened would let two owners coexist)."""
+    return os.path.join(_lock_dir(), f"{name.lstrip('/')}.so101.lock")
+
+
+class InstanceLock:
+    """Exclusive non-blocking ``flock``; released by :meth:`release` or by the kernel when the process dies."""
+
+    def __init__(self, name: str) -> None:
+        self.path = lock_path(name)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = ""
+            try:
+                holder = os.pread(fd, 32, 0).decode(errors="replace").strip()
+            except OSError:
+                pass
+            os.close(fd)
+            raise ServoAlreadyRunning(
+                f"servo shm {name!r} is owned by another live process (pid {holder or '?'}; lock {self.path})"
+            ) from None
+        except BaseException:
+            os.close(fd)
+            raise
+        try:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+        except BaseException:
+            os.close(fd)  # closing the fd drops the lock
+            raise
+        self._fd: int | None = fd
+
+    def release(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 class ServoShm(_Blocks):
     def __init__(self, shm: shared_memory.SharedMemory, *, owner: bool) -> None:
         self._shm = shm
         self._owner = owner
+        self._lock: InstanceLock | None = None
         buf = shm.buf
         self._cmd = SeqlockBlock(buf[CMD_OFFSET : CMD_OFFSET + CMD_SIZE], CMD_DTYPE)
         self._state = SeqlockBlock(buf[STATE_OFFSET : STATE_OFFSET + STATE_SIZE], STATE_DTYPE)
@@ -228,21 +289,39 @@ class ServoShm(_Blocks):
 
     @classmethod
     def create(cls, name: str) -> ServoShm:
-        """Servo process only; unlinks on close. A stale segment of the same name is replaced."""
+        """Servo process only; unlinks on close. Raises :class:`ServoAlreadyRunning` while another live process
+        owns ``name``; a stale segment left by a dead owner is replaced."""
+        lock = InstanceLock(name)
+        shm = None
         try:
-            shm = shared_memory.SharedMemory(name=name, create=True, size=TOTAL_SIZE)
-        except FileExistsError:
-            stale = shared_memory.SharedMemory(name=name)
-            stale.close()
-            stale.unlink()
-            shm = shared_memory.SharedMemory(name=name, create=True, size=TOTAL_SIZE)
-        header = np.frombuffer(shm.buf, dtype=HEADER_DTYPE, count=1)
-        header["version"] = SHM_LAYOUT_VERSION
-        header["cmd_size"] = CMD_SIZE
-        header["state_size"] = STATE_SIZE
-        header["magic"] = SHM_MAGIC  # last: publishes the header to racing attachers
-        del header
-        return cls(shm, owner=True)
+            try:
+                shm = shared_memory.SharedMemory(name=name, create=True, size=TOTAL_SIZE)
+            except FileExistsError:
+                stale = shared_memory.SharedMemory(name=name)  # its owner is dead: we hold the lock
+                stale.close()
+                stale.unlink()
+                shm = shared_memory.SharedMemory(name=name, create=True, size=TOTAL_SIZE)
+            header = np.frombuffer(shm.buf, dtype=HEADER_DTYPE, count=1)
+            header["version"] = SHM_LAYOUT_VERSION
+            header["cmd_size"] = CMD_SIZE
+            header["state_size"] = STATE_SIZE
+            header["magic"] = SHM_MAGIC  # last: publishes the header to racing attachers
+            del header
+            self = cls(shm, owner=True)
+        except BaseException:
+            if shm is not None:  # never leak a half-built segment
+                try:
+                    shm.close()
+                except BufferError:
+                    pass
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+            lock.release()
+            raise
+        self._lock = lock
+        return self
 
     @classmethod
     def attach(cls, name: str) -> ServoShm:
@@ -274,18 +353,23 @@ class ServoShm(_Blocks):
         if self._closed:
             return
         self._closed = True
-        self._cmd.release()
-        self._state.release()
-        self._cmd = self._state = None  # type: ignore[assignment]
         try:
-            self._shm.close()
-        except BufferError:  # a caller still holds a view; unlink anyway, the OS frees it on last close
-            pass
-        if self._owner:
+            self._cmd.release()
+            self._state.release()
+            self._cmd = self._state = None  # type: ignore[assignment]
             try:
-                self._shm.unlink()
-            except FileNotFoundError:
+                self._shm.close()
+            except BufferError:  # a caller still holds a view; unlink anyway, the OS frees it on last close
                 pass
+            if self._owner:
+                try:
+                    self._shm.unlink()
+                except FileNotFoundError:
+                    pass
+        finally:
+            if self._lock is not None:
+                self._lock.release()  # after the unlink: a successor never sees our segment
+                self._lock = None
 
     def __enter__(self) -> Self:
         return self
