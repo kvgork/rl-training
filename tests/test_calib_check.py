@@ -64,7 +64,8 @@ def test_homing_offset_plus_one_is_a_mismatch(calibration):
     }
     with pytest.raises(CalibrationMismatch) as ei:
         require_calibration(bus, calibration)
-    assert ei.value.report is report or ei.value.report.mismatches == report.mismatches
+    assert ei.value.report.ok is False
+    assert ei.value.report.mismatches == report.mismatches
     assert "elbow_flex" in str(ei.value)
 
 
@@ -83,10 +84,16 @@ def test_other_fields_are_compared(calibration, field):
     assert rep.mismatches["wrist_flex"][0] == field
 
 
-def test_drive_mode_is_compared(calibration):
+def test_drive_mode_is_not_compared_because_no_servo_register_holds_it(calibration):
+    """S11: every backend copies drive_mode from config, so a register check of it is a tautology. It is not
+    compared (and does not claim to be); a wrong drive_mode needs the motion-sign test (H-track / U3)."""
     bus = RegBus(calibration)
     bus.drive_mode["gripper"] ^= 1
-    assert check_calibration(bus, calibration).mismatches["gripper"][0] == "drive_mode"
+    assert check_calibration(bus, calibration).ok
+    import so101_rl.safety.calib_check as cc
+
+    assert "drive_mode" not in cc._FIELDS
+    assert "motion-sign test" in cc.__doc__
 
 
 def test_missing_motor_is_a_mismatch(calibration):

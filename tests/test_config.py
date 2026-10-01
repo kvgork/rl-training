@@ -31,6 +31,8 @@ def cfg(calib):
 
 def _variant(tmp_path, mutate):
     raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text())
+    # the loader FK-checks home/rest, so the copied yaml must still find the kinematic chain
+    raw["kinematics_path"] = str(DEFAULT_CONFIG_PATH.with_name("so101_kinematics.yaml"))
     mutate(raw)
     p = tmp_path / "so101.yaml"
     p.write_text(yaml.safe_dump(raw))
@@ -43,7 +45,8 @@ def test_defaults_match_plan(cfg):
     assert cfg.action.max_delta_ticks.dtype == np.int32
     assert cfg.thermal.trip_c == 60.0 and cfg.thermal.resume_c == 50.0
     assert cfg.rates.servo_hz == 30.0 and cfg.rates.stale_cmd_ms == 150.0
-    assert cfg.safe_state.bound_s == 5.0
+    # review B5: 5 s cannot cover limit -> home -> rest at 8 ticks/tick; the loader computes the minimum
+    assert cfg.safe_state.bound_s == 20.0 and cfg.safe_state.ramp_ticks_per_tick == 8
 
 
 def test_frozen_dataclasses_reject_mutation(cfg):

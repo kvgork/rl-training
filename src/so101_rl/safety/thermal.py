@@ -12,8 +12,13 @@ Semantics
 * **Protection bits:** any non-zero ``status`` byte (Feetech firmware protection flags: voltage, sensor,
   temperature, current, angle, overload) -> ``TripCause.PROTECTION_BIT``. These are not latched here: the state
   machine treats them as a human-reset cause.
-* ``trips_last_hour`` counts latch events in the trailing 3600 s; the state machine turns the
-  ``max_trips_per_hour + 1``-th into a human-reset ``TORQUE_OFF``.
+* **Stale temperature** (review S10): the timer starts at the first successful read, not at construction, and
+  it restarts whenever ``update`` was not called for longer than ``stale_temp_s`` (the caller was blocked, e.g.
+  in a multi-second ``reenergize``): a gap in *feeding* is not evidence of a dead sensor. Consecutive failed
+  reads while being fed every tick are still a stale-temperature trip after ``stale_temp_s`` (and the state
+  machine's ``max_bus_failures`` latches long before that).
+* ``trips_last_hour`` counts latch events in the trailing 3600 s, for diagnostics and the soak report only. The
+  automatic-resume limit (``max_trips_per_hour``) is counted in ONE place: ``SafetyStateMachine``.
 """
 
 from __future__ import annotations
@@ -39,7 +44,8 @@ class ThermalMonitor:
         self._stale_ns = int(cfg.stale_temp_s * _NS)
         self._dwell_ns = int(cfg.resume_dwell_s * _NS)
         self._latched = False
-        self._last_good_ns = clock.monotonic_ns()  # construction counts as a fresh reading (grace period)
+        self._last_good_ns: int | None = None  # no successful read yet: the stale timer has not started
+        self._last_update_ns: int | None = None
         self._cool_since_ns: int | None = None
         self._trip_times = np.zeros(_RING, dtype=np.int64)
         self._n_trips = 0
@@ -53,6 +59,9 @@ class ThermalMonitor:
     def update(self, temp_c: np.ndarray, status: np.ndarray, block_ok: bool) -> TripCause:
         now = self._clock.monotonic_ns()
         cause = TripCause.NONE
+        if self._last_update_ns is not None and now - self._last_update_ns > self._stale_ns:
+            self._last_good_ns = None  # not fed for longer than the stale window: restart the timer
+        self._last_update_ns = now
 
         if block_ok:
             self._last_good_ns = now
@@ -71,6 +80,8 @@ class ThermalMonitor:
         else:
             # Arrays hold the PREVIOUS values; never treat them as a fresh reading or as cooling time.
             self._cool_since_ns = None
+            if self._last_good_ns is None:
+                self._last_good_ns = now  # the stale window starts with the first unanswered read
             fault = (now - self._last_good_ns) > self._stale_ns
 
         if self._latched and not fault and self.may_resume():
