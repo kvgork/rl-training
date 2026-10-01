@@ -18,3 +18,4 @@ wandb/
 *.hdf5
 # agent worktrees
 .claude/worktrees/
+MUJOCO_LOG.TXT

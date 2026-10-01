@@ -4,6 +4,8 @@
 >
 > Scope discipline (anti-hypertrophy): Phase 0 deliverables plus *scaffolding* (frozen interfaces, skeletons, smoke tests) for the five Stage A critical-path items. No Stage B/C work, no C++/Rust, no ROS2, no SAM2/GDINO, no pixel world model, no sysid parameter fitting, no `pip install` support.
 
+> **Status note (2026-10-01):** wave 0 and wave 1 are built, reviewed and fixed (`plans/reviews/2026-09-30-wave1-review.md`). Where this plan's frozen interfaces differ from the code, **`docs/ARCHITECTURE.md` §5–§6 (v0.5+) is authoritative**; the F5 signatures below have been updated to the as-built versions. Hardware risk to measure in H-track: the re-energise register phase (~132 single-register transactions) must fit the 0.8 s pre-torque heartbeat budget over USB-serial; if not, switch to sync_write/sync_read.
+
 ## Overview
 
 | Item | Value |
@@ -37,7 +39,7 @@
 - Interpolate the 10 Hz goal over 3 ticks (no step input). Clamp order per tick: interpolate → joint limits → per-tick velocity → tracking clamp |target−present| ≤ E → write. **Anti-windup: the stored target is the clamped value.** E must exceed `vmax × (2–3 ticks + read latency)` or the loop limit-cycles; log the clamp-active fraction. Gripper gets its own E.
 - `SCHED_FIFO` via `os.sched_setscheduler` in try/except, `rt_active` flag, `REQUIRE_RT=1` makes failure fatal on the robot, unset in CI. Deadline loop resyncs on a large overrun instead of bursting. `gc.collect(); gc.freeze(); gc.disable()` after preallocation. Preallocated ring for tick jitter; p99.9 needs ≥10⁴ samples.
 - Heartbeat: one write per tick from the loop thread **after** read+write succeeded, `write_timeout=0.002`, a timeout counts as a missed heartbeat. Never from a timer thread (liveness must be causally after the work). Protocol with a rolling counter so a stuck repeating sender is rejected.
-- State machine: RUN, HOLD, COOLDOWN, SAFE_STOPPING, TORQUE_OFF, LATCHED; fault code is a bitmask; resume rule per cause; re-sync target=present on every resume.
+- State machine: RUN, HOLD, COOLDOWN (unused since 2026-10-01), SAFE_STOPPING, TORQUE_OFF, LATCHED; fault code is a bitmask; resume rule per cause; re-sync target=present on every resume.
 - Tests: inject `Clock`, `Bus`, heartbeat sink; `FakeClock` makes a 24 h soak run in seconds; `FakeBus` with first-order plant, latency distribution and fault injection; `FakeMcu` running the same protocol; hypothesis property tests (no NaN reaches the bus, |Δ| ≤ vmax, |target−present| ≤ E, 0 ≤ goal ≤ 4095). At least one HIL test with the real bus stays on the release checklist.
 
 **lerobot-specialist** (driver; report based on 0.5.1, cross-checked here against the installed 0.6.0 and PyPI 0.6.1):
@@ -97,7 +99,7 @@ class RateConfig:
 
 @dataclass(frozen=True)
 class SafeStateConfig:
-    bound_s: float = 5.0
+    bound_s: float = 20.0               # was 5.0; user decision 2026-10-01 (slow 240 ticks/s ramp). `safety.config_check.validate_geometry` computes the minimum (15.33 s for the shipped calibration).
     ramp_ticks_per_tick: int = 8
     home_ticks: np.ndarray               # int32[6]
     rest_ticks: np.ndarray               # int32[6]; gravity-stable, verified by H5
@@ -298,9 +300,9 @@ def check_range(goal: np.ndarray) -> bool               # dtype integer AND 0 �
 
 # safety/fk.py (pure numpy, chain from config/so101_kinematics.yaml — no placo, L7)
 class So101FK:
-    def __init__(self, chain: KinematicChain) -> None
+    def __init__(self, chain: KinematicChain, calibration: dict[str, MotorCalibration] | None = None) -> None   # as built: pass calibration, else drive_mode signs default +1
     def gripper_xyz(self, q_rad: np.ndarray, out: np.ndarray) -> np.ndarray      # base frame, metres, 5 arm joints used
-    def in_box(self, xyz: np.ndarray, box: WorkspaceBox) -> bool
+    def in_box(self, xyz: np.ndarray, box: WorkspaceBox, *, margin: float = 0.0) -> bool
 
 # safety/thermal.py
 class ThermalMonitor:
@@ -316,16 +318,19 @@ class StuckActionMonitor:
     def update(self, applied_delta: np.ndarray, moving: np.ndarray) -> TripCause
 
 # safety/safe_state.py
-class SafeStateSequencer:               # RAMP_HOME → REST → TORQUE_OFF, bounded by cfg.bound_s; falls through to torque-off in place
-    def __init__(self, cfg: SafeStateConfig, clock: Clock) -> None
+class SafeStateSequencer:               # RAMP_HOME → REST → TORQUE_OFF through the transit zone (safety/transit.py), bounded by cfg.bound_s; falls through to torque-off in place
+    # AS BUILT (wave-1 review fix S2/B1/B2, 2026-10-01) — supersedes the original (cfg, clock) signature:
+    def __init__(self, cfg: SafeStateConfig, clock: Clock, *, tracking_error_ticks: np.ndarray, motor_ids: Mapping[str, int], fk: So101FK) -> None   # all required
     def start(self, present_ticks: np.ndarray) -> None
-    def next(self, present_ticks: np.ndarray, target_out: np.ndarray) -> SafeStep    # SafeStep(write_target: bool, torque_off_ids: tuple[int, ...], done: bool, timed_out: bool)
+    def next(self, present_ticks: np.ndarray, target_out: np.ndarray, *, block_ok: bool = True) -> SafeStep    # SafeStep(write_target: bool, torque_off_ids: tuple[int, ...], done: bool, timed_out: bool)
+    def run(self, bus: Bus, block: BlockRead, *, servo_hz: float, tick_hook: Callable[[bool], None] | None = None) -> SafeStep   # blocking driver for shutdown; raises RuntimeError if torque-off refused 3×
 
 # safety/state_machine.py
 @dataclass
 class SmInputs: block_ok: bool; cmd_fresh: bool; cmd_age_ns: int; consecutive_misses: int; trips: TripCause; hb_ok: bool; mcu: McuStatus | None; stop_requested: bool; may_resume_thermal: bool
 @dataclass
-class SmOutputs: state: SmState; use_policy: bool; run_safe_sequence: bool; torque_off_now: bool; resync_target: bool
+class SmOutputs: state: SmState; use_policy: bool; run_safe_sequence: bool; torque_off_now: bool; resync_target: bool; reenergize_requested: bool = False   # as built
+# SafetyStateMachine also has (as built): mark_energized(), notify_safe_done(), notify_reenergize_failed(), resume_policy(), thermal_trips_last_hour()
 class SafetyStateMachine:
     def __init__(self, cfg: So101Config, clock: Clock) -> None
     def step(self, inp: SmInputs, out: SmOutputs) -> SmOutputs
@@ -339,9 +344,18 @@ def check_calibration(bus: Bus, expected: dict[str, MotorCalibration]) -> CalibR
 def require_calibration(bus: Bus, expected: dict[str, MotorCalibration]) -> None    # raises CalibrationMismatch; called before ANY torque enable
 
 # safety/reenergize.py  — the frozen re-energise order (plan Phase 0 "On every re-energise")
-def reenergize(bus: Bus, cfg: So101Config, calibration: dict[str, MotorCalibration], clock: Clock, block: BlockRead, *, timeout_s: float = 5.0) -> None:
-    """1. wait until all 6 ids answer (ping_all)  2. require_calibration  3. write_registers(cfg.registers)
-       4. read_block → write_goal(present) → read back Goal_Position == present for all 6  5. set_torque(True)  6. ramped home (via SafeStateSequencer RAMP_HOME)."""
+# AS BUILT (wave-1 review fixes B1–B3, S5; 2026-10-01). Authoritative order: docs/ARCHITECTURE.md §6.5.
+def reenergize(bus: Bus, cfg: So101Config, calibration: dict[str, MotorCalibration], clock: Clock, block: BlockRead, *,
+               timeout_s: float = 5.0, tick_hook: Callable[[bool], None] | None = None, heartbeat_gap_s: float = 0.8, fk: So101FK | None = None) -> None:
+    """1. ping_all  2. require_calibration  3. Lock=0, Torque_Enable==0 check, write every register, read every register back
+       4. read_block; start pose must be near rest or in box (else UnsafeStartPose); temps < trip and not 0/255; Status 0
+       5. write_goal(present) — first heartbeat tick  6. read back Goal_Position == present ×6  7. set_torque(True)
+       8. ramp home through the transit zone, re-checking temperatures every read.
+       tick_hook(ok) once per servo tick, ok = read succeeded AND write accepted; with a hook every good tick must come within heartbeat_gap_s.
+       NOTE: heartbeat_gap_s is measured from reenergize ENTRY — the caller must send a heartbeat immediately before calling.
+       Any failure after torque-on → torque off (3 attempts), then re-raise."""
+class UnsafeStartPose(RuntimeError): ...
+def torque_off_retry(bus: Bus, ids=None, attempts: int = 3) -> bool
 
 # safety/pipeline.py — order fixed by ARCHITECTURE §6.3
 class SafetyPipeline:
@@ -663,12 +677,12 @@ Tests marked `@pytest.mark.hardware` are skipped unless `SO101_HW=1`; `@pytest.m
 - **Acceptance:** `pixi run -e cpu pytest tests/test_thermal.py tests/test_stuck.py -q` → pass.
 - **Est.:** 30 min. `parallelizable-via-worktree: true`
 
-#### Task 2.4 (SW): Safe-state sequencer (bounded 5 s) and re-energise order
+#### Task 2.4 (SW): Safe-state sequencer (bounded by `bound_s`, now 20 s) and re-energise order
 - **Files:** `src/so101_rl/safety/safe_state.py`, `src/so101_rl/safety/reenergize.py`, `src/so101_rl/safety/calib_check.py`, `tests/test_safe_state.py`, `tests/test_reenergize.py`, `tests/test_calib_check.py`
 - **Specialist:** lerobot-specialist (register order), real-time-control-specialist
 - **Dependencies:** U0, 1.1 (`FakeBus` for tests — if U1 is not merged yet, test against a minimal in-test stub of `Bus`)
 - **Steps:** port `ramped_home` semantics from `arm_motor_writer.py` into `SafeStateSequencer` RAMP_HOME (per-tick step ≤ `ramp_ticks_per_tick`, respects tracking clamp); REST phase moves to `rest_ticks`; TORQUE_OFF disables in `torque_off_order`; on `bound_s` expiry → `timed_out=True`, torque off in place. `reenergize()` follows the F5 docstring order exactly; `check_calibration` compares decoded values.
-- **Tests:** sequence completes in < 5 s on a healthy plant; bus failing mid-ramp → falls through to torque-off at exactly `bound_s`; a policy command during SAFE_STOPPING is ignored (checked in 3.2); re-energise order asserted via `FakeBus` call log: `ping_all` → calibration regs → registers → `read_block` → `write_goal(present)` → `read_reg("Goal_Position")×6` → `set_torque(True)` (any other order fails); missing motor for > timeout → `TimeoutError`; **deliberately corrupted calibration** (homing_offset +1) → `CalibrationMismatch`, no `set_torque(True)` ever called; sign-magnitude case: register raw 2048+1647 vs file −1647 → **match** (decoded compare).
+- **Tests:** sequence completes within `bound_s` on a healthy plant; bus failing mid-ramp → falls through to torque-off at exactly `bound_s`; a policy command during SAFE_STOPPING is ignored (checked in 3.2); re-energise order asserted via `FakeBus` call log: `ping_all` → calibration regs → registers → `read_block` → `write_goal(present)` → `read_reg("Goal_Position")×6` → `set_torque(True)` (any other order fails); missing motor for > timeout → `TimeoutError`; **deliberately corrupted calibration** (homing_offset +1) → `CalibrationMismatch`, no `set_torque(True)` ever called; sign-magnitude case: register raw 2048+1647 vs file −1647 → **match** (decoded compare).
 - **Acceptance:** `pixi run -e cpu pytest tests/test_safe_state.py tests/test_reenergize.py tests/test_calib_check.py -q` → pass.
 - **Est.:** 45 min.
 
@@ -677,7 +691,7 @@ Tests marked `@pytest.mark.hardware` are skipped unless `SO101_HW=1`; `@pytest.m
 - **Specialist:** real-time-control-specialist
 - **Dependencies:** 2.1–2.4
 - **Steps:** transitions per specialist §5 and `RESUME_BY_CAUSE`; `resync_target=True` on every entry to RUN; `SafetyPipeline.apply` in the ARCHITECTURE §6.3 order; BOX on the *commanded* target reverts to the previous target (clamp), BOX_PRESENT (present outside the box) is a trip; every clamp sets `clamped_mask`; `applied_delta_ticks` = post-clamp goal change (what gets logged, L4).
-- **Tests:** table-driven transitions (RUN→HOLD at 151 ms, not 149; HOLD→RUN on fresh seq; N−1 misses stay HOLD, N → SAFE_STOPPING; THERMAL → COOLDOWN → RUN after resume with `resync_target`; 4th thermal trip in an hour → TORQUE_OFF (human); NaN → SAFE_STOPPING → TORQUE_OFF, no auto-resume; heartbeat fail / MCU latched → LATCHED and nothing leaves LATCHED); pipeline: interpolation reaches the goal in exactly 3 ticks; anti-windup keeps `goal` within E of present when blocked; order verified by injecting a value that would pass a later check but fail an earlier one.
+- **Tests:** table-driven transitions (RUN→HOLD at 151 ms, not 149; HOLD→RUN on fresh seq; N−1 misses stay HOLD, N → SAFE_STOPPING; ~~THERMAL → COOLDOWN → RUN~~ (superseded 2026-10-01: THERMAL → SAFE_STOPPING to rest → TORQUE_OFF → after dwell CHECK `reenergize_requested` → full reenergize → RUN; never holds energised); 4th thermal trip in an hour → TORQUE_OFF (human); NaN → SAFE_STOPPING → TORQUE_OFF, no auto-resume; heartbeat fail / MCU latched → LATCHED and nothing leaves LATCHED); pipeline: interpolation reaches the goal in exactly 3 ticks; anti-windup keeps `goal` within E of present when blocked; order verified by injecting a value that would pass a later check but fail an earlier one.
 - **Acceptance:** `pixi run -e cpu pytest tests/test_state_machine.py tests/test_pipeline.py -q` → pass (≥ 25 tests).
 - **Est.:** 45 min.
 
@@ -819,8 +833,17 @@ Tests marked `@pytest.mark.hardware` are skipped unless `SO101_HW=1`; `@pytest.m
 - **Files:** `src/so101_rl/servo/core.py`, `tests/test_servo_core.py`
 - **Specialist:** real-time-control-specialist
 - **Dependencies:** U1, U2, U6 (`RingWriter`)
+- **Contract with the wave-1 safety layer (binding; see docs/ARCHITECTURE.md §5–§6 v0.5+):**
+  - **States other than RUN:** in HOLD, SAFE_STOPPING and TORQUE_OFF, call `pipeline.monitor_only(block, v)` every tick.
+  - **TORQUE_OFF duties:** keep writing goal = present and keep sending the heartbeat. Otherwise the MCU latches during the thermal dwell.
+  - **Re-energise:**
+    - On `SmOutputs.reenergize_requested`, send one heartbeat, then call `reenergize(..., tick_hook=hb, fk=fk)`.
+    - On success, call `mark_energized()`. On failure, call `notify_reenergize_failed()`.
+    - Reset `consecutive_misses` (and any stale-command counters) after `mark_energized()`. Otherwise a stale count from the dwell sends the thermal resume straight into a STALE_CMD stop.
+  - **Boot latch:** because the MCU boots LATCHED, do **not** feed `McuStatus.latched` into the state machine until the button has been pressed and ARM has succeeded. LATCHED is absorbing, so feeding it early forces a new process. Model the start-up as BOOT → wait for button + ARM → reenergize.
+  - **Shutdown:** use `SafeStateSequencer.run(bus, block, servo_hz=…, tick_hook=hb)`, constructed with `tracking_error_ticks`, `motor_ids` and `fk`.
 - **Steps:** F6; command dedupe by `seq`; `hb_sent` only when `read_block` and `write_goal` both succeeded this tick; `write_state` every tick even in fault states; `shutdown()` idempotent; `signal.signal(SIGINT/SIGTERM)` set a flag checked by `run()`, never do I/O in the handler.
-- **Tests (FakeBus + FakeClock + FakeMcu + LocalIpc):** a command is applied exactly once across 3 ticks; late policy → HOLD, target held (no extrapolation), fresh seq → RUN; N misses → SAFE_STOPPING → TORQUE_OFF; read failure tick → no write, no heartbeat; 3 consecutive bus failures → LATCHED; `FakeMcu` latches when heartbeats stop (SIGSTOP model: stop calling `tick()` and advance the fake clock 1.1 s); thermal trip flow with resync; SIGINT flag → shutdown sequence runs and completes < 5 s of fake time; `tracemalloc` shows zero net allocation over 1000 ticks after warm-up.
+- **Tests (FakeBus + FakeClock + FakeMcu + LocalIpc):** a command is applied exactly once across 3 ticks; late policy → HOLD, target held (no extrapolation), fresh seq → RUN; N misses → SAFE_STOPPING → TORQUE_OFF; read failure tick → no write, no heartbeat; 3 consecutive bus failures → LATCHED; `FakeMcu` latches when heartbeats stop (SIGSTOP model: stop calling `tick()` and advance the fake clock 1.1 s); thermal trip flow with resync; SIGINT flag → shutdown sequence runs and completes within `cfg.safe_state.bound_s` of fake time; thermal trip → rest → torque off → dwell (heartbeat continues, MCU stays armed) → reenergize → RUN; a stale `consecutive_misses` from the dwell does NOT stop the arm after resume; MCU boot-latch handled without entering LATCHED; `tracemalloc` shows zero net allocation over 1000 ticks after warm-up.
 - **Acceptance:** `pixi run -e cpu pytest tests/test_servo_core.py -q` → pass (≥ 15 tests).
 - **Est.:** 45 min.
 
@@ -960,7 +983,7 @@ Each has a checklist section in `docs/HARDWARE_CHECKLIST.md` (7.2) and produces 
 |---|---|---|---|---|---|
 | **H1** | Restore the NVIDIA driver; laptop-vs-desktop; GPU thermals | 0.1 (re-pin `cuda-version`), 0.4 (`smoke-tdmpc2 --device cuda`) | `dkms status`; `sudo dkms autoinstall` for kernel 7.0.0-34; else boot the previous kernel or switch driver branch; `hostnamectl chassis` / `/sys/class/dmi/id/chassis_type`; 20-min `torch.matmul` loop while logging `nvidia-smi -q -d TEMPERATURE,POWER` | `nvidia-smi` shows RTX 3080 10 GB; `runs/hw/gpu-<ts>.json {driver, cuda, chassis, max_temp_c, throttled: false}`; `pixi install -e default` solves; `pixi run smoke-tdmpc2 --device cuda` exit 0 | 1–3 h |
 | **H2** | Power path: PSU ≥ 8–10 A @ 12 V, relay module (12 V automotive NO 30/40 A; transistor + flyback), TVS 15–16 V bidirectional across the servo bus, latching e-stop (DC-13 ≥ supply current, or in the control circuit with a mechanical break in the load path) | 7.2 wiring diagram | Wire per diagram; measure continuity with the relay open; e-stop opens the load path; no USB/GPIO relay, no AC SSR | Photo + `runs/hw/power-path-<ts>.json {psu_a, relay_part, tvs_part, estop_rating}`; **e-stop test** (with MCU ADC via `0xE1`, or a scope): V_bus < 1 V within 50 ms → `runs/hw/estop-<ts>.json {drop_ms, v_after}` | 3–4 h + parts |
-| **H3** | Watchdog MCU bring-up | 7.1 firmware, 1.3 link, 3.2 process | Flash `main.py` to the RP2040; wire relay pin, e-stop input, reset button, ADC divider, TEST jumper; run `test_vectors.json` against the real MCU over serial | `runs/hw/deadman-<ts>.json`: no-heartbeat → relay opens at 1.0 ± 0.1 s; `kill -9` servo → open ≤ 1.5 s; USB unplug ≤ 1.5 s; host reboot → open; latch persists until the physical reset; a serial "reset" attempt does **not** clear the latch (shown to fail) | 2–3 h |
+| **H3** | Watchdog MCU bring-up | 7.1 firmware, 1.3 link, 3.2 process | Flash `main.py` to the RP2040; wire relay pin, e-stop input, reset button, both ADC dividers (PSU side GP26, servo side GP27), TEST jumper; run `test_vectors.json` against the real MCU over serial | `runs/hw/deadman-<ts>.json`: no-heartbeat → relay opens at 1.0 ± 0.1 s; `kill -9` servo → open ≤ 1.5 s; USB unplug ≤ 1.5 s; host reboot → open; boots LATCHED (status 0x62) and latch persists until the physical reset; a serial "reset" attempt does **not** clear the latch (shown to fail); relay-weld injection latches reason 7 | 2–3 h |
 | **H4** | Servo fan + thermal duty-cycle study | 3.3 soak (`max_temp_c`), 2.3 | Mount a small fan on the servos; run 20-on/10-off duty at random motion; also a 10-min *hold-still* segment (plan: holding is worse than moving) | `runs/hw/thermal-<ts>.json {duty, max_temp_c per joint, time_to_60c_s or null}`; update `so101.yaml duty_on_s/duty_off_s` if needed | 1.5 h |
 | **H5** | Rest pose, torque-off verification, sag map, stale-goal snap test | 2.4 safe-state, 3.2 `servo --backend feetech`, 4.1 keyframe | Foam under the arm; from `rest_ticks` disable torque → no motion (video); sample limp falls from the box corners and highest poses (camera recording); none touch the D435 mount; deliberately leave a stale goal and re-energise **with foam** to see the snap that step 3 of re-energise prevents, then repeat with the real sequence | `runs/hw/rest-pose-<ts>.json {rest_ticks, moved_ticks_after_torque_off ≤ 5}`, `runs/hw/sag-map-<ts>/` videos; set `verified_on_hardware: true` in `so101.yaml` | 2 h |
 | **H6** | Register configuration proof and thermal-trip race | 1.2 `write_registers`, 2.3 | Read back all F1 registers after `configure`; stall one joint against a stop (foam) → firmware fold-back visible (`Status` bit or load drop) **and** the 60 °C software trip fires before any firmware 70 °C event during H4 | `runs/hw/registers-<ts>.json {readback, foldback_observed: true, sw_trip_first: true}`; choose arm `protection_current` / `over_current_protection_time` values and commit them to `so101.yaml` | 1.5 h |

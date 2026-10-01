@@ -50,6 +50,24 @@ REGISTER_RANGES: dict[str, tuple[int, int]] = {
 }
 # STS3215 homing offset is a 12-bit sign-magnitude register (bit 11 = sign): +-2047.
 HOMING_OFFSET_RANGE = (-2047, 2047)
+# Automatic thermal resumes per hour. The plan's value is 3; the state machine keeps max + 1 trip times.
+MAX_TRIPS_PER_HOUR_RANGE = (1, 10)
+# Plausible table height below the base frame origin (m); the box floor is the upper bound.
+TABLE_Z_RANGE_M = (-0.2, 0.0)
+SAFE_STATE_KEYS = frozenset(
+    {
+        "bound_s",
+        "ramp_ticks_per_tick",
+        "home_ticks",
+        "rest_ticks",
+        "torque_off_order",
+        "table_z_m",
+        "table_clearance_m",
+        "transit_zone_m",
+        "home_box_margin_m",
+        "rest_tolerance_ticks",
+    }
+)
 
 TOP_KEYS = frozenset(
     {
@@ -282,7 +300,9 @@ def load_config(
         resume_c=_num(t["resume_c"], "thermal.resume_c"),
         resume_dwell_s=_positive(_num(t["resume_dwell_s"], "thermal.resume_dwell_s"), "thermal.resume_dwell_s"),
         max_trips_per_hour=_in_range(
-            _int(t["max_trips_per_hour"], "thermal.max_trips_per_hour"), 1, 10**6, "thermal.max_trips_per_hour"
+            _int(t["max_trips_per_hour"], "thermal.max_trips_per_hour"),
+            *MAX_TRIPS_PER_HOUR_RANGE,
+            "thermal.max_trips_per_hour",
         ),
         duty_on_s=_positive(_num(t["duty_on_s"], "thermal.duty_on_s"), "thermal.duty_on_s"),
         duty_off_s=_positive(_num(t["duty_off_s"], "thermal.duty_off_s"), "thermal.duty_off_s"),
@@ -295,11 +315,20 @@ def load_config(
             f"{firmware_max}"
         )
 
-    s = _keys(
-        raw["safe_state"],
-        {"bound_s", "ramp_ticks_per_tick", "home_ticks", "rest_ticks", "torque_off_order"},
-        "safe_state",
+    b = _keys(raw["box"], {"x", "y", "z", "present_tolerance_m"}, "box")
+    box = WorkspaceBox(
+        x=_pair(b["x"], "box.x"),
+        y=_pair(b["y"], "box.y"),
+        z=_pair(b["z"], "box.z"),
+        present_tolerance_m=_num(b["present_tolerance_m"], "box.present_tolerance_m"),
     )
+    for axis, (lo_m, hi_m) in (("x", box.x), ("y", box.y), ("z", box.z)):
+        if not lo_m < hi_m:
+            raise ValueError(f"box.{axis}: lower bound must be below upper bound")
+    if not 0.0 <= box.present_tolerance_m <= 0.02:
+        raise ValueError(f"box.present_tolerance_m: must be within 0..0.02 m, got {box.present_tolerance_m}")
+
+    s = _keys(raw["safe_state"], SAFE_STATE_KEYS, "safe_state")
     order = s["torque_off_order"]
     if not isinstance(order, (list, tuple)) or not all(isinstance(n, str) for n in order):
         raise ValueError("safe_state.torque_off_order: expected a list of joint names")
@@ -309,19 +338,29 @@ def load_config(
         home_ticks=_vec(s["home_ticks"], "safe_state.home_ticks"),
         rest_ticks=_vec(s["rest_ticks"], "safe_state.rest_ticks"),
         torque_off_order=tuple(order),
+        table_z_m=_num(s["table_z_m"], "safe_state.table_z_m"),
+        table_clearance_m=_num(s["table_clearance_m"], "safe_state.table_clearance_m"),
+        transit_zone_m=_num(s["transit_zone_m"], "safe_state.transit_zone_m"),
+        home_box_margin_m=_num(s["home_box_margin_m"], "safe_state.home_box_margin_m"),
+        rest_tolerance_ticks=_in_range(
+            _int(s["rest_tolerance_ticks"], "safe_state.rest_tolerance_ticks"), 1, 400, "safe_state.rest_tolerance_ticks"
+        ),
     )
-    _positive(safe.ramp_ticks_per_tick, "safe_state.ramp_ticks_per_tick")
+    _in_range(safe.ramp_ticks_per_tick, 1, 64, "safe_state.ramp_ticks_per_tick")
+    if not TABLE_Z_RANGE_M[0] <= safe.table_z_m < box.z[0]:
+        raise ValueError(
+            f"safe_state.table_z_m: must be within {TABLE_Z_RANGE_M[0]} m and below box.z[0] = {box.z[0]} m, "
+            f"got {safe.table_z_m}"
+        )
+    for key in ("table_clearance_m", "transit_zone_m", "home_box_margin_m"):
+        if not getattr(safe, key) >= 0.0:
+            raise ValueError(f"safe_state.{key}: must be >= 0, got {getattr(safe, key)}")
     if sorted(safe.torque_off_order) != sorted(JOINT_NAMES):
         raise ValueError("safe_state.torque_off_order must list every joint exactly once")
     for key, ticks in (("home_ticks", safe.home_ticks), ("rest_ticks", safe.rest_ticks)):
         if np.any(ticks < limits.min_ticks) or np.any(ticks > limits.max_ticks):
             raise ValueError(f"safe_state.{key} outside the joint limits: {ticks.tolist()}")
-
-    b = _keys(raw["box"], {"x", "y", "z"}, "box")
-    box = WorkspaceBox(x=_pair(b["x"], "box.x"), y=_pair(b["y"], "box.y"), z=_pair(b["z"], "box.z"))
-    for axis, (lo_m, hi_m) in (("x", box.x), ("y", box.y), ("z", box.z)):
-        if not lo_m < hi_m:
-            raise ValueError(f"box.{axis}: lower bound must be below upper bound")
+    kinematics_path = (path.parent / raw["kinematics_path"]).resolve()
 
     g = _keys(raw["registers"], set(REGISTER_RANGES), "registers")
     registers = RegisterConfig(
@@ -340,7 +379,7 @@ def load_config(
         safe_state=safe,
         box=box,
         registers=registers,
-        kinematics_path=(path.parent / raw["kinematics_path"]).resolve(),
+        kinematics_path=kinematics_path,
     )
 
 

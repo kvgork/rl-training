@@ -1,0 +1,8 @@
+# HSV thresholds for the red die (OpenCV scale: H 0..179, S/V 0..255).
+# hsv_lo[0] > hsv_hi[0] means the hue band wraps through 0: [hsv_lo.H..179] U [0..hsv_hi.H]. Red straddles 0.
+# Starting values; re-tune on the real table and lighting (H8) and commit the result.
+hsv_lo: [170, 120, 70]
+hsv_hi: [10, 255, 255]
+min_area_px: 40
+max_area_px: 4000
+depth_window_m: 0.02

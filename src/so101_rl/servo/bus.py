@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -30,6 +30,7 @@ class BlockRead:
         self.ok: bool = False  # False on ANY comm failure; arrays then hold the PREVIOUS values
 
 
+@runtime_checkable
 class Bus(Protocol):
     def connect(self) -> None: ...
 
