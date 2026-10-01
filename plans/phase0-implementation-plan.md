@@ -99,7 +99,7 @@ class RateConfig:
 
 @dataclass(frozen=True)
 class SafeStateConfig:
-    bound_s: float = 20.0               # was 5.0; user decision 2026-10-01 (slow 240 ticks/s ramp). Loader computes the minimum (currently ~15.3 s).
+    bound_s: float = 20.0               # was 5.0; user decision 2026-10-01 (slow 240 ticks/s ramp). `safety.config_check.validate_geometry` computes the minimum (15.33 s for the shipped calibration).
     ramp_ticks_per_tick: int = 8
     home_ticks: np.ndarray               # int32[6]
     rest_ticks: np.ndarray               # int32[6]; gravity-stable, verified by H5

@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.5 (2026-10-01). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.6 (2026-10-01). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 >
@@ -113,7 +113,7 @@ rl-trainer/
 │   │                             #   feetech_bus.py: real STS3215
 │   │                             #   fake_bus.py: plant, thermal and fault injection
 │   │                             # heartbeat.py: MCU link + FakeMcu; timing; shm
-│   ├── safety/                   # clamp, fk (pure-numpy FK + box), transit (rest<->home transit-zone planner), thermal, stuck, safe_state, reenergize,
+│   ├── safety/                   # clamp, fk (pure-numpy FK + box), transit (rest<->home transit-zone planner), config_check (safe-state geometry/time-bound validation), thermal, stuck, safe_state, reenergize,
 │   │                             # calib_check, state_machine, pipeline. Never imports rl, wm or env.
 │   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface)
 │   ├── perception/               # camera (D435 by serial, FakeCamera), die_tracker (HSV + depth, None when occluded),
@@ -173,11 +173,12 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - **Rest and home poses.** Both are marked NEEDS H5.
   - *rest* is the gravity-stable pose measured on 2026-09-30: [2050, 2200, 2301, 2745, 2040, 2065], tip at z = −0.012 m.
   - *home* is an in-box placeholder: [2047, 960, 2700, 2748, 2047, 2047], tip at (0.20, 0, 0.15).
-- **What the loader checks:**
+- **What `safety.config_check.validate_geometry(cfg, calibration, chain)` checks.** `load_config` does not run these checks, because `config` must not import `safety`, and an AST test enforces that. **The servo entry point (U3) must call it before building the safety stack.**
   - FK(home) is at least 10 mm inside the box.
   - FK(rest) is at least 5 mm above the table and inside the box's x/y footprint. This approximates "clear of the D435", because the camera mount pose is not in the config.
   - Replaying the exact rest-to-home and home-to-rest transits tick by tick never takes the tip below the table plus 5 mm.
-  - `bound_s` is at least the worst limit-to-home time plus the home-to-rest time plus 1 s.
+  - `bound_s` is at least the worst limit-to-home time plus the home-to-rest time plus 1 s. That is 15.33 s for the shipped calibration, and 19.23 s for a full 0..4095 range.
+  - The loader itself checks only that `-0.2 m ≤ table_z_m < box.z[0]`.
   - The replay assumes the arm follows perfectly. At run time the time bounds end any stall with torque off.
 
 **Sim (U4).**
@@ -274,7 +275,7 @@ These are ordered from the outermost layer to the innermost.
 
    Clamps (TRACKING, JOINT_LIMIT, BOX) never change the state-machine state.
 4. **Safe-state sequence, bounded by `bound_s` (20 s).**
-   - The user decided on 2026-10-01 to keep the slow 240 ticks/s ramp. The loader computes the minimum `bound_s` from the calibration.
+   - The user decided on 2026-10-01 to keep the slow 240 ticks/s ramp. `validate_geometry` computes the minimum `bound_s` from the calibration: 15.33 s for the shipped calibration.
    - The sequence ramps home, then to the gravity-stable rest pose, through the transit zone (`safety/transit.py`):
      - it lifts first;
      - the target tip never goes below the table plus 5 mm;
@@ -384,3 +385,4 @@ Bump the version line at the top and add an entry below.
 | 0.3 | 2026-09-30 | U0 review fixes: strict config/calibration validation (§5), homing_offset semantics in ticks<->rad documented (§5), F3 state size now 232 in the plan, shm attach/create hardening, vendor tarball checksum and committed vendored-file manifest (§8) |
 | 0.4 | 2026-09-30 | Wave 1 integrated (U1, U2, U4, U5, U6, U7): the servo backends and heartbeat link, the safety layer, the MuJoCo backend, Stage A perception, episode logging, and the watchdog firmware with its hardware checklist (§4). Interface behaviour and the binding log convention (§5). The F4 wire protocol and latch semantics, the implemented check order, and the resume state paths (§6). The sysid check (§7). The `hand-eye` task fixed and `compare-real` added (§8). |
 | 0.5 | 2026-10-01 | Wave-1 review fixes (`plans/reviews/2026-09-30-wave1-review.md`). §4: `safety/transit.py`. §5: the `reenergize` and sequencer signatures, `tick_hook`, the TORQUE_OFF duties, the measured rest pose and in-box home, the loader geometry and time-bound checks, the box tolerance, live MujocoBus registers with a de-energised start. §6: the MCU boots latched, the two voltage dividers and weld detection, the never-raising host link, the 20 s safe-state bound and transit zone, thermal → rest → torque off → re-energise, and the hardened re-energise order. |
+| 0.6 | 2026-10-01 | Verification-review follow-ups. §4: `safety/config_check.py`. §5: the safe-state geometry and time-bound checks move from the `config` loader to `safety.config_check.validate_geometry`, restoring the dependency direction; U3 must call it. The bound is 15.33 s for the shipped calibration. Further U3 obligations are recorded: reset the miss counter, handle the boot latch, send a heartbeat before re-energise. The re-energise timing risk is noted. |
