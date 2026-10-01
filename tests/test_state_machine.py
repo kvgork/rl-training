@@ -1,5 +1,6 @@
 """SafetyStateMachine transitions (plan task 2.5). Table-driven, fake clock."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -117,58 +118,164 @@ def test_safe_stopping_ignores_policy_commands(sm, out):
     assert out.state is SmState.TORQUE_OFF and out.torque_off_now and not out.run_safe_sequence
 
 
-# ---- thermal -----------------------------------------------------------------------------------------------------
-def test_thermal_cooldown_then_resume_with_resync(sm, out):
-    run_state(sm, out)
+# ---- thermal (plan section 10, 2026-10-01: to rest, torque off; resume only through a full reenergize) ----------
+def thermal_trip_to_torque_off(sm, out):
+    """RUN -> (THERMAL) SAFE_STOPPING -> sequencer done -> TORQUE_OFF."""
     sm.step(fresh(trips=T.THERMAL), out)
-    assert out.state is SmState.COOLDOWN and not out.use_policy and not out.torque_off_now
+    assert out.state is SmState.SAFE_STOPPING and out.run_safe_sequence and not out.use_policy
+    assert not out.torque_off_now  # the sequencer ramps to rest first; it turns torque off itself
+    sm.notify_safe_done()
+    sm.step(fresh(trips=T.THERMAL), out)
+    assert out.state is SmState.TORQUE_OFF and out.torque_off_now
+
+
+def resume_after_dwell(sm, out):
+    """TORQUE_OFF (thermal only) -> CHECK (reenergize requested) -> mark_energized -> RUN (resync)."""
+    sm.step(fresh(may_resume_thermal=True), out)
+    assert out.state is SmState.CHECK and out.reenergize_requested and out.torque_off_now and not out.use_policy
+    sm.mark_energized()
+    sm.step(fresh(), out)
+    assert out.state is SmState.RUN and out.resync_target and out.use_policy
+
+
+def test_thermal_trip_goes_to_rest_and_torque_off_never_holds_energised(sm, out):
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
     assert sm.fault_bits & T.THERMAL and sm.resume_policy() is ResumePolicy.AUTO
     for _ in range(20):
-        sm.step(fresh(trips=T.THERMAL), out)  # monitor keeps reporting while latched
-        assert out.state is SmState.COOLDOWN
+        sm.step(fresh(trips=T.THERMAL), out)  # the monitor keeps reporting while latched
+        assert out.state is SmState.TORQUE_OFF and out.torque_off_now and not out.reenergize_requested
     sm.step(fresh(trips=T.NONE, may_resume_thermal=False), out)
-    assert out.state is SmState.COOLDOWN
+    assert out.state is SmState.TORQUE_OFF  # dwell not over
     sm.step(fresh(trips=T.THERMAL, may_resume_thermal=True), out)
-    assert out.state is SmState.COOLDOWN  # still reporting THERMAL: do not resume
-    sm.step(fresh(trips=T.NONE, may_resume_thermal=True), out)
-    assert out.state is SmState.RUN and out.resync_target and out.use_policy
+    assert out.state is SmState.TORQUE_OFF  # still reporting THERMAL: do not resume
+
+
+def test_thermal_resume_is_a_full_reenergize_then_run_with_resync(sm, out):
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
+    resume_after_dwell(sm, out)
     assert sm.fault_bits == T.NONE
+    sm.step(fresh(), out)
+    assert not out.resync_target and not out.reenergize_requested  # one-shot flags
 
 
-def test_thermal_from_hold_also_cools_down(sm, out):
+def test_cooldown_state_is_never_entered(sm, out):
+    run_state(sm, out)
+    seen = set()
+    for inp in (fresh(trips=T.THERMAL), fresh(trips=T.THERMAL), fresh(may_resume_thermal=True)):
+        sm.step(inp, out)
+        seen.add(out.state)
+        sm.notify_safe_done()
+    assert SmState.COOLDOWN not in seen
+
+
+def test_thermal_resume_requires_a_good_block_read(sm, out):
+    """S6: no resume path may ignore block_ok."""
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
+    sm.step(fresh(may_resume_thermal=True, block_ok=False), out)
+    assert out.state is SmState.TORQUE_OFF and not out.reenergize_requested
+    sm.step(fresh(may_resume_thermal=True), out)
+    assert out.state is SmState.CHECK
+
+
+def test_resync_after_energise_waits_for_a_good_block_read(sm, out):
+    """S6: the first RUN step after mark_energized must not resync to a stale (failed) read."""
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
+    sm.step(fresh(may_resume_thermal=True), out)
+    sm.mark_energized()
+    sm.step(fresh(block_ok=False), out)
+    assert out.state is SmState.RUN and not out.resync_target and not out.use_policy
+    sm.step(fresh(block_ok=True), out)
+    assert out.resync_target and out.use_policy
+
+
+def test_thermal_relatched_during_check_goes_back_to_torque_off(sm, out):
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
+    sm.step(fresh(may_resume_thermal=True), out)
+    assert out.state is SmState.CHECK
+    sm.step(fresh(trips=T.THERMAL), out)
+    assert out.state is SmState.TORQUE_OFF and out.torque_off_now
+    assert sm.resume_policy() is ResumePolicy.AUTO
+    resume_after_dwell(sm, out)
+
+
+def test_failed_automatic_reenergize_needs_a_human(sm, out):
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
+    sm.step(fresh(may_resume_thermal=True), out)
+    sm.notify_reenergize_failed()
+    for _ in range(10):
+        sm.step(fresh(may_resume_thermal=True), out)
+        assert out.state is SmState.TORQUE_OFF and not out.reenergize_requested
+    assert sm.resume_policy() is ResumePolicy.HUMAN_PHYSICAL_RESET
+
+
+def test_thermal_from_hold_also_goes_to_rest(sm, out):
     run_state(sm, out)
     sm.step(SmInputs(cmd_age_ns=300 * MS), out)
+    assert out.state is SmState.HOLD
     sm.step(SmInputs(cmd_age_ns=300 * MS, trips=T.THERMAL), out)
-    assert out.state is SmState.COOLDOWN
+    assert out.state is SmState.SAFE_STOPPING
+    sm.notify_safe_done()
+    sm.step(SmInputs(cmd_age_ns=300 * MS, may_resume_thermal=True), out)
+    assert out.state is SmState.CHECK  # THERMAL + the STALE_CMD of the HOLD before it is still thermal-only
+
+
+def test_another_fault_during_thermal_torque_off_blocks_the_automatic_resume(sm, out):
+    run_state(sm, out)
+    thermal_trip_to_torque_off(sm, out)
+    sm.step(fresh(trips=T.PROTECTION_BIT), out)
+    sm.step(fresh(may_resume_thermal=True), out)
+    assert out.state is SmState.TORQUE_OFF
+    assert sm.resume_policy() is ResumePolicy.HUMAN_PHYSICAL_RESET
 
 
 def test_fourth_thermal_trip_in_an_hour_needs_a_human(sm, out, clock):
     run_state(sm, out)
     for i in range(3):
-        sm.step(fresh(trips=T.THERMAL), out)
-        assert out.state is SmState.COOLDOWN, f"trip {i + 1}"
-        sm.step(fresh(may_resume_thermal=True), out)
-        assert out.state is SmState.RUN
+        thermal_trip_to_torque_off(sm, out)
+        resume_after_dwell(sm, out)
         clock.advance(600 * S)
-    assert sm.thermal_trips_last_hour() == 3
+        assert sm.thermal_trips_last_hour() == i + 1
     sm.step(fresh(trips=T.THERMAL), out)
     assert out.state is SmState.SAFE_STOPPING and out.run_safe_sequence
     assert sm.resume_policy() is ResumePolicy.HUMAN_PHYSICAL_RESET
     sm.notify_safe_done()
-    sm.step(fresh(may_resume_thermal=True), out)
-    assert out.state is SmState.TORQUE_OFF  # stays: no automatic resume
+    for _ in range(10):
+        sm.step(fresh(may_resume_thermal=True), out)
+        assert out.state is SmState.TORQUE_OFF and not out.reenergize_requested  # no automatic resume
 
 
 def test_thermal_trips_older_than_an_hour_do_not_count(sm, out, clock):
     run_state(sm, out)
     for _ in range(3):
-        sm.step(fresh(trips=T.THERMAL), out)
-        sm.step(fresh(may_resume_thermal=True), out)
+        thermal_trip_to_torque_off(sm, out)
+        resume_after_dwell(sm, out)
         clock.advance(1300 * S)
     # trips at t=0, 1300, 2600; now t=3900 -> the first is out of the window
-    sm.step(fresh(trips=T.THERMAL), out)
-    assert out.state is SmState.COOLDOWN
+    thermal_trip_to_torque_off(sm, out)
+    assert sm.resume_policy() is ResumePolicy.AUTO
     assert sm.thermal_trips_last_hour() == 3
+    resume_after_dwell(sm, out)
+
+
+@pytest.mark.parametrize("max_per_hour", [1, 10])
+def test_trip_ring_follows_the_configured_limit(cfg, clock, max_per_hour):
+    """S10: the ring is sized from the config (the loader bounds max_trips_per_hour to 1..10)."""
+    cfg2 = replace(cfg, thermal=replace(cfg.thermal, max_trips_per_hour=max_per_hour))
+    sm, out = SafetyStateMachine(cfg2, clock), SmOutputs()
+    run_state(sm, out)
+    for _ in range(max_per_hour):
+        thermal_trip_to_torque_off(sm, out)
+        resume_after_dwell(sm, out)
+        clock.advance(S)
+    assert sm.thermal_trips_last_hour() == max_per_hour
+    sm.step(fresh(trips=T.THERMAL), out)
+    assert sm.resume_policy() is ResumePolicy.HUMAN_PHYSICAL_RESET
 
 
 # ---- fatal classes --------------------------------------------------------------------------------------------------
@@ -220,11 +327,15 @@ def test_clamps_in_trips_are_not_transitions(sm, out, clamp):
     assert sm.fault_bits == T.NONE
 
 
-def test_cooldown_escalates_on_a_fatal_cause(sm, out):
+def test_safe_stopping_after_thermal_escalates_on_a_fatal_cause(sm, out):
     run_state(sm, out)
     sm.step(fresh(trips=T.THERMAL), out)
     sm.step(fresh(trips=T.THERMAL | T.NAN), out)
     assert out.state is SmState.SAFE_STOPPING
+    sm.notify_safe_done()
+    sm.step(fresh(may_resume_thermal=True), out)
+    assert out.state is SmState.TORQUE_OFF  # NAN accumulated: no automatic resume
+    assert sm.resume_policy() is ResumePolicy.FRESH_PROCESS
 
 
 # ---- LATCHED ----------------------------------------------------------------------------------------------------------
@@ -236,6 +347,7 @@ def test_heartbeat_fail_latches_and_nothing_leaves_latched(sm, out):
     for i in range(200):
         sm.step(fresh(hb_ok=True, may_resume_thermal=True, mcu=SimpleNamespace(latched=False)), out)
         assert out.state is SmState.LATCHED and not out.use_policy and not out.resync_target
+        assert out.torque_off_now  # S4: every tick, not only on entry
     sm.mark_energized()  # also no way back via the start-up hook
     sm.notify_safe_done()
     sm.step(fresh(), out)
@@ -293,5 +405,37 @@ def test_use_policy_only_in_run(sm, out):
     for inp in (fresh(), fresh(trips=T.THERMAL), fresh(trips=T.NAN)):
         sm.step(inp, out)
         seen.append((out.state, out.use_policy))
-    assert [s for s, _ in seen] == [SmState.BOOT, SmState.RUN, SmState.COOLDOWN, SmState.SAFE_STOPPING]
+    assert [s for s, _ in seen] == [SmState.BOOT, SmState.RUN, SmState.SAFE_STOPPING, SmState.SAFE_STOPPING]
     assert [u for _, u in seen] == [False, True, False, False]
+
+
+def test_hold_to_run_requires_a_good_block_read(sm, out):
+    """S6: a fresh command with a failed read does not resume (and does not resync to stale data)."""
+    run_state(sm, out)
+    sm.step(SmInputs(cmd_age_ns=200 * MS), out)
+    assert out.state is SmState.HOLD
+    sm.step(fresh(block_ok=False), out)
+    assert out.state is SmState.HOLD and not out.resync_target and not out.use_policy
+    sm.step(fresh(), out)
+    assert out.state is SmState.RUN and out.resync_target
+
+
+def test_latched_emits_torque_off_every_tick_even_with_bad_reads(sm, out):
+    run_state(sm, out)
+    sm.step(fresh(trips=T.DEADMAN), out)
+    for ok in (True, False, True):
+        sm.step(fresh(block_ok=ok), out)
+        assert out.state is SmState.LATCHED and out.torque_off_now
+
+
+def test_a_thermal_trip_during_a_stale_command_stop_does_not_auto_resume(sm, out):
+    """Reviewer follow-up: N stale commands need a fresh process; a THERMAL on top must not unlock the auto path."""
+    run_state(sm, out)
+    sm.step(SmInputs(consecutive_misses=5, cmd_age_ns=600 * MS), out)
+    assert out.state is SmState.SAFE_STOPPING
+    sm.step(fresh(trips=T.THERMAL), out)
+    sm.notify_safe_done()
+    for _ in range(5):
+        sm.step(fresh(may_resume_thermal=True), out)
+        assert out.state is SmState.TORQUE_OFF and not out.reenergize_requested
+    assert sm.resume_policy() is ResumePolicy.FRESH_PROCESS

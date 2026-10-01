@@ -4,6 +4,13 @@ Compares the calibration JSON against what the motors actually hold. The compari
 ``Bus.read_calibration_regs`` returns ``Homing_Offset`` already sign-magnitude-decoded (raw ``2048 + 1647`` ->
 ``-1647``), so a naive compare of raw register bytes against the JSON would report a false mismatch; this module
 never sees raw bytes. ``require_calibration`` is called before ANY torque enable (``reenergize`` step 2).
+
+What this check can and cannot prove (review S11): ``id``, ``homing_offset`` and the position limits live in the
+servo EEPROM and are compared. ``drive_mode`` is NOT stored on the STS3215; every backend's
+``read_calibration_regs`` copies it from the calibration it was built with, so comparing it would always pass
+and prove nothing. It is therefore not compared. A wrong ``drive_mode`` (a joint moving the wrong way) can only
+be caught by a motion-sign test: command a small delta on each joint and check the sign of the Present_Position
+change. That test belongs to the hardware track / the servo core (H-track, U3), not to this register check.
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ from dataclasses import dataclass, field
 from so101_rl.config import JOINT_NAMES, MotorCalibration
 from so101_rl.servo.bus import Bus
 
-_FIELDS = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
+_FIELDS = ("id", "homing_offset", "range_min", "range_max")  # drive_mode: not on the servo, see the module doc
 _MISSING = -(2**31)  # register value reported when a motor did not appear in the read-back
 
 
@@ -31,8 +38,9 @@ class CalibrationMismatch(RuntimeError):
 
 
 def check_calibration(bus: Bus, expected: dict[str, MotorCalibration]) -> CalibReport:
-    """Every motor in ``expected`` must be present in the register read-back with identical id, drive_mode,
-    homing_offset and position limits. One entry per mismatching motor (the first differing field)."""
+    """Every motor in ``expected`` must be present in the register read-back with identical id, homing_offset
+    and position limits. One entry per mismatching motor (the first differing field). ``drive_mode`` is not
+    checked (it is not a servo register; see the module docstring)."""
     actual = bus.read_calibration_regs()
     mismatches: dict[str, tuple[str, int, int]] = {}
     names = [n for n in JOINT_NAMES if n in expected] + [n for n in expected if n not in JOINT_NAMES]

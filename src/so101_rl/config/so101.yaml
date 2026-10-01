@@ -44,18 +44,31 @@ rates:
   max_bus_failures: 3
 
 safe_state:
-  bound_s: 5.0
+  # bound_s must cover the worst joint limit -> home plus the exact home -> rest transit at ramp_ticks_per_tick
+  # (the loader computes it, review B5): 16.8 s with the shipped calibration, 19.3 s for a full 0..4095 range
+  # calibration, so 20 s covers any calibration. The plan's
+  # original 5 s is not reachable at 8 ticks/tick (240 ticks/s) from the shoulder_lift limit.
+  bound_s: 20.0
   ramp_ticks_per_tick: 8
-  # PLACEHOLDERS (middle of range, LeRobot homing pose). NEEDS H5: home and rest must be measured on the real
-  # arm (gravity-stable rest pose) before verified_on_hardware may be set to true.
-  home_ticks: [2047, 2047, 2047, 2047, 2047, 2047]
-  rest_ticks: [2047, 2047, 2047, 2047, 2047, 2047]
+  # NEEDS H5 (both poses).
+  # rest: the gravity-stable pose measured on the arm on 2026-09-30, torque off. Tip (0.208, -0.001, -0.012) m:
+  #       below the box floor (it rests on the table) but above the table floor (table_z_m + table_clearance_m).
+  # home: in-box PLACEHOLDER from the wave-1 review, tip (0.200, 0.000, 0.150) m, FK-checked by the loader.
+  home_ticks: [2047, 960, 2700, 2748, 2047, 2047]
+  rest_ticks: [2050, 2200, 2301, 2745, 2040, 2065]
   torque_off_order: [gripper, wrist_roll, wrist_flex, elbow_flex, shoulder_lift, shoulder_pan]
+  # Transit zone for the ramps between rest and home (review B1, safety/transit.py), metres, base frame.
+  table_z_m: -0.02                # table top (same value as sim TABLE_Z_M)
+  table_clearance_m: 0.005        # the ramp target's tip never goes below table_z_m + this
+  transit_zone_m: 0.05            # below floor + this, joints that lower the tip wait for the lifting joints
+  home_box_margin_m: 0.010        # FK(home) at least this far inside every box face
+  rest_tolerance_ticks: 100       # reenergize starts only within this of rest (arm joints) or inside the box
 
 box:                              # metres, base frame (from LIT DEFAULT_BOX)
   x: [0.08, 0.34]
   y: [-0.22, 0.22]
   z: [0.010, 0.28]
+  present_tolerance_m: 0.005      # BOX_PRESENT trips only this far outside the box (review S3); targets: exact box
 
 registers:
   return_delay_time: 0

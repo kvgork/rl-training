@@ -116,7 +116,11 @@ class So101FK:
         return self.gripper_xyz(self.ticks_to_rad(ticks, self._q), out)
 
     @staticmethod
-    def in_box(xyz: np.ndarray, box: WorkspaceBox) -> bool:
-        """Inclusive box test. NaN is never inside."""
+    def in_box(xyz: np.ndarray, box: WorkspaceBox, *, margin: float = 0.0) -> bool:
+        """Inclusive box test. NaN is never inside. ``margin`` > 0 grows the box on every face (the present-position
+        tolerance of review S3), ``margin`` < 0 shrinks it (the loader's "home well inside the box" check)."""
         x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
-        return bool(box.x[0] <= x <= box.x[1] and box.y[0] <= y <= box.y[1] and box.z[0] <= z <= box.z[1])
+        m = float(margin)
+        return bool(
+            box.x[0] - m <= x <= box.x[1] + m and box.y[0] - m <= y <= box.y[1] + m and box.z[0] - m <= z <= box.z[1] + m
+        )

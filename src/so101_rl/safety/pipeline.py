@@ -16,8 +16,10 @@ State kept between calls (all int32[6], preallocated):
 Semantics worth knowing
 -----------------------
 * BOX on the *commanded* target is a CLAMP: the target reverts to ``prev_target`` (and the goal with it), reported in
-  ``clamped_mask`` and ``TripCause.BOX``. BOX_PRESENT (the *present* position is already outside the box) is a
-  TRIP: the state machine stops the arm (fresh process).
+  ``clamped_mask`` and ``TripCause.BOX``. BOX_PRESENT (the *present* position is more than
+  ``box.present_tolerance_m`` outside the box) is a TRIP: the state machine stops the arm (fresh process). The
+  tolerance (review S3) keeps a millimetre of sag at a face from ending the run: commands are clamped to the
+  exact box, the present position only trips beyond the tolerance band.
 * ``clamped_mask`` is the OR of every stage that modified a joint this tick, plus the command-level clamps of
   ``new_command`` (sanitize/limits) for the tick that follows. ``TRACKING``, ``JOINT_LIMIT`` and ``BOX`` are reported
   in ``Verdict.trips`` for information only; the state machine ignores them.
@@ -102,6 +104,12 @@ class SafetyPipeline:
         cfg = self._cfg
         present = block.position
         if not self._synced:
+            if not block.ok:
+                # Never resync to a stale read (review follow-up to S6): emit an out-of-range target that the
+                # core's pre-write check_range rejects, and report RANGE.
+                v.trips = TripCause.RANGE
+                v.target_ticks[...] = -1
+                return v
             self.resync(present)
         v.trips = self._cmd_trips  # command-level results (NAN, JOINT_LIMIT) are reported once
         self._cmd_trips = TripCause.NONE
@@ -135,7 +143,7 @@ class SafetyPipeline:
         # 5. Cartesian box through FK. Present outside -> trip. Commanded target outside -> revert (clamp).
         fk = self._fk
         fk.gripper_xyz_from_ticks(present, self._xyz)
-        if not fk.in_box(self._xyz, cfg.box):
+        if not fk.in_box(self._xyz, cfg.box, margin=cfg.box.present_tolerance_m):
             v.trips |= TripCause.BOX_PRESENT
             target = self.prev_target  # hold what was last written; the state machine takes over
         else:
@@ -167,8 +175,9 @@ class SafetyPipeline:
 
     def monitor_only(self, block, v: Verdict) -> Verdict:
         """Thermal + protection-bit monitoring without touching any target: the core calls this every tick in
-        states where ``apply`` is not run (HOLD, COOLDOWN, SAFE_STOPPING), because the thermal latch can only
-        clear, and ``may_resume`` can only advance, while ``ThermalMonitor.update`` keeps being fed."""
+        states where ``apply`` is not run (HOLD, SAFE_STOPPING, TORQUE_OFF including the thermal dwell), because
+        the thermal latch can only clear, and ``may_resume`` can only advance, while ``ThermalMonitor.update``
+        keeps being fed."""
         v.trips = self._thermal.update(block.temperature_c, block.status, block.ok)
         return v
 

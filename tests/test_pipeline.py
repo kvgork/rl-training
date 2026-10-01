@@ -210,6 +210,46 @@ def test_box_present_is_a_trip(cfg, calibration):
     np.testing.assert_array_equal(v.target_ticks, q0)  # holds; does not push further
 
 
+def _pose_below_floor(r, cfg, depth_m):
+    """LOW_POSE with shoulder_lift lowered until the tip is ``depth_m`` below the box floor (+-0.5 mm)."""
+    q = LOW_POSE.copy()
+    for lift in range(1930, 2300):
+        q[1] = lift
+        z = r.xyz(q)[2]
+        if z <= cfg.box.z[0] - depth_m:
+            assert z >= cfg.box.z[0] - depth_m - 0.0015
+            return q
+    raise AssertionError("no such pose")
+
+
+@pytest.mark.parametrize("depth_mm", [1.0, 3.0, 4.0])
+def test_present_sag_within_the_tolerance_is_not_a_trip(cfg, calibration, depth_mm):
+    """S3: a few mm of sag below the box floor must not end the run; commands are still clamped to the box."""
+    r = Rig(cfg, calibration, LOW_POSE)
+    q = _pose_below_floor(r, cfg, depth_mm / 1000)
+    assert depth_mm / 1000 < cfg.box.present_tolerance_m
+    r = Rig(cfg, calibration, q)
+    for tgt, trips, _m in r.cycle(d(0, 45)):  # pushing further down
+        assert not trips & T.BOX_PRESENT
+        assert r.xyz(tgt)[2] <= r.xyz(q)[2] + 1e-9  # the command did not get the target any lower than present...
+    assert not r.v.trips & T.BOX_PRESENT
+
+
+def test_present_beyond_the_tolerance_is_a_trip(cfg, calibration):
+    r = Rig(cfg, calibration, LOW_POSE)
+    q = _pose_below_floor(r, cfg, cfg.box.present_tolerance_m + 0.002)
+    r = Rig(cfg, calibration, q)
+    r.command(d(0, -10))
+    assert r.tick(3).trips & T.BOX_PRESENT
+
+
+def test_commanded_target_is_clamped_to_the_exact_box_not_the_tolerance_band(cfg, calibration):
+    r = Rig(cfg, calibration, LOW_POSE)
+    for _ in range(6):
+        for tgt, _trips, _m in r.cycle(d(0, 45)):
+            assert r.xyz(tgt)[2] >= cfg.box.z[0]
+
+
 # ---- thermal / protection / stuck -----------------------------------------------------------------------------------------
 def test_thermal_and_protection_bits_reported(rig):
     rig.block.temperature_c[3] = 61
@@ -377,3 +417,20 @@ def test_safety_never_imports_rl_wm_or_env():
                 ):
                     offenders.append(f"{path.name}: {n}")
     assert offenders == []
+
+
+def test_apply_before_any_sync_with_a_failed_read_never_emits_a_writable_target(cfg, calibration):
+    from so101_rl.safety import clamp
+
+    clock = FakeClock()
+    fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
+    pipe = SafetyPipeline(cfg, fk, ThermalMonitor(cfg.thermal, clock), StuckActionMonitor())
+    block = BlockRead()  # ok=False, position zeros (stale)
+    v = pipe.apply(block, 3, Verdict())
+    assert v.trips & T.RANGE
+    assert not clamp.check_range(v.target_ticks)  # the core's pre-write check refuses it
+    block.position[...] = POSE
+    block.temperature_c[...] = 35
+    block.ok = True
+    v = pipe.apply(block, 3, Verdict())  # the first good read syncs
+    np.testing.assert_array_equal(v.target_ticks, POSE)

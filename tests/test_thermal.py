@@ -125,17 +125,56 @@ def test_zero_temperature_blocks_resume(mon, clock):
 
 def test_stale_temperature_trips_after_one_second(mon, clock):
     assert step(mon, clock, 35) == TripCause.NONE
-    assert step(mon, clock, 35, dt_s=0.9, ok=False) == TripCause.NONE  # 0.9 s old
+    assert step(mon, clock, 35, dt_s=0.5, ok=False) == TripCause.NONE  # 0.5 s old
+    assert step(mon, clock, 35, dt_s=0.4, ok=False) == TripCause.NONE  # 0.9 s old
     assert step(mon, clock, 35, dt_s=0.2, ok=False) & TripCause.THERMAL  # 1.1 s old
     assert mon.trips_last_hour() == 1
 
 
+def test_stale_timer_does_not_start_at_construction(clock):
+    """S10: a slow re-energise between construction and the first update must not look like a dead sensor."""
+    mon = ThermalMonitor(CFG, clock)
+    clock.advance(9 * S)  # e.g. reenergize ramped home for 9 s; nobody fed the monitor
+    assert mon.update(temps(30), ZERO_STATUS, False) == TripCause.NONE
+    # ...but a sensor that keeps failing while being fed every tick still trips after stale_temp_s
+    for _ in range(int(CFG.stale_temp_s * 30)):
+        assert step(mon, clock, 30, ok=False) == TripCause.NONE  # < stale_temp_s since the first failed read
+    assert step(mon, clock, 30, dt_s=0.1, ok=False) & TripCause.THERMAL
+
+
+def test_a_gap_in_feeding_restarts_the_stale_timer(mon, clock):
+    """S10: after good reads, a multi-second blocking reenergize (no updates) followed by one failed read is not a
+    stale-temperature trip."""
+    for _ in range(10):
+        step(mon, clock, 35)
+    assert step(mon, clock, 35, dt_s=8.0, ok=False) == TripCause.NONE
+    assert step(mon, clock, 35, ok=True) == TripCause.NONE
+    assert mon.trips_last_hour() == 0
+
+
 def test_failed_block_never_counts_as_cooling(mon, clock):
+    """S12: run the failed reads for LONGER than the dwell, fed every tick, so a broken implementation that
+    counted them as cooling would resume."""
     step(mon, clock, 61)
     step(mon, clock, 40)
-    for _ in range(10):
-        step(mon, clock, 40, dt_s=0.05, ok=False)  # previous arrays say 40 C, but they are not fresh
     assert not mon.may_resume()
+    for _ in range(int((CFG.resume_dwell_s + 10) * 30)):
+        step(mon, clock, 40, ok=False)  # previous arrays say 40 C, but they are not fresh
+        assert not mon.may_resume()
+    assert mon.latched
+    # and once reads come back, the dwell starts from zero
+    for _ in range(int(CFG.resume_dwell_s * 30) - 2):
+        assert step(mon, clock, 40) & TripCause.THERMAL
+    assert not mon.may_resume()
+
+
+def test_good_reads_for_the_dwell_do_resume(mon, clock):
+    """Positive control for the test above: the same timeline with good reads clears the latch."""
+    step(mon, clock, 61)
+    for _ in range(int(CFG.resume_dwell_s * 30) + 30):
+        step(mon, clock, 40)
+    assert mon.may_resume() and not mon.latched
+    assert step(mon, clock, 40) == TripCause.NONE
 
 
 @pytest.mark.parametrize("joint", range(N_JOINTS))

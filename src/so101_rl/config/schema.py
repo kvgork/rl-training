@@ -103,7 +103,7 @@ class RateConfig:
 class SafeStateConfig:
     bound_s: float = 5.0
     ramp_ticks_per_tick: int = 8
-    home_ticks: np.ndarray | None = None  # int32[6]
+    home_ticks: np.ndarray | None = None  # int32[6]; FK inside the box (loader-checked)
     rest_ticks: np.ndarray | None = None  # int32[6]; gravity-stable, verified by H5
     torque_off_order: tuple[str, ...] = (
         "gripper",
@@ -113,6 +113,14 @@ class SafeStateConfig:
         "shoulder_lift",
         "shoulder_pan",
     )
+    # Transit zone (review B1): the rest pose is outside the box, so the ramps between rest and home are checked
+    # against the table instead. Tip z must stay >= table_z_m + table_clearance_m; below
+    # table_z_m + table_clearance_m + transit_zone_m, joints that lower the tip wait for the lifting joints.
+    table_z_m: float = -0.02
+    table_clearance_m: float = 0.005
+    transit_zone_m: float = 0.05
+    home_box_margin_m: float = 0.010  # FK(home) at least this far inside every box face
+    rest_tolerance_ticks: int = 100  # reenergize starts only within this of rest (arm joints) or inside the box
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,9 @@ class WorkspaceBox:
     x: tuple[float, float] = (0.08, 0.34)
     y: tuple[float, float] = (-0.22, 0.22)
     z: tuple[float, float] = (0.010, 0.28)
+    # BOX_PRESENT trips only when the PRESENT tip is more than this outside the box (review S3: 1 mm of sag at
+    # the floor must not end the run). Commanded targets are still clamped to the exact box.
+    present_tolerance_m: float = 0.005
 
 
 @dataclass(frozen=True)
