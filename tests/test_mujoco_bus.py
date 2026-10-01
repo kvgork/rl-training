@@ -18,6 +18,13 @@ def bus(calibration, cfg):
     model, data = load_model()
     b = MujocoBus(model, data, calibration, cfg)
     b.connect()
+    b.reset_to_keyframe("home")  # energised; the `rest` pose sits on the table, so it cannot be the free-air start
+    # Start from the mid-range pose (all joints tick 2047): off the table, inside every limit, gravity sag is small.
+    mid = np.full(6, 2047, np.int32)
+    b.data.qvel[:] = 0.0
+    b.data.qpos[b.qpos_adr] = b.ticks_to_q(mid)
+    b.data.ctrl[b.act_ids] = b.data.qpos[b.qpos_adr]
+    mujoco.mj_forward(model, b.data)
     return b
 
 
@@ -132,6 +139,18 @@ def test_action_delay_fifo_delays_by_n_ticks(calibration, cfg):
     bus.write_goal(goal)  # 4th write releases the first goal
     assert bus.data.ctrl[bus.act_ids][0] != pytest.approx(ctrl0[0])
     assert len(bus.written_goals) == 4  # the intercept sees what was written, not what was applied
+
+
+def test_bus_starts_deenergised_like_fakebus(calibration, cfg):
+    model, data = load_model()
+    b = MujocoBus(model, data, calibration, cfg)
+    b.connect()
+    assert not b.torque_enabled.any()
+    assert all(b.read_reg("Torque_Enable", i) == 0 for i in range(1, 7))
+    assert not model.actuator_gainprm[b.act_ids].any()
+    b.set_torque(True)
+    assert b.torque_enabled.all()
+    assert model.actuator_gainprm[b.act_ids[0], 0] == pytest.approx(998.22)
 
 
 def test_torque_off_lets_arm_fall_and_on_restores(bus):

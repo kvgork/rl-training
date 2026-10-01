@@ -57,7 +57,8 @@ class Recorder:
 
 def _make_fake(cfg, calibration):
     clock = FakeClock()
-    start = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32) + np.array([120, -90, 80, -60, 100, 50], np.int32)
+    # a real arm that was parked at the rest pose (same start pose as the mujoco backend's `rest` keyframe)
+    start = np.asarray(cfg.safe_state.rest_ticks, dtype=np.int32)
     bus = FakeBus(clock, calibration=calibration, initial_ticks=start)
     bus.connect()
     return bus, clock

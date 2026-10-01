@@ -77,7 +77,7 @@ class MujocoBus(Bus):
         self.temperature_c = np.full(N_JOINTS, DEFAULT_TEMPERATURE_C, dtype=np.int32)
         self.written_goals: list[np.ndarray] = []
         self._connected = False
-        self._torque = np.ones(N_JOINTS, dtype=bool)
+        self._torque = np.zeros(N_JOINTS, dtype=bool)  # like FakeBus and the real arm: starts de-energised
         self._saved_gain = model.actuator_gainprm[self.act_ids].copy()
         self._saved_bias = model.actuator_biasprm[self.act_ids].copy()
         self._delay: deque[np.ndarray] = deque()
@@ -88,7 +88,9 @@ class MujocoBus(Bus):
             self._regs[("Homing_Offset", c.id)] = c.homing_offset
             self._regs[("Min_Position_Limit", c.id)] = c.range_min
             self._regs[("Max_Position_Limit", c.id)] = c.range_max
-            self._regs[("Torque_Enable", c.id)] = 1
+            self._regs[("Torque_Enable", c.id)] = 0
+        self.model.actuator_gainprm[self.act_ids] = 0.0  # de-energised: the arm is limp until ``set_torque(True)``
+        self.model.actuator_biasprm[self.act_ids] = 0.0
 
     # ---- conversions -------------------------------------------------------------------------------
     def ticks_to_q(self, ticks: np.ndarray) -> np.ndarray:
@@ -228,7 +230,11 @@ class MujocoBus(Bus):
                 raise RuntimeError(f"MuJoCo simulation unstable: {mujoco.mju_warningText(w, 0)}")
 
     def reset_to_keyframe(self, name: str = "rest") -> None:
-        """Reset physics to a keyframe, clear the delay FIFO and the intercept, restore torque."""
+        """Reset physics to a keyframe, clear the delay FIFO and the intercept, and ENERGISE (torque on).
+
+        Unlike construction (torque off), a keyframe reset is an episode reset: the servos are re-enabled and hold
+        the keyframe ``ctrl``. Call ``set_torque(False)`` afterwards to model a de-energised arm at that pose.
+        """
         self._restore_gains()
         mujoco.mj_resetDataKeyframe(self.model, self.data, self.model.key(name).id)
         mujoco.mj_forward(self.model, self.data)

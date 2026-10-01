@@ -47,6 +47,7 @@ def rms_joint_error_pct(
     cfg = cfg if cfg is not None else load_config(calibration=calibration)
     bus = MujocoBus(model, data, calibration, cfg)
     bus.connect()
+    bus.set_torque(True)  # replaying commanded goals: the servos are energised (the bus itself starts limp)
 
     # Start from the logged pose, at rest.
     data.qvel[:] = 0.0

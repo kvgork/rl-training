@@ -24,7 +24,8 @@ the jaw primitives and the arm meshes, and the jaw primitives touch only the die
 
 ## Placeholders (NEEDS H5)
 
-`rest` and `home` keyframes are placeholders consistent with `config/so101.yaml` `safe_state` (tick 2047 on every joint:
-0 rad on the arm joints, 2.4 % open on the gripper with the current calibration). They are gravity-stable in sim only;
-the real rest pose is measured in H5. `tests/test_sim_model.py` fails if keyframes and config drift apart.
+`rest` and `home` keyframes are consistent with `config/so101.yaml` `safe_state` (`rest_ticks`: measured gravity-stable
+pose, resting on the table; `home_ticks`: in-box placeholder, NEEDS H5; qpos and ctrl both encode the ticks through the
+calibration). `tests/test_sim_model.py` fails if keyframes and config drift apart. The arm sags from `home` when torque
+is off; it does not from `rest`.
 Jaw box sizes and contact parameters (friction 1.2, condim 4) are first guesses until grasps are compared with hardware.

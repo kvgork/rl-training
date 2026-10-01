@@ -40,6 +40,12 @@ def _simulate(calibration, cfg, target: np.ndarray, *, delay_ticks: int = 0) -> 
     model, data = load_model()
     bus = MujocoBus(model, data, calibration, cfg, action_delay_ticks=delay_ticks)
     bus.connect()
+    bus.reset_to_keyframe("home")  # energised, off the table
+    # start where compare_real starts a replay: at the logged pose (the trajectory's first target), at rest
+    data.qvel[:] = 0.0
+    data.qpos[bus.qpos_adr] = bus.ticks_to_q(target[0])
+    data.ctrl[bus.act_ids] = data.qpos[bus.qpos_adr]
+    mujoco.mj_forward(model, data)
     per_step = round(cfg.rates.servo_hz / cfg.rates.policy_hz)
     out, present = BlockRead(), []
     for goal in target:

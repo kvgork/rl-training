@@ -47,7 +47,7 @@
        arm joints; gripper 2047 ticks on the 2011..3488 calibration = 2.4 % open). NEEDS H5: replace by the measured
        gravity-stable rest pose; tests/test_sim_model.py checks this stays consistent with the config. -->
   <keyframe>
-    <key name="rest" qpos="0 0 0 0 0 -0.1277  0.20 -0.05 -0.012 1 0 0 0" ctrl="0 0 0 0 0 -0.1277"/>
-    <key name="home" qpos="0 0 0 0 0 -0.1277  0.20 -0.05 -0.012 1 0 0 0" ctrl="0 0 0 0 0 -0.1277"/>
+    <key name="rest" qpos="0.0046 0.2347 0.3896 1.0707 -0.0107 -0.1043  0.20 -0.05 -0.012 1 0 0 0" ctrl="0.0046 0.2347 0.3896 1.0707 -0.0107 -0.1043"/>
+    <key name="home" qpos="0 -1.6674 1.0017 1.0753 0 -0.1277  0.20 -0.05 -0.012 1 0 0 0" ctrl="0 -1.6674 1.0017 1.0753 0 -0.1277"/>
   </keyframe>
 </mujoco>
