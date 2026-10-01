@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 import json
 import math
 import os
@@ -53,8 +52,8 @@ REGISTER_RANGES: dict[str, tuple[int, int]] = {
 HOMING_OFFSET_RANGE = (-2047, 2047)
 # Automatic thermal resumes per hour. The plan's value is 3; the state machine keeps max + 1 trip times.
 MAX_TRIPS_PER_HOUR_RANGE = (1, 10)
-# safe_state.bound_s must cover (worst joint limit -> home) + (exact home -> rest transit) + this margin (B5).
-SAFE_STATE_BOUND_MARGIN_S = 1.0
+# Plausible table height below the base frame origin (m); the box floor is the upper bound.
+TABLE_Z_RANGE_M = (-0.2, 0.0)
 SAFE_STATE_KEYS = frozenset(
     {
         "bound_s",
@@ -348,6 +347,11 @@ def load_config(
         ),
     )
     _in_range(safe.ramp_ticks_per_tick, 1, 64, "safe_state.ramp_ticks_per_tick")
+    if not TABLE_Z_RANGE_M[0] <= safe.table_z_m < box.z[0]:
+        raise ValueError(
+            f"safe_state.table_z_m: must be within {TABLE_Z_RANGE_M[0]} m and below box.z[0] = {box.z[0]} m, "
+            f"got {safe.table_z_m}"
+        )
     for key in ("table_clearance_m", "transit_zone_m", "home_box_margin_m"):
         if not getattr(safe, key) >= 0.0:
             raise ValueError(f"safe_state.{key}: must be >= 0, got {getattr(safe, key)}")
@@ -357,7 +361,6 @@ def load_config(
         if np.any(ticks < limits.min_ticks) or np.any(ticks > limits.max_ticks):
             raise ValueError(f"safe_state.{key} outside the joint limits: {ticks.tolist()}")
     kinematics_path = (path.parent / raw["kinematics_path"]).resolve()
-    _validate_safe_state_geometry(safe, box, limits, rates, calibration, kinematics_path)
 
     g = _keys(raw["registers"], set(REGISTER_RANGES), "registers")
     registers = RegisterConfig(
@@ -378,105 +381,6 @@ def load_config(
         registers=registers,
         kinematics_path=kinematics_path,
     )
-
-
-def _validate_safe_state_geometry(
-    safe: SafeStateConfig,
-    box: WorkspaceBox,
-    limits: JointLimits,
-    rates: RateConfig,
-    calibration: dict[str, MotorCalibration],
-    kinematics_path: Path,
-) -> None:
-    """Review B1 (a)/(b) and B5. The FK replay is a pure function of hashable inputs, cached across loads."""
-    problems = _safe_state_geometry_problems(
-        tuple(int(v) for v in safe.home_ticks),
-        tuple(int(v) for v in safe.rest_ticks),
-        int(safe.ramp_ticks_per_tick),
-        float(safe.bound_s),
-        float(safe.table_z_m),
-        float(safe.table_clearance_m),
-        float(safe.transit_zone_m),
-        float(safe.home_box_margin_m),
-        (box.x, box.y, box.z),
-        tuple(int(v) for v in limits.min_ticks),
-        tuple(int(v) for v in limits.max_ticks),
-        float(rates.servo_hz),
-        tuple(int(calibration[n].drive_mode) for n in JOINT_NAMES),
-        str(kinematics_path),
-    )
-    if problems:
-        raise ValueError("safe_state: " + "; ".join(problems))
-
-
-@functools.lru_cache(maxsize=64)
-def _safe_state_geometry_problems(
-    home: tuple[int, ...],
-    rest: tuple[int, ...],
-    step: int,
-    bound_s: float,
-    table_z: float,
-    clearance: float,
-    zone: float,
-    home_margin: float,
-    box_xyz: tuple[tuple[float, float], ...],
-    lim_min: tuple[int, ...],
-    lim_max: tuple[int, ...],
-    servo_hz: float,
-    drive_modes: tuple[int, ...],
-    kinematics_path: str,
-) -> tuple[str, ...]:
-    # Lazy: safety imports config at module level; by the time a config is loaded both packages are importable.
-    from so101_rl.safety.fk import KinematicChain, So101FK
-    from so101_rl.safety.transit import TransitPlanner, simulate_transit
-
-    calib = {
-        n: MotorCalibration(id=i + 1, drive_mode=d, homing_offset=0, range_min=0, range_max=TICKS_PER_REV - 1)
-        for i, (n, d) in enumerate(zip(JOINT_NAMES, drive_modes, strict=True))
-    }
-    fk = So101FK(KinematicChain.from_yaml(Path(kinematics_path)), calib)
-    box = WorkspaceBox(x=box_xyz[0], y=box_xyz[1], z=box_xyz[2])
-    planner = TransitPlanner(
-        fk, SafeStateConfig(ramp_ticks_per_tick=step, table_z_m=table_z, table_clearance_m=clearance, transit_zone_m=zone)
-    )
-    home_a = np.array(home, dtype=np.int32)
-    rest_a = np.array(rest, dtype=np.int32)
-    floor = planner.floor_z
-    out: list[str] = []
-    xyz = np.zeros(3)
-
-    # (a) home well inside the box; rest above the table and inside the box footprint (away from the D435 mount)
-    fk.gripper_xyz_from_ticks(home_a, xyz)
-    if not fk.in_box(xyz, box, margin=-home_margin):
-        out.append(f"FK(home_ticks) = {np.round(xyz, 4).tolist()} m is not {home_margin} m inside the box")
-    fk.gripper_xyz_from_ticks(rest_a, xyz)
-    if xyz[2] < floor:
-        out.append(f"FK(rest_ticks) z = {xyz[2]:.4f} m is below the table floor {floor:.4f} m (table + clearance)")
-    if not (box.x[0] <= xyz[0] <= box.x[1] and box.y[0] <= xyz[1] <= box.y[1]):
-        out.append(f"FK(rest_ticks) xy = {np.round(xyz[:2], 4).tolist()} m is outside the box footprint")
-
-    # (b) the exact ramp (the runtime TransitPlanner), tick by tick, in both directions
-    max_ticks = int(4 * TICKS_PER_REV / max(step, 1)) + 1
-    legs: dict[str, int] = {}
-    for name, a, b in (("rest -> home", rest_a, home_a), ("home -> rest", home_a, rest_a)):
-        n, z_min, reached = simulate_transit(planner, a, b, max_ticks)
-        legs[name] = n
-        if not reached:
-            out.append(f"{name} transit stalls after {n} ticks (the table floor holds every joint)")
-        if z_min < floor - 1e-9:
-            out.append(f"{name} transit dips to z = {z_min:.4f} m, below the table floor {floor:.4f} m")
-
-    # B5: bound_s covers the worst joint limit -> home plus the exact home -> rest transit, plus a margin
-    lo, hi = np.array(lim_min), np.array(lim_max)
-    worst = int(max(np.abs(lo - home_a).max(), np.abs(hi - home_a).max()))
-    need_s = worst / (step * servo_hz) + legs["home -> rest"] / servo_hz + SAFE_STATE_BOUND_MARGIN_S
-    if bound_s < need_s:
-        out.append(
-            f"bound_s = {bound_s} s is below the {need_s:.2f} s the ramp needs (worst limit -> home {worst} ticks, "
-            f"home -> rest {legs['home -> rest']} ticks at {step} ticks/tick and {servo_hz} Hz, "
-            f"+{SAFE_STATE_BOUND_MARGIN_S} s)"
-        )
-    return tuple(out)
 
 
 def is_verified_on_hardware(path: Path | None = None) -> bool:

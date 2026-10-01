@@ -15,7 +15,7 @@ the :class:`~so101_rl.safety.safe_state.SafeStateSequencer` (-> home -> rest) go
 
 A held ramp makes no progress, so the caller's time bound (the sequencer's ``bound_s``, reenergize's ramp
 budget) then ends it with torque off. The loader replays exactly this planner tick by tick from rest to home and
-from home to rest (``config/loader.py``), so a shipped configuration never relies on that fall-back.
+from home to rest (``safety/config_check.py``), so a shipped configuration never relies on that fall-back.
 
 The planner checks the TARGET. The present position lags it by the servo's tracking error, which the tracking
 clamp (applied by the callers after this step) bounds.

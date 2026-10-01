@@ -13,6 +13,7 @@ Core-loop rules modelled here, which ServoCore (U3) must follow too:
 import numpy as np
 import pytest
 
+from so101_rl.safety.config_check import validate_geometry
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.pipeline import SafetyPipeline
 from so101_rl.safety.reenergize import reenergize
@@ -31,6 +32,7 @@ S = 1_000_000_000
 
 class MiniCore:
     def __init__(self, cfg, calibration):
+        validate_geometry(cfg, calibration)  # config.load_config is pure; the safety stack validates the geometry
         self.cfg = cfg
         self.cal = calibration
         self.clock = FakeClock(start_ns=50 * S)

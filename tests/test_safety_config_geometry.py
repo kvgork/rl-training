@@ -1,11 +1,15 @@
-"""Loader checks of the safe-state geometry (review B1 a/b, B5, S10): FK(home) in the box, FK(rest) above the table,
-the exact rest <-> home transit replayed tick by tick, and bound_s long enough for the slowest ramp."""
+"""Safe-state geometry checks (review B1 a/b, B5, S10), now in ``safety.config_check.validate_geometry``: FK(home) in
+the box, FK(rest) above the table, the exact rest <-> home transit replayed tick by tick, and bound_s long enough for
+the slowest ramp. ``load_config`` itself only does the pure range/consistency checks."""
+
+from dataclasses import replace
 
 import numpy as np
 import pytest
 import yaml
 
 from so101_rl.config import DEFAULT_CONFIG_PATH, load_config
+from so101_rl.safety.config_check import geometry_problems, validate_geometry
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.transit import TransitPlanner, ramp_toward, simulate_transit
 
@@ -22,8 +26,14 @@ def _variant(tmp_path, mutate):
 
 
 def _rejects(tmp_path, calibration, mutate, match):
+    """load_config accepts the variant (it is pure) and validate_geometry rejects it; or load_config rejects it."""
     with pytest.raises(ValueError, match=match):
-        load_config(_variant(tmp_path, mutate), calibration=calibration)
+        cfg = load_config(_variant(tmp_path, mutate), calibration=calibration)
+        validate_geometry(cfg, calibration)
+
+
+def _problems(tmp_path, calibration, mutate):
+    return geometry_problems(load_config(_variant(tmp_path, mutate), calibration=calibration), calibration)
 
 
 @pytest.fixture
@@ -105,30 +115,49 @@ def test_rest_outside_the_box_footprint_is_rejected(tmp_path, calibration):
 
 
 # ---- (b) the exact transit -------------------------------------------------------------------------------------
-def test_transit_check_rejects_a_table_that_the_ramp_would_hit(tmp_path, calibration):
-    # raise the table to 1 mm below the rest tip: rest itself is still "above", but the clearance is not
-    _rejects(tmp_path, calibration, lambda r: r["safe_state"].update(table_z_m=-0.012), "table floor")
+def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
+    """Synthetic rest pose from which the planner has to hold every joint on the way up to home. Rest is above the
+    floor and inside the footprint, so only the stall check can reject this (exactly one problem is reported)."""
+
+    def mut(raw):
+        raw["safe_state"]["rest_ticks"] = [2050, 2264, 2481, 2993, 2040, 2065]
+        raw["safe_state"]["table_z_m"] = 0.0025
+
+    probs = _problems(tmp_path, calibration, mut)
+    assert len(probs) == 1
+    assert "rest -> home transit stalls" in probs[0]
+    _rejects(tmp_path, calibration, mut, "transit stalls")
+
+
+def test_transit_dip_is_rejected(tmp_path, calibration):
+    """Raise the table 5 mm above the rest tip: the replay starts below the floor (plain transit would sit there /
+    dip), and says so with the dip message, not only the rest-floor one."""
+    probs = _problems(tmp_path, calibration, lambda r: r["safe_state"].update(table_z_m=-0.012))
+    assert any("rest -> home transit dips" in p for p in probs)
+    assert any("FK(rest_ticks) z" in p for p in probs)  # the rest-floor check fires too, but is a different message
+    _rejects(tmp_path, calibration, lambda r: r["safe_state"].update(table_z_m=-0.012), "transit dips")
+
+
+# Synthetic pair for which the plain per-joint ramp rest -> home crosses a floor that the rest pose is above.
+DIP_REST = [2050, 1951, 2017, 2964, 2040, 2065]
+DIP_TABLE_Z = 0.08446094929348767  # floor = this + 5 mm clearance; the plain ramp bottoms out 2 mm below it
 
 
 def test_planner_prevents_a_dip_that_the_naive_ramp_makes(cfg, fk):
-    """The independent per-joint ramp (the old code) dips below a floor that the planner respects."""
-    from dataclasses import replace
-
-    rest = np.asarray(cfg.safe_state.rest_ticks, dtype=np.int32)
-    home = np.full(6, 2047, dtype=np.int32)  # the old placeholder home
-    cur = rest.copy()
-    out = np.empty_like(cur)
-    naive_min = 1.0
+    rest = np.asarray(DIP_REST, dtype=np.int32)
+    home = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32)
+    ss = replace(cfg.safe_state, rest_ticks=rest, table_z_m=DIP_TABLE_Z)
+    planner = TransitPlanner(fk, ss)
+    assert tip(fk, rest)[2] > planner.floor_z  # rest itself is above the floor
+    cur, out, naive_min = rest.copy(), np.empty_like(rest), 1.0
     while not (cur == home).all():
-        ramp_toward(cur, home, 8, out)
+        ramp_toward(cur, home, ss.ramp_ticks_per_tick, out)
         cur[...] = out
         naive_min = min(naive_min, tip(fk, cur)[2])
-    z_rest = tip(fk, rest)[2]
-    assert naive_min > z_rest  # the naive ramp from this rest happens not to dip: build a floor it crosses
-    floor_cfg = replace(cfg.safe_state, table_z_m=float(z_rest) - 0.002 - 0.005)  # floor 2 mm below rest
-    planner = TransitPlanner(fk, floor_cfg)
-    _n, z_min, reached = simulate_transit(planner, rest, home, 2000)
-    assert reached and z_min >= planner.floor_z
+    assert naive_min < planner.floor_z - 1e-3  # non-vacuous: the independent ramp DOES dip
+    for a, b in ((rest, home), (home, rest)):
+        _n, z_min, reached = simulate_transit(planner, a, b, 2000)
+        assert reached and z_min >= planner.floor_z
 
 
 def test_lift_first_inside_the_zone(cfg, fk):
@@ -160,14 +189,13 @@ def test_a_faster_ramp_allows_a_shorter_bound(tmp_path, calibration):
         _variant(tmp_path, lambda r: r["safe_state"].update(bound_s=10.0, ramp_ticks_per_tick=16)), calibration=calibration
     )
     assert cfg.safe_state.bound_s == 10.0
+    validate_geometry(cfg, calibration)
 
 
 def test_bound_check_uses_the_calibration_limits(tmp_path, calibration):
     """A wider calibration (full 0..4095 on every joint) needs a longer bound; 20 s still covers it."""
-    from dataclasses import replace
-
     wide = {n: replace(c, range_min=0, range_max=4095) for n, c in calibration.items()}
-    load_config(calibration=wide)  # shipped 20 s
+    validate_geometry(load_config(calibration=wide), wide)  # shipped 20 s
     _rejects(tmp_path, wide, lambda r: r["safe_state"].update(bound_s=17.0), "bound_s")
 
 
@@ -192,6 +220,42 @@ def test_present_tolerance_has_no_hidden_default(tmp_path, calibration):
 
 
 def test_geometry_cache_does_not_mask_a_changed_value(tmp_path, calibration):
-    load_config(calibration=calibration)
+    validate_geometry(load_config(calibration=calibration), calibration)
     _rejects(tmp_path, calibration, lambda r: r["safe_state"].update(bound_s=5.0), "bound_s")
-    load_config(calibration=calibration)  # and back
+    validate_geometry(load_config(calibration=calibration), calibration)  # and back
+
+
+def test_shipped_config_passes_validate_geometry(cfg, calibration):
+    validate_geometry(cfg, calibration)
+    validate_geometry(cfg)  # calibration read from cfg.calibration_path (drive_mode only)
+
+
+def test_explicit_chain_bypasses_the_cache(cfg, calibration):
+    validate_geometry(cfg, calibration, KinematicChain.from_yaml(cfg.kinematics_path))
+
+
+# ---- table_z_m sanity range, in the (pure) loader --------------------------------------------------------------
+@pytest.mark.parametrize("bad", [-0.25, 0.010, 0.05])
+def test_table_z_is_range_checked_by_the_loader(tmp_path, calibration, bad):
+    with pytest.raises(ValueError, match="table_z_m"):
+        load_config(_variant(tmp_path, lambda r: r["safe_state"].update(table_z_m=bad)), calibration=calibration)
+
+
+# ---- dependency direction: config is a leaf ----------------------------------------------------------------------
+def test_config_package_does_not_import_safety():
+    import ast
+    from pathlib import Path
+
+    import so101_rl.config as config_pkg
+
+    offenders = []
+    for f in Path(config_pkg.__file__).parent.glob("*.py"):
+        for node in ast.walk(ast.parse(f.read_text())):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [("." * node.level) + (node.module or "")] + [a.name for a in node.names]
+            if any("safety" in n.split(".") or n.endswith("safety") for n in names):
+                offenders.append(f"{f.name}:{node.lineno}")
+    assert not offenders, offenders

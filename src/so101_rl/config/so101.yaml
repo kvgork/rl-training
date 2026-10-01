@@ -45,8 +45,8 @@ rates:
 
 safe_state:
   # bound_s must cover the worst joint limit -> home plus the exact home -> rest transit at ramp_ticks_per_tick
-  # (the loader computes it, review B5): 16.8 s with the shipped calibration, 19.3 s for a full 0..4095 range
-  # calibration, so 20 s covers any calibration. The plan's
+  # (safety/config_check.py computes it, review B5): 15.33 s with the shipped calibration, 19.23 s for a full 0..4095 range
+  # calibration (both include the 1 s margin), so 20 s covers any calibration. The plan's
   # original 5 s is not reachable at 8 ticks/tick (240 ticks/s) from the shoulder_lift limit.
   bound_s: 20.0
   ramp_ticks_per_tick: 8
