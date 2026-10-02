@@ -30,8 +30,11 @@ def _stats_ms(ns: np.ndarray) -> dict[str, float]:
 
 
 def measure_bus(bus: Bus, n: int = 300, *, clock: Clock | None = None, write: bool = False) -> dict[str, float]:
-    """``read_block`` round-trip latency over ``n`` calls: ``{n, p50, p99, max, failures}`` in ms. With ``write``
-    each read is followed by ``write_goal(present)`` (the arm holds still) and ``write_*`` keys are added."""
+    """``read_block`` round-trip latency over ``n`` calls: ``{n, p50, p99, max, failures}`` in ms. The statistics
+    cover the SUCCESSFUL reads only (``n`` = ``attempts - failures``): a failed read returns after a timeout and
+    would distort the budget (U3 review item 16); ``failures`` counts the rest. With ``write`` each good read is
+    followed by ``write_goal(present)`` (the arm holds still) and ``write_*`` keys are added. The caller must make
+    sure torque is off on the real arm (the hardware test asserts it)."""
     clock = clock if clock is not None else RealClock()
     block = BlockRead()
     reads = np.zeros(n, dtype=np.int64)
@@ -40,14 +43,16 @@ def measure_bus(bus: Bus, n: int = 300, *, clock: Clock | None = None, write: bo
     write_failures = 0
     goal = np.zeros(block.position.shape, dtype=np.int32)
     nw = 0
-    for i in range(n):
+    nr = 0
+    for _ in range(n):
         t0 = clock.monotonic_ns()
         ok = bool(bus.read_block(block)) and block.ok
         t1 = clock.monotonic_ns()
-        reads[i] = t1 - t0
         if not ok:
             failures += 1
             continue
+        reads[nr] = t1 - t0
+        nr += 1
         if write:
             goal[...] = block.position
             t2 = clock.monotonic_ns()
@@ -55,7 +60,8 @@ def measure_bus(bus: Bus, n: int = 300, *, clock: Clock | None = None, write: bo
                 write_failures += 1
             writes[nw] = clock.monotonic_ns() - t2
             nw += 1
-    out = _stats_ms(reads)
+    out = _stats_ms(reads[:nr])
+    out["attempts"] = n
     out["failures"] = failures
     if write:
         out.update({f"write_{k}": v for k, v in _stats_ms(writes[:nw]).items()})

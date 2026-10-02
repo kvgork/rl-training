@@ -200,8 +200,9 @@ STATE_DTYPE = np.dtype([                   # written by servo, read by policy
     ("applied_delta_ticks", "<f4", (6,)),   # the post-clamp delta actually applied this command (L4)
     ("clamped_mask", "<u1", (6,)),
     ("fault_bits", "<u4"), ("sm_state", "<u4"), ("last_cmd_seq", "<u8"), ("hb_ok", "<u1"),
+    ("read_ok", "<u1"),                     # AS BUILT (U3 review item 9, plan §10 2026-10-02): this tick's block read succeeded; 0 = present..moving repeat the last good read
     ("crc32", "<u4"),
-], align=True)                              # itemsize asserted == 232 (corrected 2026-09-30: natural alignment; block stride 256 B)
+], align=True)                              # itemsize asserted == 232 (corrected 2026-09-30: natural alignment; block stride 256 B). read_ok sits at offset 225 in former padding: size/stride/offsets unchanged, SHM_LAYOUT_VERSION = 2
 
 class SeqlockBlock:                         # single writer, many readers, no locks
     def __init__(self, buf: memoryview, dtype: np.dtype) -> None: ...
@@ -247,6 +248,8 @@ class McuStatus(NamedTuple): relay_on: bool; latched: bool; armed: bool; undervo
 class HeartbeatLink(Protocol):
     def arm(self) -> McuStatus: ...
     def send(self, seq: int) -> bool: ...              # non-blocking; False on write timeout or bad echo → counts as a missed heartbeat
+    # AS BUILT (U3 review item 2, 2026-10-02): def send(self, seq: int) -> HbSend   # IntEnum NOT_DELIVERED=0 (seq NOT consumed) / ACKED=1 / DELIVERED_NO_ECHO=2 (seq consumed)
+    # AS BUILT: last_status: McuStatus | None   # the MCU's last reported status byte (fed to the state machine after ARM)
     def status(self) -> McuStatus: ...
     def test_drop(self) -> int: ...                    # drop_ms
 
@@ -257,6 +260,7 @@ class FakeMcu:                                          # host-side model of the
     def feed(self, frame: bytes) -> bytes: ...          # returns the status byte(s)
     def poll(self) -> None: ...                         # apply timeouts at clock.monotonic_ns()
 class FakeHeartbeatLink(HeartbeatLink): def __init__(self, mcu: FakeMcu) -> None
+    # AS BUILT: fail_writes(n) -> NOT_DELIVERED, drop_echoes(n) -> DELIVERED_NO_ECHO, unplug(); FakeMcu.relay_closed() -> bool powers FakeBus(power=...)
 ```
 
 ### F5. Safety layer — `src/so101_rl/safety/`
@@ -385,19 +389,26 @@ class ServoCore:
     def tick(self, deadline_ns: int | None = None) -> TickResult   # as built: returns the SAME preallocated TickResult every call
     # (F6 original) def tick(self) -> TickResult  # read_block → ipc.read_cmd (dedupe by seq) → sm.step → pipeline.apply → check_range → bus.write_goal → heartbeat.send → ipc.write_state
     def shutdown(self, reason: TripCause = TripCause.USER_STOP) -> None   # runs SafeStateSequencer to completion (bounded), then torque off, then disconnect. SIGINT/SIGTERM/exceptions all route here. Idempotent.
+    # AS BUILT (U3 review fixes, 2026-10-02):
+    #   start(): bus.connect() WITHOUT handshake -> BOOT (no bus traffic) -> button + ARM -> ping_all until every id answers -> read + write + ACKED heartbeat, all within BOOT_HEARTBEAT_WINDOW_S = 0.8 s of ARM -> reenergize(..., should_abort=...)
+    #   should_abort is kept: it aborts a running reenergize (ReenergizeAborted, torque off) and blocks a thermal resume
+    #   heartbeat: seq consumed only when delivered; misses counted -> SmInputs.hb_misses (F5 addition; HB_MISS_BUDGET = 5 latches), SmInputs.mcu = link.last_status after ARM; reenergize strict (one miss aborts)
+    #   commands: only RUN-mode commands are fresh; an unapplied RUN delta stays pending; the cmd block is drained after mark_energized
+    #   state record: read_ok; applied_delta_ticks / clamped_mask zero when apply did not run; properties thermal, hb_misses
 def build_servo_core(cfg, calibration, bus, ipc, heartbeat, clock, *, chain=None, tick_log=None, log=None) -> ServoCore   # as built: calls safety.config_check.validate_geometry, wires the stack
 TICK_LOG_DTYPE: np.dtype                         # as built: one tick-log record per tick (jitter, duration, state, flags, trips, present, target, temps, latencies)
 def log_row(last_rec_of_step, first_rec_of_next_step) -> dict   # as built: the F8 log-convention pairing of two STATE_DTYPE records
 
 # servo/process.py
 def run(cfg: So101Config, bus_factory: Callable[[], Bus], hb_factory: Callable[[], HeartbeatLink | None], *, require_rt: bool, max_ticks: int | None = None,
-        clock=None, ipc=None, calibration=None, tick_log_path=None, summary_path=None, arm_timeout_s=None, install_signals=True, freeze_gc=True, on_core=None) -> int   # as built: kw-only extras for tests and the CLI; exit codes 0 ok, 1 exception, 2 start-up, 3 RT required, 4 shm owned
+        clock=None, ipc=None, calibration=None, tick_log_path=None, summary_path=None, arm_timeout_s=None, install_signals=True, freeze_gc=True, on_core=None, serial_ports=()) -> int   # as built: kw-only extras for tests and the CLI; exit codes 0 ok, 1 exception, 2 start-up, 3 RT required, 4 shm or serial port owned (SerialPortLock per serial_ports entry); stop signals SIGINT/SIGTERM/SIGHUP/SIGQUIT
 #   sets SCHED_FIFO(50) + sched_setaffinity + mlockall (best effort unless require_rt), gc.collect/freeze/disable, absolute-deadline loop with resync-on-large-overrun, returns exit code
 # servo/main.py  — CLI: so101-servo --backend {feetech,fake,mujoco} --port --heartbeat-port --shm-name --require-rt --max-ticks
 # servo/soak.py  — soak harness: runs the servo with a random-policy client for --minutes, writes runs/soak-<ts>/report.json
 @dataclass
 class SoakReport: rt_active: bool; kernel: str; minutes: float; tick_stats: TickStats; hb_max_gap_ms: float; hb_gaps_over_200ms: int; thermal_trips: int; calib_mismatches: int; max_temp_c: dict[str, int]; rss_growth_mb: float; gc_collections: int; unexpected_safe_states: int
 def check_soak_report(path: Path, *, strict: bool) -> tuple[bool, list[str]]    # gate: p999 < 5 ms, hb_gaps_over_200ms == 0, thermal_trips == 0, calib_mismatches == 0; strict=False (non-RT host) → advisory
+# AS BUILT (U3 review items 3, 12): strict also needs minutes >= 30 and hold_entries == 0; invalid on ANY host: < 90 % of requested minutes, of minutes*60*servo_hz samples or of minutes*60*policy_hz policy steps. SoakReport gains hold_entries, requested_minutes, servo_hz, policy_hz; hb gaps use the window start/end as endpoints
 ```
 
 ### F7. Goal-conditioned Gym environment — `src/so101_rl/env/`

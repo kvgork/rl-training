@@ -31,7 +31,13 @@ deadman and the state machine.
 succeeded AND its ``write_goal`` was accepted. The first such tick is step 4's ``write_goal(present)``. With a
 hook, the time from entry to that first good tick, and every later gap between good ticks, must stay below
 ``heartbeat_gap_s`` (0.8 s, under the MCU's 1000 ms timeout), else ``TimeoutError``: an MCU that is about to
-latch must not be raced.
+latch must not be raced. The hook may raise to abort (the servo core does on a refused heartbeat: re-energise
+stays strict, one miss aborts it).
+
+**Abort** (U3 review item 7): ``should_abort()`` is polled once per servo tick in every waiting loop and in the
+ramp. When it turns true ``ReenergizeAborted`` is raised; like every other failure after ``set_torque(True)`` that
+turns torque off first (the arm goes limp where it is, as with the e-stop), so a Ctrl-C or STOP_REQ is honoured
+within one tick instead of after the up-to-5 s ramp.
 """
 
 from __future__ import annotations
@@ -61,6 +67,10 @@ _TORQUE_OFF_ATTEMPTS = 3
 TickHook = Callable[[bool], None]
 
 
+class ReenergizeAborted(RuntimeError):
+    """``should_abort()`` turned true (signal, STOP_REQ). Torque is off when this propagates."""
+
+
 class UnsafeStartPose(RuntimeError):
     """The arm is neither near rest nor inside the box: re-energising could swing it through anything."""
 
@@ -85,13 +95,14 @@ def reenergize(
     tick_hook: TickHook | None = None,
     heartbeat_gap_s: float = 0.8,
     fk: So101FK | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> None:
     """1. wait until all 6 ids answer (ping_all)  2. require_calibration  3. Lock=0, torque-off check, registers,
     read-back  4. read_block -> start pose / temperature check -> write_goal(present) -> read back
     Goal_Position == present for all 6  5. set_torque(True)  6. ramp home through the transit zone.
 
     Raises ``TimeoutError`` (motors missing, block read failing, heartbeat gap, homing not reached),
-    ``CalibrationMismatch``, ``UnsafeStartPose`` or ``RuntimeError`` (register / goal read-back differs, torque on
+    ``CalibrationMismatch``, ``UnsafeStartPose``, ``ReenergizeAborted`` (``should_abort()``) or ``RuntimeError`` (register / goal read-back differs, torque on
     before the register writes, hot or faulted motor, bus write failed). After step 5 every failure turns torque
     off before it propagates. The order is asserted by tests/test_reenergize.py.
     """
@@ -107,8 +118,14 @@ def reenergize(
     if fk is None:
         fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
 
+    def check_abort() -> None:
+        if should_abort is not None and should_abort():
+            raise ReenergizeAborted("re-energise aborted (stop requested)")
+
     def wait_until(what: str, ok, until_ns: int) -> None:
+        check_abort()
         while not ok():
+            check_abort()
             now = clock.monotonic_ns()
             if now >= until_ns:
                 raise TimeoutError(f"re-energise: timed out waiting for {what}")
@@ -156,11 +173,12 @@ def reenergize(
             raise RuntimeError(f"re-energise: Goal_Position of {name} reads {got}, expected present {int(want)}")
 
     # 5. only now
+    check_abort()
     try:
         if not bus.set_torque(True):
             raise RuntimeError("re-energise: set_torque(True) failed")
         # 6. ramp home through the transit zone, same step and tracking clamp as the safe-state ramp
-        _ramp_home(bus, cfg, clock, block, present, timeout_s, fk, tick_hook, last_good_ns, gap_ns)
+        _ramp_home(bus, cfg, clock, block, present, timeout_s, fk, tick_hook, last_good_ns, gap_ns, check_abort)
     except BaseException as exc:
         if not torque_off_retry(bus):
             exc.add_note("re-energise: torque-off after the failure ALSO failed; the deadman is the next layer")
@@ -231,6 +249,7 @@ def _ramp_home(
     tick_hook: TickHook | None,
     last_good_ns: int,
     gap_ns: int,
+    check_abort: Callable[[], None],
 ) -> None:
     home = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32)
     planner = TransitPlanner(fk, cfg.safe_state)
@@ -246,6 +265,7 @@ def _ramp_home(
     deadline = clock.monotonic_ns() + int(budget_s * _NS)
     next_tick = clock.monotonic_ns()
     while True:
+        check_abort()
         now = clock.monotonic_ns()
         if now >= deadline:
             raise TimeoutError("re-energise: ramp home did not complete in time")

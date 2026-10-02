@@ -10,7 +10,7 @@ import pytest
 from so101_rl.config import JOINT_NAMES, N_JOINTS, MotorCalibration
 from so101_rl.safety.calib_check import CalibrationMismatch
 from so101_rl.safety.fk import KinematicChain, So101FK
-from so101_rl.safety.reenergize import UnsafeStartPose, reenergize, register_name
+from so101_rl.safety.reenergize import ReenergizeAborted, UnsafeStartPose, reenergize, register_name
 from so101_rl.servo.bus import BlockRead
 from so101_rl.servo.timing import FakeClock
 
@@ -526,3 +526,25 @@ def test_with_hook_a_slow_register_phase_is_caught_before_torque(cfg, calibratio
     with pytest.raises(TimeoutError, match="heartbeat gap"):
         reenergize(bus, cfg, calibration, clock, BlockRead(), tick_hook=lambda ok: None)
     assert "write_goal" not in bus.log and "set_torque:True" not in bus.log
+
+
+# ---- should_abort (U3 review item 7) ----------------------------------------------------------------------------
+def test_abort_before_torque_never_energises(cfg, calibration, bus, clock):
+    with pytest.raises(ReenergizeAborted):
+        reenergize(bus, cfg, calibration, clock, BlockRead(), should_abort=lambda: True)
+    assert "set_torque:True" not in bus.log and not bus.torque
+
+
+def test_abort_during_the_ramp_turns_torque_off_within_one_tick(cfg, calibration, clock):
+    bus = LoggingBus(calibration, clock, present=list(cfg.safe_state.rest_ticks), follow=0.3)
+    state = {"t_abort": None}
+
+    def abort():
+        if bus.torque and state["t_abort"] is None:
+            state["t_abort"] = clock.monotonic_ns() + 200_000_000  # 200 ms into the ramp
+        return state["t_abort"] is not None and clock.monotonic_ns() >= state["t_abort"]
+
+    with pytest.raises(ReenergizeAborted):
+        reenergize(bus, cfg, calibration, clock, BlockRead(), should_abort=abort)
+    assert not bus.torque and bus.log[-1] == "set_torque:False"
+    assert clock.monotonic_ns() - state["t_abort"] < int(1e9 / cfg.rates.servo_hz) + 1  # honoured within one tick

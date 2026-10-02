@@ -359,3 +359,121 @@ def test_setup_realtime_never_raises_and_reports():
     if not _rt_available():
         assert not st.fifo and any("SCHED_FIFO" in e for e in st.errors)
     os.sched_setaffinity(0, set(range(os.cpu_count() or 1)))  # undo the pinning for the rest of the session
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# U3 review items 6, 7 and 14
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT], ids=["SIGTERM", "SIGHUP", "SIGQUIT"])
+def test_item6_stop_signals_go_through_the_bounded_shutdown(cfg, calibration, sig):
+    """SIGHUP (ssh session closed) and SIGQUIT must ramp the arm down like SIGINT, not kill the process."""
+    clock = FakeClock(start_ns=1_000 * NS)
+    bus = FakeBus(clock, calibration=calibration, initial_ticks=cfg.safe_state.home_ticks)
+    mcu = FakeMcu(clock)
+    mcu.set_button(True)
+    n = {"reads": 0, "t_sig": None}
+    real_read = bus.read_block
+    seen = {}
+
+    def read(out):
+        n["reads"] += 1
+        if n["t_sig"] is None and "core" in seen and seen["core"].state is SmState.RUN:  # first loop tick
+            n["t_sig"] = clock.monotonic_ns()
+            os.kill(os.getpid(), sig)
+        return real_read(out)
+
+    bus.read_block = read
+    before = signal.getsignal(sig)
+    code = process.run(
+        cfg,
+        lambda: bus,
+        lambda: FakeHeartbeatLink(mcu),
+        require_rt=False,
+        clock=clock,
+        ipc=LocalIpc(),
+        calibration=calibration,
+        arm_timeout_s=5.0,
+        freeze_gc=False,
+        max_ticks=600,  # a test that never signals must fail, not hang
+        on_core=lambda core, runner: seen.update(core=core, runner=runner),
+    )
+    assert code == process.EXIT_OK
+    assert n["t_sig"] is not None and seen["runner"].signal_received == sig
+    assert clock.monotonic_ns() - n["t_sig"] <= cfg.safe_state.bound_s * NS
+    assert not bus.torque_enabled().any() and not bus.connected
+    np.testing.assert_allclose(bus._pos[:5], np.asarray(cfg.safe_state.rest_ticks)[:5], atol=30)  # ramped down
+    assert signal.getsignal(sig) == before  # restored
+    assert set(process.STOP_SIGNALS) >= {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
+
+
+def test_item7_signal_during_the_boot_reenergize_aborts_it_promptly(cfg, calibration):
+    clock = FakeClock(start_ns=1_000 * NS)
+    bus = FakeBus(clock, calibration=calibration, initial_ticks=cfg.safe_state.rest_ticks)  # long ramp
+    mcu = FakeMcu(clock)
+    mcu.set_button(True)
+    t = {"sig": None}
+    real_torque = bus.set_torque
+
+    def set_torque(enabled, ids=None):
+        ok = real_torque(enabled, ids)
+        if enabled and t["sig"] is None:
+            t["sig"] = clock.monotonic_ns()
+            os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C right when the ramp starts
+        return ok
+
+    bus.set_torque = set_torque
+    code = process.run(
+        cfg,
+        lambda: bus,
+        lambda: FakeHeartbeatLink(mcu),
+        require_rt=False,
+        clock=clock,
+        ipc=LocalIpc(),
+        calibration=calibration,
+        arm_timeout_s=5.0,
+        freeze_gc=False,
+    )
+    assert code == process.EXIT_OK  # interrupted by a signal, not a start-up failure
+    assert clock.monotonic_ns() - t["sig"] < 0.5 * NS  # not the ~5 s ramp
+    assert not bus.torque_enabled().any()
+
+
+def test_item14_a_held_serial_port_refuses_a_second_servo_with_exit_4(cfg, calibration, tmp_path):
+    from so101_rl.servo.shm import SerialPortLock
+
+    port = tmp_path / "ttyFAKE_bus"
+    port.write_text("")
+    alias = tmp_path / "serial-by-id"
+    alias.symlink_to(port)
+    held = SerialPortLock(str(port))  # another servo (with a different shm name) owns the bus
+    try:
+        code = process.run(
+            cfg,
+            lambda: pytest.fail("bus must not be built"),
+            lambda: None,
+            require_rt=False,
+            clock=FakeClock(),
+            ipc=LocalIpc(),
+            calibration=calibration,
+            install_signals=False,
+            serial_ports=(str(alias),),
+        )
+    finally:
+        held.release()
+    assert code == process.EXIT_LOCKED
+    code, _bus, _ = _in_process(cfg, calibration, max_ticks=5, serial_ports=(str(alias),))
+    assert code == process.EXIT_OK  # free again, and released by run() itself:
+    SerialPortLock(str(port)).release()
+
+
+def test_item14_cli_locks_the_feetech_bus_and_watchdog_ports(monkeypatch):
+    from so101_rl.servo import main as main_mod
+
+    seen = {}
+    monkeypatch.setattr(main_mod, "run", lambda *a, **kw: seen.update(kw) or 0)
+    assert main_mod.main(["--backend", "feetech", "--calibration", str(CALIB), "--port", "/dev/fake-bus",
+                          "--heartbeat-port", "/dev/fake-mcu"]) == 0
+    assert seen["serial_ports"] == ("/dev/fake-bus", "/dev/fake-mcu")
+    assert main_mod.main(["--backend", "fake", "--calibration", str(CALIB)]) == 0
+    assert seen["serial_ports"] == ()

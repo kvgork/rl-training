@@ -29,13 +29,16 @@ MS = 1_000_000
 
 
 class Harness:
-    def __init__(self, cfg, calibration, *, start=None, mcu=True, fake_bus_kwargs=None):
+    def __init__(self, cfg, calibration, *, start=None, mcu=True, fake_bus_kwargs=None, relay_powered=False, boot_ms=0.0):
         self.cfg = cfg
         self.clock = FakeClock(start_ns=1_000 * NS)
         self.start_ticks = np.asarray(cfg.safe_state.home_ticks if start is None else start, dtype=np.int32)
-        self.bus = FakeBus(self.clock, calibration=calibration, initial_ticks=self.start_ticks, **(fake_bus_kwargs or {}))
-        self.ipc = LocalIpc()
         self.mcu = FakeMcu(self.clock, timeout_ms=cfg.rates.heartbeat_timeout_ms) if mcu else None
+        kw = dict(fake_bus_kwargs or {})
+        if relay_powered:  # the servo side is live only while the MCU's relay is closed (the real wiring)
+            kw.update(power=self.mcu.relay_closed, boot_ms=boot_ms)
+        self.bus = FakeBus(self.clock, calibration=calibration, initial_ticks=self.start_ticks, **kw)
+        self.ipc = LocalIpc()
         self.link = FakeHeartbeatLink(self.mcu) if mcu else None
         self.logs: list[str] = []
         self.core = build_servo_core(cfg, calibration, self.bus, self.ipc, self.link, self.clock, log=self.logs.append)
@@ -277,7 +280,8 @@ def test_three_consecutive_bus_failures_latch_and_stop_heartbeats(h):
 
 
 def test_mcu_latches_when_the_servo_stops_ticking(h):
-    """SIGSTOP model: no tick() for 1.1 s -> the MCU opens the relay; the next heartbeat is refused -> LATCHED."""
+    """SIGSTOP model: no tick() for 1.1 s -> the MCU opens the relay; the next heartbeat's echo reports the MCU
+    latched -> LATCHED at once (DEADMAN, plan section 10 2026-10-02: an MCU latch never waits for the miss budget)."""
     h.run_policy(3)
     assert h.mcu.armed
     h.clock.advance(1100 * MS)
@@ -286,7 +290,7 @@ def test_mcu_latches_when_the_servo_stops_ticking(h):
     h.send()
     h.tick(2)
     assert h.core.state is SmState.LATCHED
-    assert h.core.sm.fault_bits & TripCause.HEARTBEAT_FAIL
+    assert h.core.sm.fault_bits & TripCause.DEADMAN
 
 
 def test_state_is_published_every_tick_also_when_latched(h):

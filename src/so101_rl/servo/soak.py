@@ -7,16 +7,21 @@ of parking against a face) at ``policy_hz`` for ``M`` minutes, then stops the ch
 shutdown) and writes ``runs/soak-<ts>/report.json``.
 
 Sources of the report fields: ``tick_stats`` (jitter/duration over the loop ticks of the soak window),
-``hb_max_gap_ms`` / ``hb_gaps_over_200ms`` and ``max_temp_c`` / ``thermal_trips`` (rising edges of THERMAL) /
-``unexpected_safe_states`` (entries into SAFE_STOPPING, TORQUE_OFF or LATCHED while the policy was driving) come
-from the tick log; ``calib_mismatches`` (failed calibration checks at each CHECK / re-energise),
+``hb_max_gap_ms`` / ``hb_gaps_over_200ms`` (the window's start and end count as gap endpoints, so silence before
+the first or after the last heartbeat is a gap too), ``hold_entries`` (entries into HOLD: the policy was late),
+``max_temp_c`` / ``thermal_trips`` (rising edges of THERMAL) / ``unexpected_safe_states`` (entries into
+SAFE_STOPPING, TORQUE_OFF or LATCHED while the policy was driving) come from the tick log; ``calib_mismatches`` (failed calibration checks at each CHECK / re-energise),
 ``gc_collections`` and ``rt_active`` from the child's summary; ``rss_growth_mb`` from ``psutil`` on the child
 (RUN start -> end of the soak window); ``kernel`` from ``platform``.
 
-``check_soak_report(path, strict=...)`` is the Tier-1 gate: p99.9 tick jitter < 5 ms, no heartbeat gap over
-200 ms, no thermal trip, no calibration mismatch. ``strict=False`` (a non-RT host) turns those into warnings.
-A run that is not a valid soak fails on any host: the servo exited nonzero, wrote no summary, or entered a safe
-state while the random policy was driving it (``unexpected_safe_states``). The CLI uses ``strict=rt_active`` and exits 1 when a strict gate fails.
+``check_soak_report(path, strict=...)`` is the Tier-1 gate: at least ``GATE_MIN_MINUTES`` (30) of soak, p99.9
+tick jitter < 5 ms, no heartbeat gap over 200 ms, no HOLD entry, no thermal trip, no calibration mismatch.
+``strict=False`` (a non-RT host) turns those into warnings. A run that is not a valid soak fails on any host (U3
+review item 3, the L12 failure mode: an empty run must never pass): the servo exited nonzero, wrote no summary,
+entered a safe state while the random policy was driving it (``unexpected_safe_states``), ran shorter than 90 %
+of the requested minutes, or has fewer than 90 % of the expected loop-tick samples
+(``minutes * 60 * servo_hz``) or policy steps (``minutes * 60 * policy_hz``). The CLI uses ``strict=rt_active``
+and exits 1 when the gate fails.
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ from so101_rl.servo.timing import TickStats
 
 GATE_P999_MS = 5.0
 GATE_HB_GAP_MS = 200.0
+GATE_MIN_MINUTES = 30.0  # the first Tier-1 soak (ARCHITECTURE section 6.6); strict gate only
+MIN_FRACTION = 0.9  # samples / policy steps / minutes below this fraction of the expected count: not a valid soak
 _NS = 1_000_000_000
 _STOP_STATES = (SmState.SAFE_STOPPING, SmState.TORQUE_OFF, SmState.LATCHED)
 _RUN_TIMEOUT_S = 60.0
@@ -62,6 +69,10 @@ class SoakReport:
     rss_growth_mb: float
     gc_collections: int
     unexpected_safe_states: int
+    hold_entries: int = 0
+    requested_minutes: float = 0.0
+    servo_hz: float = 0.0
+    policy_hz: float = 0.0
     backend: str = ""
     servo_exit_code: int | None = None
     policy_steps: int = 0
@@ -80,11 +91,31 @@ def check_soak_report(path: Path, *, strict: bool) -> tuple[bool, list[str]]:
         invalid.append("the servo wrote no summary (crashed?)")
     if int(rep.get("unexpected_safe_states", 0)) != 0:
         invalid.append(f"{rep['unexpected_safe_states']} unexpected safe-state entr(y/ies) while the policy was driving")
+    minutes = float(rep.get("minutes", 0.0))
+    requested = float(rep.get("requested_minutes", 0.0)) or minutes
+    servo_hz = float(rep.get("servo_hz", 0.0))
+    policy_hz = float(rep.get("policy_hz", 0.0))
+    if not (servo_hz > 0 and policy_hz > 0):
+        invalid.append("report has no servo_hz / policy_hz: cannot check the sample counts")
+    if not minutes > 0 or minutes < MIN_FRACTION * requested:
+        invalid.append(f"soak ran {minutes:.3f} min of the {requested:.3f} min requested")
+    want_samples = MIN_FRACTION * minutes * 60.0 * servo_hz
+    samples = int(rep["tick_stats"].get("samples", 0))
+    if samples < max(1.0, want_samples):
+        invalid.append(f"{samples} loop-tick samples, expected >= {want_samples:.0f} ({minutes:.3f} min at {servo_hz:g} Hz)")
+    want_steps = MIN_FRACTION * minutes * 60.0 * policy_hz
+    steps = int(rep.get("policy_steps", 0))
+    if steps < max(1.0, want_steps):
+        invalid.append(f"{steps} policy steps, expected >= {want_steps:.0f} ({minutes:.3f} min at {policy_hz:g} Hz)")
+    if minutes < GATE_MIN_MINUTES:
+        problems.append(f"soak of {minutes:.2f} min is shorter than the {GATE_MIN_MINUTES:g} min Tier-1 floor")
     p999 = float(rep["tick_stats"]["p999_ms"])
     if not p999 < GATE_P999_MS:
         problems.append(f"p99.9 tick jitter {p999:.3f} ms >= {GATE_P999_MS} ms")
     if int(rep["hb_gaps_over_200ms"]) != 0:
         problems.append(f"{rep['hb_gaps_over_200ms']} heartbeat gap(s) over {GATE_HB_GAP_MS:.0f} ms")
+    if int(rep.get("hold_entries", 0)) != 0:
+        problems.append(f"{rep['hold_entries']} HOLD entr(y/ies): the policy was late")
     if int(rep["thermal_trips"]) != 0:
         problems.append(f"{rep['thermal_trips']} thermal trip(s)")
     if int(rep["calib_mismatches"]) != 0:
@@ -101,19 +132,21 @@ def analyse_tick_log(recs: np.ndarray, *, t_start_ns: int, t_end_ns: int, period
     stats = TickStats(period_ns, capacity=max(1, len(loop)))
     for j, d in zip(loop["jitter_ns"].tolist(), loop["duration_ns"].tolist(), strict=True):
         stats.record(int(j), int(d))
+    # the window's start and end are gap endpoints: silence before the first / after the last heartbeat counts
     hb_t = win["t_ns"][win["hb_sent"].astype(bool)]
-    if len(hb_t) >= 2:
-        gaps = np.diff(hb_t)
+    if t_end_ns > t_start_ns:
+        gaps = np.diff(np.concatenate(([t_start_ns], hb_t.astype(np.int64), [t_end_ns])))
         hb_max_gap_ms = float(gaps.max()) / 1e6
         over = int((gaps > GATE_HB_GAP_MS * 1e6).sum())
     else:
-        hb_max_gap_ms = float("inf") if len(win) else 0.0
-        over = 1 if len(win) else 0
+        hb_max_gap_ms, over = 0.0, 0  # no window at all: the sample-count checks reject the run
     thermal = (win["trips"] & int(TripCause.THERMAL)) != 0
     thermal_trips = int(np.count_nonzero(thermal[1:] & ~thermal[:-1]) + (1 if len(thermal) and thermal[0] else 0))
     st = win["sm_state"].astype(np.int64)
     stop = np.isin(st, [int(s) for s in _STOP_STATES])
     unexpected = int(np.count_nonzero(stop[1:] & ~stop[:-1]) + (1 if len(stop) and stop[0] else 0))
+    hold = st == int(SmState.HOLD)
+    hold_entries = int(np.count_nonzero(hold[1:] & ~hold[:-1]) + (1 if len(hold) and hold[0] else 0))
     tmax = win["temp_c"].max(axis=0) if len(win) else np.zeros(len(JOINT_NAMES), dtype=np.int64)
     return {
         "tick_stats": stats.summary(),
@@ -121,6 +154,7 @@ def analyse_tick_log(recs: np.ndarray, *, t_start_ns: int, t_end_ns: int, period
         "hb_gaps_over_200ms": over,
         "thermal_trips": thermal_trips,
         "unexpected_safe_states": unexpected,
+        "hold_entries": hold_entries,
         "max_temp_c": {n: int(t) for n, t in zip(JOINT_NAMES, tmax, strict=True)},
     }
 
@@ -254,6 +288,10 @@ def soak(
         rss_growth_mb=(rss1 - rss0) if (rss0 is not None and rss1 is not None) else float("nan"),
         gc_collections=int(summary.get("gc_collections", 0)),
         unexpected_safe_states=m["unexpected_safe_states"],
+        hold_entries=m["hold_entries"],
+        requested_minutes=float(minutes),
+        servo_hz=float(cfg.rates.servo_hz),
+        policy_hz=float(cfg.rates.policy_hz),
         backend=backend,
         servo_exit_code=proc.returncode,
         policy_steps=steps,

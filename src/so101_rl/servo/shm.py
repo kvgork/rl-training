@@ -11,10 +11,17 @@ depend on store ordering.
 NOTE: ``STATE_DTYPE.itemsize == 232`` (the plan's F3 now says so too; it originally asserted 192, which the
 listed fields cannot fit with natural alignment). The block stride is 256 (64-byte aligned).
 
+Layout version 2 (U3 review item 9, plan section 10 2026-10-02): ``read_ok`` (u1, offset 225) follows ``hb_ok``
+in what was alignment padding, so the size, the stride and every other offset are unchanged. ``read_ok = 0``
+means the block read of that tick failed: ``present_ticks`` .. ``moving`` then repeat the last good reading and
+``t_mono_ns`` is the tick time, not the time of the reading.
+
 Single instance (review carry-forward C1): :meth:`ServoShm.create` first takes an exclusive, non-blocking
 ``flock`` on ``/dev/shm/<name>.so101.lock`` and keeps it until :meth:`ServoShm.close`. A second servo process for
 the same segment name gets :class:`ServoAlreadyRunning` instead of silently replacing the live segment. The kernel
 drops the lock when its owner dies (even by ``kill -9``), so a stale segment of a crashed servo is still replaced.
+:class:`SerialPortLock` (U3 review item 14) is the same lock keyed on a serial port's resolved path, so two servo
+processes with different segment names still cannot drive one bus or one watchdog MCU.
 
 Creation order: the creator fills version/sizes first and writes ``magic`` LAST, so an attacher that races the
 creator sees magic == 0 ("not ready") instead of a half-written header.
@@ -35,7 +42,7 @@ from typing import Final, Protocol, Self
 import numpy as np
 
 SHM_MAGIC: Final[int] = 0x534F31303152_4C31  # "SO101RL1"
-SHM_LAYOUT_VERSION: Final[int] = 1
+SHM_LAYOUT_VERSION: Final[int] = 2  # 2: STATE.read_ok (U3 review item 9)
 
 
 class CmdMode(IntEnum):
@@ -84,6 +91,7 @@ STATE_DTYPE = np.dtype(
         ("sm_state", "<u4"),
         ("last_cmd_seq", "<u8"),
         ("hb_ok", "<u1"),
+        ("read_ok", "<u1"),  # this tick's block read succeeded (0: present .. moving repeat the last good read)
         ("crc32", "<u4"),
     ],
     align=True,
@@ -101,6 +109,8 @@ TOTAL_SIZE: Final[int] = STATE_OFFSET + STATE_STRIDE
 assert HEADER_DTYPE.itemsize == 64
 assert CMD_SIZE == 64
 assert STATE_SIZE == 232
+assert STATE_DTYPE.fields["read_ok"][1] == 225 and STATE_DTYPE.fields["crc32"][1] == 228  # read_ok used padding
+assert STATE_STRIDE == 256
 
 
 def new_cmd() -> np.ndarray:
@@ -239,11 +249,19 @@ def lock_path(name: str) -> str:
     return os.path.join(_lock_dir(), f"{name.lstrip('/')}.so101.lock")
 
 
+def serial_lock_path(port: str) -> str:
+    """Lock file of a serial port, keyed on its RESOLVED path (``/dev/serial/by-id/...`` and ``/dev/ttyACM0`` are
+    the same port). Only ``realpath`` is used: the device itself is never opened (opening can toggle DTR)."""
+    real = os.path.realpath(port)
+    return os.path.join(_lock_dir(), "so101-serial" + real.replace(os.sep, "_") + ".lock")
+
+
 class InstanceLock:
     """Exclusive non-blocking ``flock``; released by :meth:`release` or by the kernel when the process dies."""
 
-    def __init__(self, name: str) -> None:
-        self.path = lock_path(name)
+    def __init__(self, name: str, *, path: str | None = None, what: str | None = None) -> None:
+        self.path = path if path is not None else lock_path(name)
+        what = what if what is not None else f"servo shm {name!r}"
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -255,7 +273,7 @@ class InstanceLock:
                 pass
             os.close(fd)
             raise ServoAlreadyRunning(
-                f"servo shm {name!r} is owned by another live process (pid {holder or '?'}; lock {self.path})"
+                f"{what} is owned by another live process (pid {holder or '?'}; lock {self.path})"
             ) from None
         except BaseException:
             os.close(fd)
@@ -275,6 +293,13 @@ class InstanceLock:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+class SerialPortLock(InstanceLock):
+    """Single-instance lock on a serial port (bus or watchdog MCU); :class:`ServoAlreadyRunning` if held."""
+
+    def __init__(self, port: str) -> None:
+        super().__init__(port, path=serial_lock_path(port), what=f"serial port {port!r}")
 
 
 class ServoShm(_Blocks):

@@ -11,9 +11,10 @@ Transition table (first matching row wins, rows are evaluated top to bottom ever
 from               condition                                            to                 resume
 =================  ===================================================  =================  ================
 LATCHED            always (``torque_off_now`` every tick)               LATCHED (absorbing) physical reset
-any                ``hb_ok`` false, MCU latched, HEARTBEAT_FAIL,        LATCHED            human + physical
-                   DEADMAN or BUS_FAIL in trips, or
-                   ``max_bus_failures`` consecutive ``block_ok`` false
+any                ``hb_ok`` false, ``hb_misses >= HB_MISS_BUDGET``,    LATCHED            human + physical
+                   MCU latched, HEARTBEAT_FAIL, DEADMAN or BUS_FAIL
+                   in trips, or ``max_bus_failures`` consecutive
+                   ``block_ok`` false
 TORQUE_OFF         thermal-only fault, ``may_resume_thermal``,          CHECK              automatic
                    THERMAL not in trips, ``block_ok``                   (``reenergize_requested``)
 TORQUE_OFF         otherwise                                            TORQUE_OFF          new process / human
@@ -46,6 +47,13 @@ review S10). ``ThermalMonitor.trips_last_hour`` counts monitor latch events for 
 
 ``TRACKING``, ``JOINT_LIMIT`` and ``BOX`` in ``trips`` are clamps, never state-machine transitions.
 
+Heartbeat miss budget (plan section 10, 2026-10-02): in normal running the core counts consecutive heartbeat
+sends that were not acknowledged (``hb_misses``) and passes the MCU's last reported status (``mcu``, only after
+ARM). The machine latches when the MCU reports latched (DEADMAN) or after ``HB_MISS_BUDGET`` (5, about 150 ms at
+30 Hz, well inside the MCU's 1 s deadline) consecutive misses (HEARTBEAT_FAIL), so one lost USB echo does not end
+an unattended run. ``hb_ok = False`` still latches at once: the core uses it for the strict paths (a heartbeat
+refused during re-energise).
+
 ``resync_target`` is true on the step that enters RUN (the first good-read step after ``mark_energized``, and
 HOLD -> RUN): the pipeline must then ``resync(present)`` so no stale target is resumed. Every resume requires
 ``block_ok`` (review S6): a pending resync waits for a step with a good block read, and ``use_policy`` is false
@@ -69,6 +77,7 @@ if TYPE_CHECKING:  # heartbeat.py belongs to the servo package (U1); duck-typed 
 
 _NS = 1_000_000_000
 _HOUR_NS = 3600 * _NS
+HB_MISS_BUDGET = 5  # consecutive unacknowledged heartbeats that latch (plan section 10, 2026-10-02)
 
 _LINK_CAUSES = TripCause.HEARTBEAT_FAIL | TripCause.DEADMAN | TripCause.BUS_FAIL
 _FRESH_PROCESS_CAUSES = TripCause.NAN | TripCause.STUCK | TripCause.OOD | TripCause.RANGE | TripCause.BOX_PRESENT
@@ -85,7 +94,8 @@ class SmInputs:
     cmd_age_ns: int = 0  # servo-clock age of the newest command
     consecutive_misses: int = 0  # consecutive 100 ms policy windows without a new seq (counted by the core)
     trips: TripCause = TripCause.NONE  # from SafetyPipeline.apply / monitor_only (thermal) / stuck
-    hb_ok: bool = True
+    hb_ok: bool = True  # False latches at once (strict paths: a heartbeat refused during re-energise)
+    hb_misses: int = 0  # consecutive heartbeat sends without an ack (counted by the core); HB_MISS_BUDGET latches
     mcu: McuStatus | None = None
     stop_requested: bool = False
     may_resume_thermal: bool = False
@@ -164,7 +174,7 @@ class SafetyStateMachine:
         # bus failures: a single one holds the target (use_policy false); N in a row is a link fault
         self._bus_failures = 0 if inp.block_ok else self._bus_failures + 1
         link = inp.trips & _LINK_CAUSES
-        if not inp.hb_ok:
+        if not inp.hb_ok or inp.hb_misses >= HB_MISS_BUDGET:
             link |= TripCause.HEARTBEAT_FAIL
         if inp.mcu is not None and inp.mcu.latched:
             link |= TripCause.DEADMAN

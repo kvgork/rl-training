@@ -4,17 +4,20 @@
 
 1. Real-time setup, best effort unless ``require_rt``: ``mlockall``, ``SCHED_FIFO`` priority 50 and CPU affinity.
    ``require_rt`` (the ``--require-rt`` flag or ``REQUIRE_RT=1``) makes any failure fatal: exit code 3.
-2. ``safety.config_check.validate_geometry`` (exit 2 on a bad safe-state geometry), the single-instance shm
-   segment (``ServoShm.create``; exit 4 if another servo owns it), the bus and heartbeat factories.
-3. ``ServoCore.start()`` (BOOT -> button + ARM -> re-energise -> RUN; exit 2 if it fails), then
-   ``gc.collect(); gc.freeze(); gc.disable()``.
+2. The single-instance locks: the shm segment (``ServoShm.create``) and every serial port in ``serial_ports``
+   (``SerialPortLock``; review item 14); exit 4 if another servo owns one. Then the bus and heartbeat factories and
+   ``build_servo_core``, which runs ``safety.config_check.validate_geometry`` (exit 2 on a bad safe-state geometry).
+3. ``ServoCore.start()`` (port without handshake -> BOOT -> button + ARM -> ping -> re-energise -> RUN; exit 2 if
+   it fails), then ``gc.collect(); gc.freeze(); gc.disable()``.
 4. The absolute-deadline loop: ``deadline += period`` every tick, so the rate does not drift with the tick body.
    After a large overrun (the tick finished a full period or more past its next deadline) the missed deadlines are
    SKIPPED and the loop waits for the next point of the original grid (resync, counted) instead of running the
    missed ticks back to back. Overruns are counted in the state record and the
    tick log, and reported on stderr at most once per second.
-5. Every exit (``--max-ticks``, SIGINT, SIGTERM, an exception) goes through ``ServoCore.shutdown``. The signal
-   handlers only set a flag; the loop checks it once per tick.
+5. Every exit (``--max-ticks``, SIGINT, SIGTERM, SIGHUP, SIGQUIT, an exception) goes through
+   ``ServoCore.shutdown``. The signal handlers only set a flag; the loop checks it once per tick, and a running
+   re-energise polls it too. SIGHUP matters: closing the ssh session that started the servo must ramp the arm
+   down, not kill the process (the arm would fall about 1 s later, when the MCU times out).
 
 Exit codes: 0 normal stop, 1 exception in the loop (after a clean shutdown), 2 start-up failed, 3 RT required
 but unavailable, 4 another servo process owns the shm segment.
@@ -43,7 +46,7 @@ from so101_rl.safety.types import SmState, TripCause
 from so101_rl.servo.bus import Bus
 from so101_rl.servo.core import TICK_LOG_DTYPE, ServoCore, StartupError, build_servo_core
 from so101_rl.servo.heartbeat import HeartbeatLink
-from so101_rl.servo.shm import ServoAlreadyRunning, ServoIpc, ServoShm
+from so101_rl.servo.shm import SerialPortLock, ServoAlreadyRunning, ServoIpc, ServoShm
 from so101_rl.servo.timing import Clock, RealClock, TickStats
 
 EXIT_OK, EXIT_EXCEPTION, EXIT_STARTUP, EXIT_RT, EXIT_LOCKED = 0, 1, 2, 3, 4
@@ -51,6 +54,7 @@ RT_PRIORITY = 50
 _MCL_CURRENT, _MCL_FUTURE = 1, 2
 _NS = 1_000_000_000
 _MIN_MEMLOCK = 512 << 20
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)  # all go through shutdown()
 
 
 @dataclass
@@ -162,7 +166,7 @@ def _install_signals(runner: ServoRunner) -> dict[int, Any]:
     def handler(signum, _frame):  # flag only: no I/O, no allocation-heavy work in the handler
         runner.request_stop(signum)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in STOP_SIGNALS:
         try:
             old[sig] = signal.signal(sig, handler)
         except ValueError:  # not the main thread
@@ -195,8 +199,10 @@ def run(
     install_signals: bool = True,
     freeze_gc: bool = True,
     on_core: Callable[[ServoCore, ServoRunner], None] | None = None,
+    serial_ports: tuple[str, ...] = (),
 ) -> int:
-    """Run the servo process (see the module docstring). Returns the exit code."""
+    """Run the servo process (see the module docstring). Returns the exit code. ``serial_ports``: every serial
+    device this servo will own (bus, watchdog MCU), each locked for the life of the process."""
     log = lambda m: print(f"servo: {m}", file=sys.stderr, flush=True)
     clock = clock if clock is not None else RealClock()
     summary: dict[str, Any] = {"kernel": platform.release(), "exit_code": None}
@@ -217,11 +223,18 @@ def run(
         calibration = load_calibration(cfg.calibration_path)
     own_ipc = None
     tick_log = None
+    port_locks: list[SerialPortLock] = []
     try:
         if ipc is None:
             own_ipc = ipc = ServoShm.create(cfg.shm_name)
+        for port in dict.fromkeys(serial_ports):
+            port_locks.append(SerialPortLock(port))
     except ServoAlreadyRunning as exc:
         log(str(exc))
+        for lock in port_locks:
+            lock.release()
+        if own_ipc is not None:
+            own_ipc.close()
         summary["exit_code"] = EXIT_LOCKED
         _write_summary(summary_path, summary)
         return EXIT_LOCKED
@@ -307,13 +320,15 @@ def run(
                 pass
         if own_ipc is not None:
             own_ipc.close()
+        for lock in port_locks:
+            lock.release()
         summary["exit_code"] = code
         _write_summary(summary_path, summary)
     return code
 
 
 def _core_summary(core: ServoCore, runner: ServoRunner, gc_before: int) -> dict[str, Any]:
-    thermal = core._thermal
+    thermal = core.thermal
     return {
         "ticks": core.tick_count,
         "loop_ticks": runner.ticks,

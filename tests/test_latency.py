@@ -22,9 +22,27 @@ def test_measure_bus_on_fakebus_with_a_latency_model(calibration):
     bus.faults.latency_ms(lambda rng: 1.0 + 4.0 * rng.random())  # 1..5 ms per bus operation
     bus.faults.fail_next_read(3)
     r = measure_bus(bus, n=300, clock=clock, write=True)
-    assert r["n"] == 300 and r["failures"] == 3
+    assert r["attempts"] == 300 and r["n"] == 297 and r["failures"] == 3  # failed reads are not in the stats
     assert 1.0 <= r["p50"] <= 5.0 and r["p50"] <= r["p99"] <= r["max"] <= 5.0 + 1e-6
     assert r["write_n"] == 297 and 1.0 <= r["write_p50"] <= 5.0
+
+
+def test_item16_failed_reads_are_excluded_from_the_latency_stats(calibration):
+    class SlowFailBus(FakeBus):
+        def read_block(self, out):
+            if self.faults.consume_read_failure():
+                self.clock.advance(50 * MS)  # a timed-out read is slow
+                out.ok = False
+                return False
+            return super().read_block(out)
+
+    clock = FakeClock()
+    bus = SlowFailBus(clock, calibration=calibration)
+    bus.faults.latency_ms(2.0)
+    bus.faults.fail_next_read(5)
+    r = measure_bus(bus, n=50, clock=clock)
+    assert r["failures"] == 5 and r["n"] == 45
+    assert r["max"] == pytest.approx(2.0)  # the 50 ms failures did not leak into the budget
 
 
 def test_measure_bus_constant_latency_is_exact(calibration):
@@ -84,6 +102,10 @@ def test_hw_feetech_read_latency_budget(cfg, calibration):  # pragma: no cover -
     bus = FeetechBus(cfg, calibration)
     bus.connect()
     try:
+        # it writes Goal_Position: refuse unless every motor is limp (U3 review item 16)
+        ids = [calibration[n].id for n in calibration]
+        torque = {i: bus.read_reg("Torque_Enable", i) for i in ids}
+        assert not any(torque.values()), f"torque must be off before the latency test writes goals: {torque}"
         r = measure_bus(bus, n=300, write=True)
     finally:
         bus.disconnect()

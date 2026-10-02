@@ -68,8 +68,12 @@ class FeetechBus:
         self._scratch = np.zeros((len(_ROWS), N_JOINTS), dtype=np.int32)
 
     # -- lifecycle -----------------------------------------------------------------------------
-    def connect(self) -> None:
-        self._bus.connect(handshake=True)
+    def connect(self, *, handshake: bool = False) -> None:
+        """Open the port. No handshake by default (U3 review item 1): before the watchdog MCU is armed the servo
+        side of the relay is unpowered, so lerobot's handshake (a ping of every motor) would raise
+        ``ConnectionError`` on every start. The servo core pings the motors after ARM and before re-energise.
+        ``handshake=True`` is for bench tools on an externally powered bus."""
+        self._bus.connect(handshake=handshake)
         self._build_reader()
 
     def _build_reader(self) -> None:
@@ -122,6 +126,8 @@ class FeetechBus:
         return True
 
     def write_goal(self, goal_ticks: np.ndarray) -> bool:
+        """Un-acked ``sync_write``: True = transmitted (lerobot raises only on a port / transmit error). Whether
+        the motors got it shows in the next block read (U3 review item 13)."""
         goal = np.asarray(goal_ticks)
         if goal.shape != (N_JOINTS,):
             raise ValueError(f"goal_ticks must have shape ({N_JOINTS},), got {goal.shape}")

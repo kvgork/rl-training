@@ -6,9 +6,11 @@
 Tick order
 ----------
 1. ``bus.read_block`` (one 11-byte sync read). A failed read never becomes ``present = 0``: nothing is written
-   and no heartbeat is sent on that tick.
+   and no heartbeat is sent on that tick, and the state record says ``read_ok = 0``.
 2. ``ipc.read_cmd`` with dedupe by ``seq``: a command is integrated at most once (the 10 Hz delta is spread over
-   ``interp_ticks`` servo ticks by the pipeline, never re-added).
+   ``interp_ticks`` servo ticks by the pipeline, never re-added). Only a RUN-mode command is "fresh" for the state
+   machine (an IDLE / HOLD command keeps the policy alive but never turns HOLD into RUN), and a RUN delta that
+   arrives on a tick without ``use_policy`` stays pending until the next tick that applies (never dropped).
 3. Outside RUN, ``pipeline.monitor_only`` is called first, so the thermal monitor sees every tick (thermal dwell,
    stale temperature). Then ``sm.step``.
 4. RUN with ``use_policy``: ``resync`` (if requested) -> ``new_command`` (on a new seq) -> ``pipeline.apply``. If the
@@ -29,29 +31,40 @@ Tick order
                      needs a human and the physical reset anyway)
    ================  =============================================================================================
 
-6. Heartbeat: sent only when this tick's read succeeded AND its writes were accepted (``hb_sent``). Its result
-   feeds ``SmInputs.hb_ok`` of the next step. ``max_bus_failures`` consecutive good-read ticks whose writes were
-   refused add ``BUS_FAIL`` to the next step's trips (the machine itself counts only failed reads), so a bus that
-   reads but no longer writes latches even without an MCU link.
-7. ``ipc.write_state`` every tick, also in fault states; then one tick-log record.
+6. Heartbeat: sent only when this tick's read succeeded AND its writes were accepted (``hb_sent``; for the
+   un-acked ``write_goal`` "accepted" means transmitted). ``HeartbeatLink.send`` is tri-state (``HbSend``): the
+   sequence number advances only when the frame was delivered (a lost echo still advances it). A send that is not
+   ``ACKED`` is a miss; ``SmInputs.hb_misses`` (consecutive misses) and ``SmInputs.mcu`` (the MCU's last reported
+   status, only after ARM) feed the next step, which latches after ``HB_MISS_BUDGET`` (5) misses or at once when
+   the MCU reports latched (plan section 10, 2026-10-02). ``max_bus_failures`` consecutive good-read ticks whose
+   writes were refused add ``BUS_FAIL`` to the next step's trips (the machine itself counts only failed reads), so
+   a bus that reads but no longer writes latches even without an MCU link.
+7. ``ipc.write_state`` every tick, also in fault states (``applied_delta_ticks`` / ``clamped_mask`` are zero on
+   every tick where ``pipeline.apply`` did not run); then one tick-log record.
 
 Start-up (the MCU boots LATCHED)
 --------------------------------
-``start()`` models start-up as BOOT -> wait for the physical button + ARM -> heartbeat -> ``reenergize`` -> RUN.
-While waiting, ``McuStatus.latched`` is shown to the operator but NEVER fed into the state machine (LATCHED is
-absorbing; feeding the boot latch would force a new process). After ARM the MCU state reaches the machine only
-through ``hb_ok`` (``HeartbeatLink.send`` returns False once the MCU is latched).
+``start()`` models start-up as (U3 review item 1) open the port WITHOUT a handshake -> BOOT, wait for the physical
+button + ARM (no bus traffic: the servo side of the relay is unpowered) -> ARM closes the relay -> ping until every
+motor answers -> one good read + goal write + ACKED heartbeat, all within ``BOOT_HEARTBEAT_WINDOW_S`` of ARM ->
+``reenergize`` -> RUN. While waiting, ``McuStatus.latched`` is shown to the operator (repeated every
+``ARM_REMINDER_S``) but NEVER fed into the state machine (LATCHED is absorbing; feeding the boot latch would force
+a new process). After ARM the MCU's reported status is fed every tick (``SmInputs.mcu``).
 
 Re-energise (boot and the automatic thermal resume) runs with ``tick_hook``: one heartbeat per good tick, and a
-heartbeat that fails during re-energise aborts it (``reenergize`` then turns torque off). Afterwards
-``mark_energized()`` and the stale-command counters are reset, so a stale count from the dwell cannot turn the
-thermal resume into a STALE_CMD stop. A failure calls ``notify_reenergize_failed()``.
+heartbeat that is not ACKED during re-energise aborts it (strict: ``reenergize`` then turns torque off). It also
+gets ``should_abort`` (the runner's stop flag or a STOP_REQ), and a thermal resume never starts once a stop was
+requested. Afterwards ``mark_energized()`` and the stale-command counters are reset (the command block is drained,
+so a command written before ARM is not "fresh" on the first RUN tick), so a stale count from the dwell cannot turn
+the thermal resume into a STALE_CMD stop. A failure calls ``notify_reenergize_failed()``.
 
 Shutdown
 --------
 ``shutdown(reason)`` is idempotent. If the arm may be energised (RUN, HOLD, SAFE_STOPPING) it steps the machine
 with ``stop_requested`` and runs ``SafeStateSequencer.run(bus, block, servo_hz=..., tick_hook=hb)`` (heartbeat
-continues, bounded by ``bound_s``), then torque off on every motor, then ``disconnect``. Every process exit
+continues, bounded by ``bound_s``; lenient: a missed heartbeat does not stop the ramp, and a frame that was not
+delivered does not advance the sequence, so it cannot latch SEQ_ERROR), then torque off on every motor, then
+``disconnect``. Every process exit
 (SIGINT, SIGTERM, exception, ``--max-ticks``) goes through it (``servo/process.py``).
 
 State record and the log convention
@@ -84,14 +97,14 @@ from so101_rl.safety.calib_check import CalibrationMismatch
 from so101_rl.safety.config_check import validate_geometry
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.pipeline import SafetyPipeline
-from so101_rl.safety.reenergize import reenergize, torque_off_retry
+from so101_rl.safety.reenergize import ReenergizeAborted, reenergize, torque_off_retry
 from so101_rl.safety.safe_state import SafeStateSequencer
 from so101_rl.safety.state_machine import SafetyStateMachine, SmInputs, SmOutputs
 from so101_rl.safety.stuck import StuckActionMonitor
 from so101_rl.safety.thermal import ThermalMonitor
 from so101_rl.safety.types import SmState, TripCause, Verdict
 from so101_rl.servo.bus import BlockRead, Bus
-from so101_rl.servo.heartbeat import HeartbeatLink, McuStatus
+from so101_rl.servo.heartbeat import HbSend, HeartbeatLink, McuStatus
 from so101_rl.servo.shm import CmdMode, ServoIpc, new_cmd, new_state
 from so101_rl.servo.timing import Clock
 
@@ -110,8 +123,13 @@ _NS = 1_000_000_000
 # Clamps are reported in Verdict.trips but are not state-machine causes (F5).
 CLAMP_CAUSES = TripCause.TRACKING | TripCause.JOINT_LIMIT | TripCause.BOX
 _SM_CAUSES = (2**32 - 1) & ~int(CLAMP_CAUSES)  # plain int mask
-_OBS_RING = 64  # state seq -> publish time, for the obs -> command latency
-BOOT_HEARTBEAT_WINDOW_S = 0.5  # after ARM: first good read + goal write (and its heartbeat) must come within this
+# state seq -> publish time ring, for the obs -> command latency. 64 records = 2.1 s at 30 Hz: a command computed
+# from an older observation reports obs_to_cmd = 0 (unknown) instead of a wrong value.
+_OBS_RING = 64
+# After ARM: every motor must answer a ping and the first good read + goal write + ACKED heartbeat must come within
+# this (the MCU's 1 s timeout runs from ARM; the STS3215 boot time behind the relay is a hardware-track measurement).
+BOOT_HEARTBEAT_WINDOW_S = 0.8
+ARM_REMINDER_S = 10.0  # while waiting for the button + ARM, repeat the operator message this often
 
 # One record per servo tick (and per re-energise / shutdown tick), pushed into the RingWriter tick log.
 TICK_LOG_DTYPE = np.dtype(
@@ -171,7 +189,11 @@ def log_row(last_rec_of_step: np.ndarray, first_rec_of_next_step: np.ndarray) ->
 
 
 class ServoCore:
-    """See the module docstring. Single-threaded: every method runs on the servo loop's thread."""
+    """See the module docstring. Single-threaded: every method runs on the servo loop's thread.
+
+    Build it with :func:`build_servo_core`: the constructor does NOT validate the safe-state geometry
+    (``validate_geometry``) or wire the safety objects consistently; it exists for that function and for tests.
+    """
 
     def __init__(
         self,
@@ -202,7 +224,7 @@ class ServoCore:
         self._calibration = calibration
         self._fk = fk
         self._thermal = thermal
-        self._log = log if log is not None else (lambda msg: print(f"servo: {msg}", file=sys.stderr, flush=True))
+        self._log_sink = log if log is not None else (lambda msg: print(f"servo: {msg}", file=sys.stderr, flush=True))
         self._ids = [calibration[n].id for n in JOINT_NAMES]
 
         self.period_ns = round(_NS / cfg.rates.servo_hz)
@@ -239,6 +261,7 @@ class ServoCore:
         self._s_target, self._s_goal = s["target_ticks"][0], s["goal_ticks"][0]
         self._s_applied, self._s_clamped = s["applied_delta_ticks"][0], s["clamped_mask"][0]
         self._s_fault, self._s_sm, self._s_last_cmd, self._s_hb = s["fault_bits"], s["sm_state"], s["last_cmd_seq"], s["hb_ok"]
+        self._s_read_ok = s["read_ok"]
         # tick-log record and field views
         self._lg = np.zeros(1, dtype=TICK_LOG_DTYPE)
         g = self._lg
@@ -258,12 +281,17 @@ class ServoCore:
         self.calib_mismatches = 0
         self.reenergize_count = 0
         self.last_error: BaseException | None = None
-        self._hb_seq = 0
-        self._last_hb_ok = True
+        self._hb_seq = 0  # last sequence number DELIVERED to the MCU
+        self._last_hb_ok = True  # the last heartbeat was ACKED (True without an MCU link)
+        self._hb_misses = 0  # consecutive heartbeat sends that were not ACKED (normal running; HB_MISS_BUDGET)
+        self._hb_hard_fail = False  # a strict-path miss (re-energise): latches on the next step
+        self._abort: Callable[[], bool] = _never
         self._armed = False  # MCU ARM succeeded (only then is the link used)
         self._last_cmd_seq = 0
         self._rx_ns = clock.monotonic_ns()
-        self._has_delta = False
+        self._delta_pending = False  # a RUN delta was received and not yet handed to pipeline.new_command
+        self._cmd_is_run = False  # mode of the newest command
+        self._applied_this_tick = False  # pipeline.apply ran on this tick (else applied delta is published as 0)
         self._interp_left = 1
         self._stop_requested = False
         self._safe_started = False
@@ -297,33 +325,61 @@ class ServoCore:
     def stop_requested(self) -> bool:
         return self._stop_requested
 
+    @property
+    def thermal(self) -> ThermalMonitor:
+        return self._thermal
+
+    @property
+    def hb_misses(self) -> int:
+        return self._hb_misses
+
+    def _log(self, msg: str) -> None:
+        try:
+            self._log_sink(msg)
+        except OSError:  # stderr gone (closed terminal): logging must never break the servo loop
+            pass
+
     def consecutive_misses(self) -> int:
         return int((self._clock.monotonic_ns() - self._rx_ns) // self._policy_period_ns)
 
     # ------------------------------------------------------------------------------------------------------
     # start-up
     def start(self, *, should_abort: Callable[[], bool] | None = None, arm_timeout_s: float | None = None) -> None:
-        """BOOT -> wait for the physical button + ARM -> heartbeat -> ``reenergize`` -> RUN.
+        """Open the port (no handshake) -> BOOT, wait for the physical button + ARM -> ping every motor -> good
+        read + write + ACKED heartbeat -> ``reenergize`` -> RUN.
 
-        Raises :class:`StartupError` (torque off) if the MCU never arms within ``arm_timeout_s`` (None: wait
-        forever), if ``should_abort()`` becomes true, or if re-energise fails."""
-        abort = should_abort if should_abort is not None else (lambda: False)
-        self._bus.connect()
+        ``should_abort`` is kept for the life of the core: it also aborts a running re-energise and blocks a
+        thermal resume. Raises :class:`StartupError` (torque off) if the MCU never arms within ``arm_timeout_s``
+        (None: wait forever, with a reminder every ``ARM_REMINDER_S``), if ``should_abort()`` becomes true, if
+        the motors do not answer within ``BOOT_HEARTBEAT_WINDOW_S`` of ARM, or if re-energise fails."""
+        abort = should_abort if should_abort is not None else _never
+        self._abort = abort
+        self._bus.connect()  # opens the port only: before ARM the servo side is unpowered (review item 1)
         if self._hb is not None:
             self._wait_for_arm(abort, arm_timeout_s)
-        # The heartbeat immediately before reenergize (heartbeat_gap_s is measured from its entry). Right after ARM
-        # the servos may still be booting, so retry tick by tick for at most BOOT_HEARTBEAT_WINDOW_S (well inside
-        # the MCU's 1 s timeout, which the ARM itself restarted).
+        # Right after ARM the servos are still booting behind the relay: ping tick by tick until every motor
+        # answers, then the heartbeat immediately before reenergize (heartbeat_gap_s is measured from its entry).
+        # Both within BOOT_HEARTBEAT_WINDOW_S, inside the MCU's 1 s timeout which the ARM itself restarted.
         t_arm = self._clock.monotonic_ns()
         nxt = t_arm
-        while not self._pre_reenergize_tick(PHASE_BOOT):
+        answered = False
+        while True:
+            if not answered:
+                answered = self._motors_answer()
+            if answered and self._pre_reenergize_tick(PHASE_BOOT):
+                break
+            if not answered:
+                self._publish(self._clock.monotonic_ns(), False, False, False, TripCause.NONE, PHASE_BOOT, 0, 0)
             if abort():
                 raise StartupError("start-up aborted before re-energise")
+            st = self._hb.last_status if (self._hb is not None and self._armed) else None
+            if st is not None and st.latched:
+                torque_off_retry(self._bus)
+                raise StartupError(f"watchdog MCU latched again right after ARM (reason {st.reason})")
             if self._clock.monotonic_ns() - t_arm >= int(BOOT_HEARTBEAT_WINDOW_S * _NS):
                 torque_off_retry(self._bus)
-                raise StartupError(
-                    f"no good read + goal write within {BOOT_HEARTBEAT_WINDOW_S} s after ARM (servos not answering?)"
-                )
+                what = "a good read + goal write + heartbeat" if answered else "every motor to answer a ping"
+                raise StartupError(f"no {what} within {BOOT_HEARTBEAT_WINDOW_S} s after ARM (servos not answering?)")
             nxt += self.period_ns
             self._clock.sleep_until(nxt)
         if abort():
@@ -331,12 +387,17 @@ class ServoCore:
         if not self._run_reenergize():
             raise StartupError(f"start-up re-energise failed: {self.last_error!r}") from self.last_error
 
+    def _motors_answer(self) -> bool:
+        answered = self._bus.ping_all()
+        return all(answered.get(i, False) for i in self._ids)
+
     def _wait_for_arm(self, abort: Callable[[], bool], timeout_s: float | None) -> None:
         hb = self._hb
         assert hb is not None
         t0 = self._clock.monotonic_ns()
         nxt = t0
         said = ""
+        said_ns = t0
         while True:
             if abort():
                 raise StartupError("start-up aborted while waiting for the watchdog MCU")
@@ -353,9 +414,10 @@ class ServoCore:
                 msg = f"watchdog MCU latched (reason {st.reason}): press the physical reset button for 0.5 s"
             else:
                 msg = "watchdog MCU already ARMED by someone else: waiting for it to time out and latch"
-            if msg != said:
-                self._log(msg)
-                said = msg
+            now = self._clock.monotonic_ns()
+            if msg != said or now - said_ns >= int(ARM_REMINDER_S * _NS):
+                self._log(msg if msg != said else f"{msg} (still waiting after {(now - t0) / _NS:.0f} s)")
+                said, said_ns = msg, now
             if timeout_s is not None and self._clock.monotonic_ns() - t0 > int(timeout_s * _NS):
                 raise StartupError(f"watchdog MCU did not arm within {timeout_s} s ({msg})")
             self._boot_idle_tick(st)
@@ -363,9 +425,8 @@ class ServoCore:
             self._clock.sleep_until(nxt)
 
     def _boot_idle_tick(self, st: McuStatus) -> None:
-        t0 = self._clock.monotonic_ns()
-        ok = bool(self._bus.read_block(self.block)) and self.block.ok
-        self._publish(t0, ok, False, False, TripCause.NONE, PHASE_BOOT, 0, 0)
+        """No bus traffic before ARM (the servo side is unpowered): publish a record with ``read_ok = 0``."""
+        self._publish(self._clock.monotonic_ns(), False, False, False, TripCause.NONE, PHASE_BOOT, 0, 0)
 
     def _pre_reenergize_tick(self, phase: int) -> bool:
         """Torque is off here: goal = present, then a heartbeat if the read and the write both succeeded. Returns
@@ -379,7 +440,7 @@ class ServoCore:
             wrote = bool(self._bus.write_goal(self._target))
             if wrote:
                 hb = True
-                self._last_hb_ok = self._send_heartbeat()
+                self._last_hb_ok = self._send_heartbeat() == HbSend.ACKED  # strict: only an ACK counts
         self._publish(t0, ok, wrote, hb, TripCause.NONE, phase, 0, 0)
         return hb and self._last_hb_ok
 
@@ -395,6 +456,7 @@ class ServoCore:
                 self.block,
                 tick_hook=self._reenergize_hook,
                 fk=self._fk,
+                should_abort=self._abort_requested,
             )
         except BaseException as exc:
             self.last_error = exc
@@ -402,7 +464,10 @@ class ServoCore:
                 self.calib_mismatches += 1
                 self._sm.fault_bits |= TripCause.CALIB_MISMATCH
             if isinstance(exc, HeartbeatLost):
-                self._last_hb_ok = False  # the next step latches (HEARTBEAT_FAIL)
+                self._last_hb_ok = False
+                self._hb_hard_fail = True  # strict path: the next step latches (HEARTBEAT_FAIL)
+            if isinstance(exc, ReenergizeAborted):
+                self._log("re-energise aborted: stop requested")
             self._sm.notify_reenergize_failed()
             self._log(f"re-energise failed: {exc!r}")
             if not isinstance(exc, Exception):
@@ -412,14 +477,17 @@ class ServoCore:
         self._energized_once = True
         self._applied_since_energize = False
         self._reset_command_counters()
-        self._safe_started = False
+        self._hb_misses = 0  # every re-energise tick was ACKED
         self._interp_left = 1
         return True
+
+    def _abort_requested(self) -> bool:
+        return self._stop_requested or bool(self._abort())
 
     def _reenergize_hook(self, ok: bool) -> None:
         t0 = self._clock.monotonic_ns()
         if ok:
-            self._last_hb_ok = self._send_heartbeat()
+            self._last_hb_ok = self._send_heartbeat() == HbSend.ACKED  # strict: one miss aborts re-energise
             if not self._last_hb_ok:
                 self._publish(t0, ok, True, True, TripCause.NONE, PHASE_REENERGIZE, 0, 0)
                 raise HeartbeatLost("heartbeat refused during re-energise (MCU latched or link dead)")
@@ -428,9 +496,17 @@ class ServoCore:
         self._publish(t0, ok, ok, ok, TripCause.NONE, PHASE_REENERGIZE, 0, 0)
 
     def _reset_command_counters(self) -> None:
-        """After ``mark_energized``: a stale count from before (thermal dwell, boot) must not stop the arm."""
+        """After ``mark_energized``: a stale count from before (thermal dwell, boot) must not stop the arm, and a
+        command written before (while waiting for ARM, during the dwell) must not look fresh on the first RUN tick:
+        the command block is drained (its seq becomes the last seen; a STOP_REQ in it still counts)."""
+        if self._ipc.read_cmd(self._cmd):
+            seq = int(self._c_seq[0])
+            if seq != self._last_cmd_seq:
+                self._last_cmd_seq = seq
+                if int(self._c_mode[0]) == CmdMode.STOP_REQ:
+                    self._stop_requested = True
         self._rx_ns = self._clock.monotonic_ns()
-        self._has_delta = False
+        self._delta_pending = False
 
     # ------------------------------------------------------------------------------------------------------
     # the tick
@@ -448,7 +524,9 @@ class ServoCore:
         inp = self._in
 
         ok = bool(self._bus.read_block(block)) and block.ok
-        fresh = self._poll_cmd(t0)
+        new_seq = self._poll_cmd(t0)
+        fresh = new_seq and self._cmd_is_run  # IDLE / HOLD commands never resume RUN (review item 8c)
+        self._applied_this_tick = False
 
         monitored = False
         trips = TripCause.NONE
@@ -463,8 +541,10 @@ class ServoCore:
         if self._write_failures >= self._max_bus_failures:
             trips |= TripCause.BUS_FAIL  # consecutive refused writes: the same link fault as failed reads
         inp.trips = trips
-        inp.hb_ok = self._last_hb_ok
-        inp.mcu = None  # McuStatus reaches the machine only through hb_ok (boot latch: see module docstring)
+        inp.hb_ok = not self._hb_hard_fail
+        inp.hb_misses = self._hb_misses
+        # the MCU's own status, only after ARM (the boot latch must never reach the machine: module docstring)
+        inp.mcu = self._hb.last_status if (self._hb is not None and self._armed) else None
         inp.stop_requested = self._stop_requested
         inp.may_resume_thermal = self._thermal.may_resume()
         sm.step(inp, out)
@@ -473,7 +553,8 @@ class ServoCore:
             if out.resync_target:
                 self._pipe.resync(block.position)
                 self._interp_left = 1
-            if fresh and self._has_delta:
+            if self._delta_pending:  # also a delta that arrived on an earlier tick without use_policy (8a)
+                self._delta_pending = False
                 self._pipe.new_command(self._c_delta, v)
                 self._interp_left = self._interp
             self._pipe.apply(block, self._interp_left, v)
@@ -481,6 +562,7 @@ class ServoCore:
                 self._interp_left -= 1
             trips = v.trips
             self._applied_since_energize = True
+            self._applied_this_tick = True
             if int(trips) & _SM_CAUSES:
                 inp.trips = trips
                 inp.cmd_fresh = False
@@ -514,9 +596,13 @@ class ServoCore:
             if out.reenergize_requested:
                 self._reenergize_pending = True
 
+        if state is not SmState.RUN and state is not SmState.HOLD:
+            self._delta_pending = False  # a stop or a fault drops an unapplied delta
+
         hb_sent = ok and wrote and state is not SmState.LATCHED
         if hb_sent:
-            self._last_hb_ok = self._send_heartbeat()
+            self._last_hb_ok = self._send_heartbeat() == HbSend.ACKED
+            self._hb_misses = 0 if self._last_hb_ok else self._hb_misses + 1  # HB_MISS_BUDGET latches (next step)
         if ok and state is not SmState.LATCHED:
             self._write_failures = 0 if wrote else self._write_failures + 1
         self._last_state = state
@@ -539,7 +625,8 @@ class ServoCore:
 
         # thermal resume: the FULL reenergize, right after this tick's heartbeat
         if self._reenergize_pending and sm.state is SmState.CHECK:
-            if hb_sent and self._last_hb_ok:
+            # only right after an ACKED heartbeat, and never once a stop was requested (review item 7)
+            if hb_sent and self._last_hb_ok and not self._abort_requested():
                 self._reenergize_pending = False
                 self._run_reenergize()
         elif sm.state is not SmState.CHECK:
@@ -558,7 +645,9 @@ class ServoCore:
         mode = int(self._c_mode[0])
         if mode == CmdMode.STOP_REQ:
             self._stop_requested = True
-        self._has_delta = mode == CmdMode.RUN
+        self._cmd_is_run = mode == CmdMode.RUN
+        if self._cmd_is_run:
+            self._delta_pending = True  # a newer delta replaces an unapplied older one
         self._age_ns = now - int(self._c_t[0])
         # obs -> command: publish time of the state record the policy computed this command from
         sseq = int(self._c_state_seq[0])
@@ -591,12 +680,17 @@ class ServoCore:
             self._safe_started = False
         return attempted and goal_ok and torque_ok  # every write of the tick accepted (heartbeat condition)
 
-    def _send_heartbeat(self) -> bool:
-        self._hb_seq = (self._hb_seq + 1) & 0xFF
+    def _send_heartbeat(self) -> HbSend:
+        """One heartbeat with the next sequence number. The number is consumed only if the frame was delivered
+        (``NOT_DELIVERED`` reuses it next time: a gap would latch SEQ_ERROR; a lost echo still consumes it)."""
         self.last_hb_ns = self._clock.monotonic_ns()
         if self._hb is None or not self._armed:
-            return True
-        return bool(self._hb.send(self._hb_seq))
+            return HbSend.ACKED
+        seq = (self._hb_seq + 1) & 0xFF
+        res = self._hb.send(seq)
+        if res != HbSend.NOT_DELIVERED:
+            self._hb_seq = seq
+        return res
 
     def request_stop(self) -> None:
         """Same as a ``CmdMode.STOP_REQ`` command: USER_STOP -> SAFE_STOPPING -> TORQUE_OFF."""
@@ -628,13 +722,18 @@ class ServoCore:
         self._s_moving[...] = b.moving
         self._s_target[...] = self._target
         self._s_goal[...] = self._pipe.goal
-        self._s_applied[...] = self._v.applied_delta_ticks
-        self._s_clamped[...] = self._v.clamped_mask
+        if self._applied_this_tick:
+            self._s_applied[...] = self._v.applied_delta_ticks
+            self._s_clamped[...] = self._v.clamped_mask
+        else:  # HOLD, SAFE_STOPPING, TORQUE_OFF, ...: no delta was applied this tick (review item 10)
+            self._s_applied[...] = 0.0
+            self._s_clamped[...] = 0
         fault = int(self._sm.fault_bits) | (int(trips) & _SM_CAUSES)
         self._s_fault[0] = fault
         self._s_sm[0] = int(self._sm.state)
         self._s_last_cmd[0] = self._last_cmd_seq
         self._s_hb[0] = hb_sent and self._last_hb_ok
+        self._s_read_ok[0] = ok
         self._ipc.write_state(self._st)
         seq = getattr(self._ipc, "last_state_seq", 0)
         if seq:
@@ -697,6 +796,7 @@ class ServoCore:
             inp.cmd_fresh = False
             inp.trips = TripCause.NONE
             inp.hb_ok = True
+            inp.hb_misses = 0
             inp.mcu = None
             inp.stop_requested = True
             sm.step(inp, self._out)  # -> SAFE_STOPPING (USER_STOP)
@@ -710,9 +810,15 @@ class ServoCore:
     def _shutdown_hook(self, ok: bool) -> None:
         t0 = self._clock.monotonic_ns()
         if ok:
-            self._last_hb_ok = self._send_heartbeat()  # lenient: keep going, the sequence is bounded anyway
+            # lenient: keep going, the sequence is bounded anyway; an undelivered frame does not consume its seq
+            self._last_hb_ok = self._send_heartbeat() == HbSend.ACKED
+            self._hb_misses = 0 if self._last_hb_ok else self._hb_misses + 1
             self._target[...] = self.block.position
         self._publish(t0, ok, ok, ok, TripCause.NONE, PHASE_SHUTDOWN, 0, 0)
+
+
+def _never() -> bool:
+    return False
 
 
 def build_servo_core(

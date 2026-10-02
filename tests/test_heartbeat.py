@@ -1,3 +1,7 @@
+import os
+import threading
+import time
+import tty
 from typing import ClassVar
 
 import pytest
@@ -7,10 +11,11 @@ from so101_rl.servo import heartbeat as hb
 from so101_rl.servo.heartbeat import (
     FakeHeartbeatLink,
     FakeMcu,
+    HbSend,
     McuStatus,
     SerialHeartbeatLink,
 )
-from so101_rl.servo.timing import FakeClock
+from so101_rl.servo.timing import FakeClock, RealClock
 
 MS = 1_000_000
 
@@ -62,7 +67,7 @@ def test_boot_latch_refuses_serial_arm_and_only_the_button_clears_it(raw_mcu, cl
     link = FakeHeartbeatLink(raw_mcu)
     for _ in range(3):
         assert link.arm().armed is False
-        assert link.send(0) is False
+        assert link.send(0) is HbSend.DELIVERED_NO_ECHO
         assert link.status().latched
         clock.advance(2000 * MS)
     assert raw_mcu.state == "LATCHED" and not raw_mcu.relay_on
@@ -108,7 +113,7 @@ def test_heartbeat_at_exactly_1000_ms_cannot_rescue(mcu, link, clock):
     link.arm()
     link.send(0)
     clock.advance(1000 * MS)
-    assert link.send(1) is False
+    assert link.send(1) is HbSend.DELIVERED_NO_ECHO
     assert mcu.reason == hb.REASON_TIMEOUT
 
 
@@ -118,7 +123,7 @@ def test_arm_checks_psu_side_not_servo_side(mcu, link):
     mcu.set_servo_voltage(0.0)
     assert link.arm().armed
     mcu.set_servo_voltage(0.5)
-    assert link.send(0) is True and mcu.state == "ARMED" and not mcu.undervolt
+    assert link.send(0) is HbSend.ACKED and mcu.state == "ARMED" and not mcu.undervolt
 
 
 def test_psu_side_undervolt_refuses_arm_even_if_servo_side_is_fine(mcu, link):
@@ -186,13 +191,13 @@ def test_arm_only_from_disarmed(mcu, link):
     assert s.armed and s.relay_on and not s.latched
     assert mcu.state == "ARMED"
     # a second ARM while ARMED changes nothing (in particular does not re-baseline the sequence)
-    assert link.send(10)
+    assert link.send(10) is HbSend.ACKED
     assert mcu.feed(bytes([0x5A])) == bytes([mcu.status_byte()])
     assert mcu.state == "ARMED" and mcu._last_seq == 10
 
 
 def test_heartbeat_ignored_while_disarmed(mcu, link):
-    assert link.send(0) is False  # not armed: echo says so
+    assert link.send(0) is HbSend.DELIVERED_NO_ECHO  # not armed: echo says so
     assert mcu.state == "DISARMED"
 
 
@@ -200,15 +205,15 @@ def test_heartbeat_sequence_ok_and_wraps(mcu, link, clock):
     link.arm()
     for seq in list(range(250, 256)) + list(range(5)):
         clock.advance(33 * MS)
-        assert link.send(seq) is True
+        assert link.send(seq) is HbSend.ACKED
     assert mcu.state == "ARMED"
 
 
 def test_wrong_seq_latches_reason_3(mcu, link):
     link.arm()
-    assert link.send(0)
-    assert link.send(1)
-    assert link.send(5) is False
+    assert link.send(0) is HbSend.ACKED
+    assert link.send(1) is HbSend.ACKED
+    assert link.send(5) is HbSend.DELIVERED_NO_ECHO
     assert mcu.latched and mcu.reason == hb.REASON_SEQ_ERROR and not mcu.relay_on
     s = link.status()
     assert s.latched and s.reason == 3 and not s.relay_on
@@ -216,8 +221,8 @@ def test_wrong_seq_latches_reason_3(mcu, link):
 
 def test_repeated_seq_latches(mcu, link):
     link.arm()
-    assert link.send(7)
-    assert link.send(7) is False
+    assert link.send(7) is HbSend.ACKED
+    assert link.send(7) is HbSend.DELIVERED_NO_ECHO
     assert mcu.reason == hb.REASON_SEQ_ERROR
 
 
@@ -242,7 +247,7 @@ def test_timeout_is_measured_from_last_valid_heartbeat(mcu, link, clock):
     link.arm()
     for seq in range(40):
         clock.advance(500 * MS)
-        assert link.send(seq)
+        assert link.send(seq) is HbSend.ACKED
     assert mcu.state == "ARMED"  # 20 s total, never a 1 s gap
 
 
@@ -256,7 +261,7 @@ def test_late_heartbeat_after_timeout_does_not_unlatch(mcu, link, clock):
     link.arm()
     link.send(0)
     clock.advance(1500 * MS)
-    assert link.send(1) is False
+    assert link.send(1) is HbSend.DELIVERED_NO_ECHO
     assert mcu.latched and mcu.reason == hb.REASON_TIMEOUT
 
 
@@ -308,7 +313,7 @@ def test_undervoltage_glitch_shorter_than_50ms_is_tolerated(mcu, link, clock):
     clock.advance(30 * MS)
     mcu.set_bus_voltage(12.0)
     clock.advance(100 * MS)
-    assert link.send(1)
+    assert link.send(1) is HbSend.ACKED
 
 
 def test_arm_refused_when_undervolt(mcu, link):
@@ -386,18 +391,18 @@ def test_power_cycle_reports_mcu_reset_latched_and_opens_relay(mcu, link):
 
 def test_fake_link_unplug_returns_false_and_reports_dead(mcu, link):
     link.arm()
-    assert link.send(0) and link.dead is False
+    assert link.send(0) is HbSend.ACKED and link.dead is False
     link.unplug()
-    assert link.send(1) is False and link.dead is True
+    assert link.send(1) is HbSend.NOT_DELIVERED and link.dead is True
 
 
 def test_fake_link_write_timeout_returns_false_and_frame_is_lost(mcu, link, clock):
     link.arm()
-    assert link.send(0)
+    assert link.send(0) is HbSend.ACKED
     link.fail_writes(1)
-    assert link.send(1) is False
+    assert link.send(1) is HbSend.NOT_DELIVERED
     assert mcu._last_seq == 0  # never arrived
-    assert link.send(1) is True  # sequence continues unharmed
+    assert link.send(1) is HbSend.ACKED  # sequence continues unharmed
 
 
 def test_split_frame_is_buffered(mcu):
@@ -478,7 +483,7 @@ def test_serial_link_happy_path(ser_link, mcu, clock):
     assert link.arm().armed
     for seq in range(20):
         clock.advance(33 * MS)
-        assert link.send(seq) is True
+        assert link.send(seq) is HbSend.ACKED
     assert ser.writes[0] == b"\x5a"
     assert ser.writes[1] == bytes([0xA5, 0, 0xFF])
     assert mcu.state == "ARMED"
@@ -488,28 +493,28 @@ def test_serial_link_happy_path(ser_link, mcu, clock):
 def test_serial_link_write_timeout_returns_false(ser_link):
     link, ser = ser_link
     link.arm()
-    assert link.send(0)
+    assert link.send(0) is HbSend.ACKED
     ser.raise_timeout = True
-    assert link.send(1) is False
+    assert link.send(1) is HbSend.NOT_DELIVERED
 
 
 def test_serial_link_missing_echo_returns_false_then_recovers(ser_link):
     link, ser = ser_link
     link.arm()
-    assert link.send(0)
+    assert link.send(0) is HbSend.ACKED
     ser.swallow_reply = 1
-    assert link.send(1) is True  # echo for 1 not yet due when send(1) returns... it was swallowed
-    assert link.send(2) is False  # ...so the next send sees an unacknowledged previous heartbeat
-    assert link.send(3) is True  # the lost echo was forgotten; link recovers
+    assert link.send(1) is HbSend.ACKED  # echo for 1 not yet due when send(1) returns... it was swallowed
+    assert link.send(2) is HbSend.DELIVERED_NO_ECHO  # ...so the next send sees an unacknowledged previous heartbeat
+    assert link.send(3) is HbSend.ACKED  # the lost echo was forgotten; link recovers
 
 
 def test_serial_link_latched_echo_returns_false(ser_link, mcu, clock):
     link, _ = ser_link
     link.arm()
-    assert link.send(0)
+    assert link.send(0) is HbSend.ACKED
     clock.advance(1500 * MS)
-    assert link.send(1) is True  # this send's own echo has not been read yet
-    assert link.send(2) is False  # the echo of the previous one says LATCHED
+    assert link.send(1) is HbSend.ACKED  # this send's own echo has not been read yet
+    assert link.send(2) is HbSend.DELIVERED_NO_ECHO  # the echo of the previous one says LATCHED
     assert mcu.latched
 
 
@@ -526,12 +531,12 @@ def test_serial_link_latched_echo_returns_false(ser_link, mcu, clock):
 def test_serial_link_unplug_returns_false_and_reports_dead(ser_link, exc, where, monkeypatch):
     link, ser = ser_link
     link.arm()
-    assert link.send(0) and link.dead is False
+    assert link.send(0) is HbSend.ACKED and link.dead is False
     if where == "write":
         monkeypatch.setattr(ser, "write", lambda data: (_ for _ in ()).throw(exc))
     else:
         monkeypatch.setattr(FakeSerial, "in_waiting", property(lambda self: (_ for _ in ()).throw(exc)))
-    assert link.send(1) is False  # must not raise in the tick path
+    assert link.send(1) is HbSend.NOT_DELIVERED  # must not raise in the tick path
     assert link.dead is True and link.last_error is exc
 
 
@@ -539,21 +544,21 @@ def test_serial_link_dead_link_no_longer_touches_the_port(ser_link):
     link, ser = ser_link
     link.arm()
     ser.unplugged = serial.SerialException("gone")
-    assert link.send(0) is False and link.dead
+    assert link.send(0) is HbSend.NOT_DELIVERED and link.dead
     before = ser.touched_after_unplug
     for seq in range(1, 6):
-        assert link.send(seq) is False
+        assert link.send(seq) is HbSend.NOT_DELIVERED
     assert ser.touched_after_unplug == before
 
 
 def test_serial_link_write_timeout_is_transient_not_dead(ser_link):
     link, ser = ser_link
     link.arm()
-    assert link.send(0)
+    assert link.send(0) is HbSend.ACKED
     ser.raise_timeout = True
-    assert link.send(1) is False and link.dead is False
+    assert link.send(1) is HbSend.NOT_DELIVERED and link.dead is False
     ser.raise_timeout = False
-    assert link.send(2) is True  # a timed-out write is just a missed heartbeat: the link recovers at once
+    assert link.send(2) is HbSend.ACKED  # a timed-out write is just a missed heartbeat: the link recovers at once
 
 
 def test_serial_link_arm_times_out_without_reply(ser_link):
@@ -605,3 +610,149 @@ def test_serial_link_close(ser_link):
     link, ser = ser_link
     link.close()
     assert ser.closed
+
+
+# -- tri-state send (U3 review item 2) ---------------------------------------------------------
+def test_hbsend_values_are_bool_compatible():
+    assert HbSend.ACKED == True  # legacy bool test doubles keep their meaning
+    assert HbSend.NOT_DELIVERED == False
+    assert HbSend.DELIVERED_NO_ECHO not in (True, False)
+
+
+def test_fake_link_lost_echo_is_delivered_and_mcu_counted_it(mcu, link):
+    link.arm()
+    assert link.send(0) is HbSend.ACKED
+    link.drop_echoes(1)
+    assert link.send(1) is HbSend.DELIVERED_NO_ECHO
+    assert mcu._last_seq == 1  # it arrived: the next one must be 2, repeating 1 would latch
+    assert link.send(2) is HbSend.ACKED and not mcu.latched
+
+
+def test_fake_link_last_status_tracks_every_reply(mcu, link, clock):
+    assert link.last_status is None
+    link.arm()
+    assert link.last_status.armed
+    link.send(0)
+    clock.advance(1100 * MS)
+    assert link.send(1) is HbSend.DELIVERED_NO_ECHO
+    assert link.last_status.latched and link.last_status.reason == hb.REASON_TIMEOUT
+
+
+def test_serial_link_exposes_last_status(ser_link, mcu, clock):
+    link, _ = ser_link
+    assert link.last_status is None
+    link.arm()
+    assert link.last_status.armed and not link.last_status.latched
+
+
+def test_relay_closed_follows_the_mcu_state(mcu, link, clock):
+    assert not mcu.relay_closed()
+    link.arm()
+    assert mcu.relay_closed()
+    clock.advance(1000 * MS)
+    assert not mcu.relay_closed()  # the timeout is applied by relay_closed() itself
+
+
+# -- SerialHeartbeatLink on a real pyserial over a pty (no serial device): delivery from bytes written --------
+class _PtyMcu:
+    """FakeMcu on the master side of a pty, pumped synchronously by the test."""
+
+    def __init__(self, clock):
+        self.master, self.slave = os.openpty()
+        tty.setraw(self.slave)
+        os.set_blocking(self.master, False)
+        self.port = os.ttyname(self.slave)
+        self.mcu = FakeMcu(clock)
+        self.mcu.reset_button(500)
+        self.rx = bytearray()
+
+    def pump(self):
+        try:
+            data = os.read(self.master, 256)
+        except BlockingIOError:
+            data = b""
+        self.rx += data
+        reply = self.mcu.feed(data) if data else b""
+        if reply:
+            os.write(self.master, reply)
+
+    def close(self):
+        os.close(self.master)
+        os.close(self.slave)
+
+
+@pytest.fixture
+def pty_link(clock):
+    p = _PtyMcu(clock)
+    link = SerialHeartbeatLink(p.port, RealClock())
+    yield link, p
+    link.close()
+    p.close()
+
+
+def _arm_over_pty(link, p):
+    def pump_for_200_ms():
+        for _ in range(200):
+            p.pump()
+            time.sleep(0.001)
+
+    t = threading.Thread(target=pump_for_200_ms)
+    t.start()
+    st = link.arm()
+    t.join()
+    assert st.armed
+
+
+def test_serial_link_pyserial_timeout_after_a_full_write_is_still_delivered(pty_link, monkeypatch):
+    """pyserial raises SerialTimeoutException also AFTER os.write took the whole frame (preemption). The link
+    must not believe that: reusing the number of a frame the MCU received latches SEQ_ERROR."""
+    link, p = pty_link
+    _arm_over_pty(link, p)
+
+    def ambiguous_write(self, data):
+        os.write(self.fd, data)  # the bytes DID go out ...
+        raise serial.SerialTimeoutException("Write timeout")  # ... and pyserial still raises
+
+    monkeypatch.setattr(serial.Serial, "write", ambiguous_write)
+    for seq in range(10):
+        res = link.send(seq)
+        assert res is not HbSend.NOT_DELIVERED
+        p.pump()
+    assert not p.mcu.latched and p.mcu._last_seq == 9
+
+
+def test_serial_link_no_byte_accepted_is_not_delivered(pty_link, monkeypatch):
+    link, p = pty_link
+    _arm_over_pty(link, p)
+
+    def full(fd, data):
+        raise BlockingIOError
+
+    monkeypatch.setattr(hb.os, "write", full)
+    assert link.send(0) is HbSend.NOT_DELIVERED and not link.dead
+    monkeypatch.undo()
+    assert link.send(0) is not HbSend.NOT_DELIVERED  # the same number again: the MCU never saw it
+    p.pump()
+    assert p.mcu._last_seq == 0 and not p.mcu.latched
+
+
+def test_serial_link_partial_write_is_completed_on_the_next_send(pty_link, monkeypatch):
+    link, p = pty_link
+    _arm_over_pty(link, p)
+    real_write = hb.os.write
+    calls = {"n": 0}
+
+    def one_byte_then_full(fd, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_write(fd, data[:1])
+        raise BlockingIOError
+
+    monkeypatch.setattr(hb.os, "write", one_byte_then_full)
+    assert link.send(0) is not HbSend.NOT_DELIVERED  # 1 of 3 bytes accepted: delivered, the rest is kept
+    monkeypatch.undo()
+    p.pump()
+    assert link.send(1) is not HbSend.NOT_DELIVERED  # tail of frame 0 first, then frame 1
+    p.pump()
+    assert bytes(p.rx[-6:]) == bytes([0xA5, 0, 0xFF, 0xA5, 1, 0xFE])
+    assert p.mcu._last_seq == 1 and not p.mcu.latched

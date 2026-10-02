@@ -2,10 +2,11 @@
 
 Backends:
 
-* ``fake``: :class:`~so101_rl.servo.fake_bus.FakeBus` on the real clock, powered up at the home pose. Unless
+* ``fake``: :class:`~so101_rl.servo.fake_bus.FakeBus` on the real clock, at the home pose. Unless
   ``--heartbeat-port`` or ``--no-mcu`` is given it gets an in-process :class:`~so101_rl.servo.heartbeat.FakeMcu`
-  that boots LATCHED like the firmware, plus a simulated operator who presses the reset button, so the full
-  start-up path (boot latch -> button -> ARM -> re-energise) runs.
+  that boots LATCHED like the firmware, plus a simulated operator who presses the reset button, and the FakeBus is
+  powered through the MCU's relay (silent until ARM, then a short servo boot), so the full real-arm start-up path
+  (port without handshake -> boot latch -> button -> ARM -> ping -> re-energise) runs.
 * ``mujoco``: :class:`~so101_rl.sim.mujoco_bus.MujocoBus` starting limp at the ``rest`` keyframe; the physics is
   stepped in real time by :class:`RealtimeSimClock`. Needs the ``sim`` pixi feature.
 * ``feetech``: the real arm (:class:`~so101_rl.servo.feetech_bus.FeetechBus` on ``--port``). Requires the
@@ -30,6 +31,7 @@ from so101_rl.servo.process import require_rt_from_env, run
 from so101_rl.servo.timing import RealClock
 
 _NS = 1_000_000_000
+FAKE_SERVO_BOOT_MS = 50.0  # fake backend: servo boot time after the relay closes
 
 
 class SimulatedOperatorLink(FakeHeartbeatLink):
@@ -104,13 +106,25 @@ def main(argv: list[str] | None = None) -> int:
     hb_port = args.heartbeat_port if args.heartbeat_port is not None else cfg.heartbeat_port
     clock = RealClock()
 
+    fake_mcu = None
+    if args.backend == "fake" and hb_port is None and not args.no_mcu:
+        fake_mcu = FakeMcu(clock, timeout_ms=cfg.rates.heartbeat_timeout_ms)
+
     if args.backend == "fake":
         from so101_rl.servo.fake_bus import FakeBus
 
         home = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32)
+        power = fake_mcu.relay_closed if fake_mcu is not None else None
 
         def bus_factory():
-            return FakeBus(clock, calibration=calibration, initial_ticks=home, record_writes=False)
+            return FakeBus(
+                clock,
+                calibration=calibration,
+                initial_ticks=home,
+                record_writes=False,
+                power=power,
+                boot_ms=FAKE_SERVO_BOOT_MS if power is not None else 0.0,
+            )
 
     elif args.backend == "mujoco":
         from so101_rl.sim.model import load_model
@@ -149,7 +163,13 @@ def main(argv: list[str] | None = None) -> int:
             return SerialHeartbeatLink(hb_port, clock)
         if args.backend == "feetech":
             return None  # unreachable: refused above
-        return SimulatedOperatorLink(FakeMcu(clock, timeout_ms=cfg.rates.heartbeat_timeout_ms))
+        return SimulatedOperatorLink(fake_mcu if fake_mcu is not None else FakeMcu(clock, timeout_ms=cfg.rates.heartbeat_timeout_ms))
+
+    ports: list[str] = []
+    if args.backend == "feetech":
+        ports.append(cfg.port)
+    if hb_port is not None and not args.no_mcu:
+        ports.append(hb_port)
 
     return run(
         cfg,
@@ -162,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         tick_log_path=args.tick_log,
         summary_path=args.summary,
         arm_timeout_s=args.arm_timeout_s,
+        serial_ports=tuple(ports),
     )
 
 

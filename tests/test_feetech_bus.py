@@ -302,7 +302,18 @@ def test_connect_fails_when_a_motor_is_missing(world):
     world.silent.add(3)
     b = FeetechBus(load_config(calibration=_calib()), _calib())
     with pytest.raises(RuntimeError, match="Missing motor IDs"):
-        b.connect()
+        b.connect(handshake=True)
+
+
+def test_default_connect_does_not_ping_an_unpowered_bus(world):
+    """U3 review item 1: before ARM the servo side is dead; connect() must open the port without a handshake."""
+    world.silent.update(range(1, 7))
+    b = FeetechBus(load_config(calibration=_calib()), _calib())
+    b.connect()  # no ConnectionError although no motor answers
+    assert world.is_open
+    assert b.ping_all() == dict.fromkeys(range(1, 7), False)
+    world.silent.clear()  # relay closed, servos booted
+    assert all(b.ping_all().values())
 
 
 def test_read_block_before_connect_raises(world):
