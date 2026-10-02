@@ -548,3 +548,41 @@ def test_abort_during_the_ramp_turns_torque_off_within_one_tick(cfg, calibration
         reenergize(bus, cfg, calibration, clock, BlockRead(), should_abort=abort)
     assert not bus.torque and bus.log[-1] == "set_torque:False"
     assert clock.monotonic_ns() - state["t_abort"] < int(1e9 / cfg.rates.servo_hz) + 1  # honoured within one tick
+
+
+# ---- hand_over_on_abort (plan section 10, 2026-10-02 "Stop during re-energise") ------------------------------
+def test_abort_during_the_ramp_with_hand_over_leaves_torque_on_for_the_caller(cfg, calibration, clock):
+    bus = LoggingBus(calibration, clock, present=list(cfg.safe_state.rest_ticks), follow=0.3)
+    state = {"t_abort": None}
+
+    def abort():
+        if bus.torque and state["t_abort"] is None:
+            state["t_abort"] = clock.monotonic_ns() + 200_000_000
+        return state["t_abort"] is not None and clock.monotonic_ns() >= state["t_abort"]
+
+    with pytest.raises(ReenergizeAborted) as ei:
+        reenergize(bus, cfg, calibration, clock, BlockRead(), should_abort=abort, hand_over_on_abort=True)
+    assert ei.value.torque_on
+    assert bus.torque and "set_torque:False" not in bus.log  # the caller ramps to rest; no torque off in place
+    assert clock.monotonic_ns() - state["t_abort"] < int(1e9 / cfg.rates.servo_hz) + 1  # within one tick
+
+
+def test_abort_before_torque_with_hand_over_still_never_energises(cfg, calibration, bus, clock):
+    with pytest.raises(ReenergizeAborted) as ei:
+        reenergize(bus, cfg, calibration, clock, BlockRead(), should_abort=lambda: True, hand_over_on_abort=True)
+    assert not ei.value.torque_on
+    assert "set_torque:True" not in bus.log and not bus.torque
+
+
+def test_other_failures_during_the_ramp_still_turn_torque_off_with_hand_over(cfg, calibration, clock):
+    bus = LoggingBus(calibration, clock, present=list(cfg.safe_state.rest_ticks), follow=0.3)
+    calls = {"n": 0}
+
+    def hook(ok):
+        calls["n"] += 1
+        if bus.torque and calls["n"] > 5:
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        reenergize(bus, cfg, calibration, clock, BlockRead(), tick_hook=hook, should_abort=lambda: False, hand_over_on_abort=True)
+    assert not bus.torque and bus.log[-1] == "set_torque:False"

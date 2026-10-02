@@ -407,36 +407,142 @@ def test_item6_stop_signals_go_through_the_bounded_shutdown(cfg, calibration, si
     assert set(process.STOP_SIGNALS) >= {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
 
 
-def test_item7_signal_during_the_boot_reenergize_aborts_it_promptly(cfg, calibration):
+def _boot_ramp_signal_run(cfg, calibration, *, second_after_s=None):
+    """In-process ``run`` from rest (a ~5 s boot ramp); SIGINT 1 s into the ramp, optionally a second SIGINT
+    ``second_after_s`` later. Returns (exit code, times, bus, mcu, runner, heartbeat times, torque-off times)."""
     clock = FakeClock(start_ns=1_000 * NS)
     bus = FakeBus(clock, calibration=calibration, initial_ticks=cfg.safe_state.rest_ticks)  # long ramp
     mcu = FakeMcu(clock)
     mcu.set_button(True)
-    t = {"sig": None}
-    real_torque = bus.set_torque
+    t = {"on": None, "sig": None, "sig2": None}
+    hb, offs, seen = [], [], {}
+    real_torque, real_read = bus.set_torque, bus.read_block
 
     def set_torque(enabled, ids=None):
-        ok = real_torque(enabled, ids)
-        if enabled and t["sig"] is None:
-            t["sig"] = clock.monotonic_ns()
-            os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C right when the ramp starts
-        return ok
+        if enabled and t["on"] is None:
+            t["on"] = clock.monotonic_ns()
+        if not enabled:
+            offs.append(clock.monotonic_ns())
+        return real_torque(enabled, ids)
 
-    bus.set_torque = set_torque
+    def read(out):
+        now = clock.monotonic_ns()
+        if t["on"] is not None and t["sig"] is None and now - t["on"] >= 1 * NS:
+            t["sig"] = now
+            os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C during the boot ramp
+        elif second_after_s is not None and t["sig"] is not None and t["sig2"] is None:
+            if now - t["sig"] >= second_after_s * NS:
+                t["sig2"] = now
+                os.kill(os.getpid(), signal.SIGINT)  # second Ctrl-C during the hand-over: escalate
+        return real_read(out)
+
+    bus.set_torque, bus.read_block = set_torque, read
+
+    class Link(FakeHeartbeatLink):
+        def send(self, seq):
+            hb.append(clock.monotonic_ns())
+            return super().send(seq)
+
     code = process.run(
         cfg,
         lambda: bus,
-        lambda: FakeHeartbeatLink(mcu),
+        lambda: Link(mcu),
         require_rt=False,
         clock=clock,
         ipc=LocalIpc(),
         calibration=calibration,
         arm_timeout_s=5.0,
         freeze_gc=False,
+        on_core=lambda core, runner: seen.update(runner=runner),
     )
+    return code, t, bus, mcu, seen["runner"], hb, offs
+
+
+def test_item7_signal_during_the_boot_ramp_hands_over_to_the_safe_state_sequence(cfg, calibration):
+    code, t, bus, mcu, runner, hb, offs = _boot_ramp_signal_run(cfg, calibration)
     assert code == process.EXIT_OK  # interrupted by a signal, not a start-up failure
-    assert clock.monotonic_ns() - t["sig"] < 0.5 * NS  # not the ~5 s ramp
+    assert t["sig"] is not None and runner.stop_signals == 1 and not runner.immediate
+    assert min(o for o in offs if o >= t["sig"]) - t["sig"] > 1 * NS  # no torque off in place: ramped back
+    np.testing.assert_allclose(bus._pos[:5], np.asarray(cfg.safe_state.rest_ticks)[:5], atol=30)  # at rest
     assert not bus.torque_enabled().any()
+    assert max(offs) - t["sig"] <= cfg.safe_state.bound_s * NS
+    assert np.diff([h for h in hb if h >= t["on"]]).max() < 0.5 * NS and not mcu.latched  # heartbeat continuous
+
+
+def test_item7_second_signal_during_the_handover_cuts_torque_within_one_tick(cfg, calibration):
+    code, t, bus, _mcu, runner, _hb, offs = _boot_ramp_signal_run(cfg, calibration, second_after_s=0.5)
+    assert code == process.EXIT_OK
+    assert t["sig2"] is not None and runner.stop_signals == 2 and runner.immediate
+    period = round(NS / cfg.rates.servo_hz)
+    assert min(o for o in offs if o >= t["sig2"]) - t["sig2"] <= period
+    assert not bus.torque_enabled().any()
+    assert np.abs(bus._pos[:5] - np.asarray(cfg.safe_state.rest_ticks)[:5]).max() > 60  # cut, not ramped to rest
+
+
+def _sigint_during_boot_ramp_subprocess(tmp_path, *, second_after_s=None):
+    """``--backend fake --fake-start rest`` subprocess (FakeMcu in-process, real clock). SIGINT once the boot ramp
+    has visibly left rest (state record: BOOT, present moving), optionally a second SIGINT later."""
+    name = _name()
+    summary = tmp_path / "summary.json"
+    proc = subprocess.Popen(
+        _servo_cmd("--backend", "fake", "--fake-start", "rest", "--shm-name", name, "--summary", str(summary)),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    rest = np.asarray(json.loads("[2050, 2200, 2301, 2745, 2040, 2065]"))
+    shm, st, last = None, new_state(), None
+    t_sig = t_sig2 = None
+    try:
+        t0 = time.monotonic()
+        while proc.poll() is None and time.monotonic() - t0 < 40:
+            if shm is None:
+                try:
+                    shm = ServoShm.attach(name)
+                except (FileNotFoundError, RuntimeError):
+                    time.sleep(0.02)
+                    continue
+            if shm.read_state(st):
+                last = st.copy()
+                moved = np.abs(st["present_ticks"][0][:5].astype(int) - rest[:5]).max()
+                booting = SmState(int(st["sm_state"][0])) is SmState.BOOT and bool(st["read_ok"][0])
+                if t_sig is None and booting and moved > 60:
+                    proc.send_signal(signal.SIGINT)
+                    t_sig = time.monotonic()
+            due = t_sig is not None and t_sig2 is None and time.monotonic() - t_sig >= (second_after_s or 0.0)
+            if second_after_s is not None and due:
+                proc.send_signal(signal.SIGINT)
+                t_sig2 = time.monotonic()
+            time.sleep(0.005)
+        code = proc.wait(timeout=40)
+        t_exit = time.monotonic()
+        err = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        if shm is not None:
+            shm.close()
+    return code, json.loads(summary.read_text()), err, last, rest, t_sig, t_sig2, t_exit
+
+
+def test_item7_subprocess_sigint_during_boot_ramp_exits_via_safe_state(tmp_path):
+    code, rep, err, last, rest, t_sig, _t2, t_exit = _sigint_during_boot_ramp_subprocess(tmp_path)
+    assert t_sig is not None, err
+    assert code == 0, err
+    assert rep["signal"] == signal.SIGINT and rep["stop_signals"] == 1 and not rep["immediate_stop"]
+    assert "ReenergizeAborted" in rep["last_error"] and "handing over to the safe-state sequence" in err
+    assert "escalation" not in err
+    np.testing.assert_allclose(last["present_ticks"][0][:5], rest[:5], atol=30)  # ramped back to rest
+    assert t_exit - t_sig <= 20.0 + 2.0  # bound_s plus process exit
+
+
+def test_item7_subprocess_second_sigint_cuts_torque_immediately(tmp_path):
+    code, rep, err, last, rest, _t_sig, t_sig2, t_exit = _sigint_during_boot_ramp_subprocess(tmp_path, second_after_s=0.4)
+    assert t_sig2 is not None, err
+    assert code == 0, err
+    assert rep["stop_signals"] == 2 and rep["immediate_stop"]
+    assert "escalation" in err
+    assert t_exit - t_sig2 < 1.5  # no ramp: torque off on the next tick, then the normal exit path
+    assert np.abs(last["present_ticks"][0][:5].astype(int) - rest[:5]).max() > 30  # cut, not at rest
 
 
 def test_item14_a_held_serial_port_refuses_a_second_servo_with_exit_4(cfg, calibration, tmp_path):

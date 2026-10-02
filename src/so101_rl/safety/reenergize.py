@@ -34,10 +34,13 @@ hook, the time from entry to that first good tick, and every later gap between g
 latch must not be raced. The hook may raise to abort (the servo core does on a refused heartbeat: re-energise
 stays strict, one miss aborts it).
 
-**Abort** (U3 review item 7): ``should_abort()`` is polled once per servo tick in every waiting loop and in the
-ramp. When it turns true ``ReenergizeAborted`` is raised; like every other failure after ``set_torque(True)`` that
-turns torque off first (the arm goes limp where it is, as with the e-stop), so a Ctrl-C or STOP_REQ is honoured
-within one tick instead of after the up-to-5 s ramp.
+**Abort** (U3 review item 7; plan section 10, 2026-10-02 "Stop during re-energise"): ``should_abort()`` is polled
+once per servo tick in every waiting loop and in the ramp. When it turns true ``ReenergizeAborted`` is raised
+within one tick instead of after the up-to-5 s ramp. Before ``set_torque(True)`` the arm is never energised. During
+the ramp, by default, torque is turned off first like every other failure (the arm goes limp where it is). With
+``hand_over_on_abort=True`` (the servo core) torque is LEFT ON and the exception carries ``torque_on=True``: the
+caller must hand over to the bounded safe-state sequence back to rest at once (heartbeat continuing), so a Ctrl-C
+during the ramp does not drop the arm.
 """
 
 from __future__ import annotations
@@ -68,7 +71,13 @@ TickHook = Callable[[bool], None]
 
 
 class ReenergizeAborted(RuntimeError):
-    """``should_abort()`` turned true (signal, STOP_REQ). Torque is off when this propagates."""
+    """``should_abort()`` turned true (signal, STOP_REQ). ``torque_on`` False: torque is off (or was never on) when
+    this propagates. ``torque_on`` True (only with ``hand_over_on_abort=True``, abort during the ramp): torque is
+    still ON and the caller must run the safe-state sequence now."""
+
+    def __init__(self, msg: str, *, torque_on: bool = False) -> None:
+        super().__init__(msg)
+        self.torque_on = torque_on
 
 
 class UnsafeStartPose(RuntimeError):
@@ -96,15 +105,18 @@ def reenergize(
     heartbeat_gap_s: float = 0.8,
     fk: So101FK | None = None,
     should_abort: Callable[[], bool] | None = None,
+    hand_over_on_abort: bool = False,
 ) -> None:
     """1. wait until all 6 ids answer (ping_all)  2. require_calibration  3. Lock=0, torque-off check, registers,
     read-back  4. read_block -> start pose / temperature check -> write_goal(present) -> read back
     Goal_Position == present for all 6  5. set_torque(True)  6. ramp home through the transit zone.
 
     Raises ``TimeoutError`` (motors missing, block read failing, heartbeat gap, homing not reached),
-    ``CalibrationMismatch``, ``UnsafeStartPose``, ``ReenergizeAborted`` (``should_abort()``) or ``RuntimeError`` (register / goal read-back differs, torque on
-    before the register writes, hot or faulted motor, bus write failed). After step 5 every failure turns torque
-    off before it propagates. The order is asserted by tests/test_reenergize.py.
+    ``CalibrationMismatch``, ``UnsafeStartPose``, ``ReenergizeAborted`` (``should_abort()``) or ``RuntimeError``
+    (register / goal read-back differs, torque on before the register writes, hot or faulted motor, bus write
+    failed). After step 5 every failure turns torque
+    off before it propagates, except a ``ReenergizeAborted`` with ``hand_over_on_abort=True``: then torque stays on
+    (``exc.torque_on``) for the caller's safe-state hand-over. The order is asserted by tests/test_reenergize.py.
     """
     motors = _ordered(calibration)
     if len(motors) != N_JOINTS:
@@ -180,6 +192,9 @@ def reenergize(
         # 6. ramp home through the transit zone, same step and tracking clamp as the safe-state ramp
         _ramp_home(bus, cfg, clock, block, present, timeout_s, fk, tick_hook, last_good_ns, gap_ns, check_abort)
     except BaseException as exc:
+        if hand_over_on_abort and isinstance(exc, ReenergizeAborted):
+            exc.torque_on = True  # stop during the ramp: the caller ramps to rest (plan section 10, 2026-10-02)
+            raise
         if not torque_off_retry(bus):
             exc.add_note("re-energise: torque-off after the failure ALSO failed; the deadman is the next layer")
         raise

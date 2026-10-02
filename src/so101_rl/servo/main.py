@@ -2,7 +2,8 @@
 
 Backends:
 
-* ``fake``: :class:`~so101_rl.servo.fake_bus.FakeBus` on the real clock, at the home pose. Unless
+* ``fake``: :class:`~so101_rl.servo.fake_bus.FakeBus` on the real clock, at the home pose (``--fake-start rest``:
+  at the rest pose, so the boot re-energise ramps home for a few seconds). Unless
   ``--heartbeat-port`` or ``--no-mcu`` is given it gets an in-process :class:`~so101_rl.servo.heartbeat.FakeMcu`
   that boots LATCHED like the firmware, plus a simulated operator who presses the reset button, and the FakeBus is
   powered through the MCU's relay (silent until ARM, then a short servo boot), so the full real-arm start-up path
@@ -87,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--arm-timeout-s", type=float, default=None, help="give up waiting for the MCU button/ARM")
     ap.add_argument("--tick-log", type=Path, default=None, help="binary tick log (TICK_LOG_DTYPE records)")
     ap.add_argument("--summary", type=Path, default=None, help="write a JSON summary at exit")
+    ap.add_argument(
+        "--fake-start", choices=("home", "rest"), default="home", help="fake backend: initial pose (rest: long boot ramp)"
+    )
     return ap
 
 
@@ -113,14 +117,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend == "fake":
         from so101_rl.servo.fake_bus import FakeBus
 
-        home = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32)
+        pose = cfg.safe_state.rest_ticks if args.fake_start == "rest" else cfg.safe_state.home_ticks
+        start_pose = np.asarray(pose, dtype=np.int32)
         power = fake_mcu.relay_closed if fake_mcu is not None else None
 
         def bus_factory():
             return FakeBus(
                 clock,
                 calibration=calibration,
-                initial_ticks=home,
+                initial_ticks=start_pose,
                 record_writes=False,
                 power=power,
                 boot_ms=FAKE_SERVO_BOOT_MS if power is not None else 0.0,

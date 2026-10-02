@@ -374,21 +374,113 @@ def test_item4_second_safe_stop_starts_a_fresh_sequence_to_rest(h):
 # item 7: reenergize abort; no thermal resume after a stop
 
 
-def test_item7_stop_during_boot_reenergize_aborts_within_a_tick(cfg, calibration):
+def _ramp_stop_harness(cfg, calibration, *, stop_after_ms=1500, cut_after_ms=None):
+    """Boot from rest (a ~5 s ramp home). ``should_abort`` turns true ``stop_after_ms`` into the ramp; with
+    ``cut_after_ms`` the escalation flag (``immediate_stop``) turns true that long after the stop. Records every
+    heartbeat send time and every ``set_torque`` call."""
     hn = Harness(cfg, calibration, start=cfg.safe_state.rest_ticks)
-    t = {"abort_at": None}
+    t = {"stop": None, "cut": None, "hb": [], "torque": [], "pos_at_stop": None}
+    real_send, real_torque = hn.link.send, hn.bus.set_torque
+
+    def send(seq):
+        t["hb"].append(hn.clock.monotonic_ns())
+        return real_send(seq)
+
+    def set_torque(enabled, ids=None):
+        t["torque"].append((bool(enabled), hn.clock.monotonic_ns()))
+        return real_torque(enabled, ids)
+
+    hn.link.send, hn.bus.set_torque = send, set_torque
 
     def should_abort():
-        if t["abort_at"] is None and hn.bus.torque_enabled().any():
-            t["abort_at"] = hn.clock.monotonic_ns() + 300 * MS  # 0.3 s into the ramp
-        return t["abort_at"] is not None and hn.clock.monotonic_ns() >= t["abort_at"]
+        now = hn.clock.monotonic_ns()
+        if t["stop"] is None and hn.bus.torque_enabled().any():
+            t["stop"] = now + stop_after_ms * MS
+        hit = t["stop"] is not None and now >= t["stop"]
+        if hit and t["pos_at_stop"] is None:
+            t["pos_at_stop"] = hn.bus._pos.copy()
+        return hit
+
+    def immediate():
+        return cut_after_ms is not None and t["stop"] is not None and hn.clock.monotonic_ns() >= t["stop"] + cut_after_ms * MS
+
+    hn.mcu.set_button(True)
+    with pytest.raises(StartupError):
+        hn.core.start(should_abort=should_abort, arm_timeout_s=5.0, immediate_stop=immediate)
+    return hn, t
+
+
+def test_item7_stop_during_the_boot_ramp_hands_over_to_the_safe_state_sequence(cfg, calibration):
+    """Plan section 10, 2026-10-02: a stop during the re-energise ramp ramps the arm back to rest via the
+    SafeStateSequencer (heartbeat continuing), torque off only at the end; never torque off in place."""
+    hn, t = _ramp_stop_harness(cfg, calibration)
+    assert isinstance(hn.core.last_error, ReenergizeAborted) and hn.core.last_error.torque_on
+    rest = np.asarray(cfg.safe_state.rest_ticks)
+    assert np.abs(t["pos_at_stop"][:5] - rest[:5]).max() > 100  # the ramp had really left rest
+    offs = [ts for on, ts in t["torque"] if not on]
+    assert offs and min(offs) > t["stop"] + 1_000_000_000  # no torque off in place: the hand-over ramp ran (> 1 s)
+    np.testing.assert_allclose(hn.bus._pos[:5], rest[:5], atol=30)  # ended at rest
+    assert not hn.bus.torque_enabled().any()
+    assert hn.clock.monotonic_ns() - t["stop"] <= cfg.safe_state.bound_s * NS
+    # heartbeat continuous across the whole ramp + hand-over (> 1 s): the MCU never timed out
+    gaps = np.diff([ts for ts in t["hb"] if ts >= t["stop"] - 200 * MS])
+    assert gaps.max() < 0.5 * NS
+    assert not hn.mcu.latched and hn.mcu.armed
+
+
+def test_item7_stop_before_torque_on_never_energises(cfg, calibration):
+    hn = Harness(cfg, calibration, start=cfg.safe_state.rest_ticks)
+    calls = []
+    real_torque = hn.bus.set_torque
+    hn.bus.set_torque = lambda enabled, ids=None: (calls.append(bool(enabled)), real_torque(enabled, ids))[1]
+    regs = {"n": 0}
+    real_write_reg = hn.bus.write_reg
+    hn.bus.write_reg = lambda *a: (regs.__setitem__("n", regs["n"] + 1), real_write_reg(*a))[1]
+    hn.mcu.set_button(True)
+    with pytest.raises(StartupError):
+        hn.core.start(should_abort=lambda: regs["n"] > 0, arm_timeout_s=5.0)  # stop during the register phase
+    assert isinstance(hn.core.last_error, ReenergizeAborted) and not hn.core.last_error.torque_on
+    assert True not in calls and not hn.bus.torque_enabled().any()
+
+
+def test_item7_second_stop_during_the_handover_cuts_torque_within_one_tick(cfg, calibration):
+    hn, t = _ramp_stop_harness(cfg, calibration, cut_after_ms=500)
+    t_cut = t["stop"] + 500 * MS
+    offs = [ts for on, ts in t["torque"] if not on]
+    assert offs and t_cut <= min(offs) <= t_cut + hn.period  # torque off within one tick of the escalation
+    assert not hn.bus.torque_enabled().any()
+    rest = np.asarray(cfg.safe_state.rest_ticks)
+    assert np.abs(hn.bus._pos[:5] - rest[:5]).max() > 100  # cut in place, not ramped to rest
+    assert any("escalation" in m for m in hn.logs)
+
+
+def test_item7_mcu_latch_during_the_handover_cuts_torque_at_once(cfg, calibration):
+    hn = Harness(cfg, calibration, start=cfg.safe_state.rest_ticks)
+    t = {"stop": None, "estop": None}
+    real_read = hn.bus.read_block
+
+    def read(out):
+        now = hn.clock.monotonic_ns()
+        if t["stop"] is not None and now >= t["stop"] + 300 * MS and t["estop"] is None:
+            t["estop"] = now
+            hn.mcu.set_estop(True)  # e-stop pressed during the hand-over: the MCU latches
+        return real_read(out)
+
+    hn.bus.read_block = read
+
+    def should_abort():
+        now = hn.clock.monotonic_ns()
+        if t["stop"] is None and hn.bus.torque_enabled().any():
+            t["stop"] = now + 1500 * MS
+        return t["stop"] is not None and now >= t["stop"]
 
     hn.mcu.set_button(True)
     with pytest.raises(StartupError):
         hn.core.start(should_abort=should_abort, arm_timeout_s=5.0)
-    assert isinstance(hn.core.last_error, ReenergizeAborted)
-    assert hn.clock.monotonic_ns() - t["abort_at"] <= hn.period
+    assert t["estop"] is not None
+    assert hn.clock.monotonic_ns() - t["estop"] <= 2 * hn.period
     assert not hn.bus.torque_enabled().any()
+    assert any("escalation" in m for m in hn.logs)
 
 
 def test_item7_no_thermal_resume_once_stop_is_set(cfg, calibration, monkeypatch):

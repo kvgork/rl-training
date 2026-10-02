@@ -54,7 +54,10 @@ a new process). After ARM the MCU's reported status is fed every tick (``SmInput
 Re-energise (boot and the automatic thermal resume) runs with ``tick_hook``: one heartbeat per good tick, and a
 heartbeat that is not ACKED during re-energise aborts it (strict: ``reenergize`` then turns torque off). It also
 gets ``should_abort`` (the runner's stop flag or a STOP_REQ), and a thermal resume never starts once a stop was
-requested. Afterwards ``mark_energized()`` and the stale-command counters are reset (the command block is drained,
+requested. A stop before ``set_torque(True)`` never energises. A stop during the ramp (plan section 10,
+2026-10-02) leaves torque on (``hand_over_on_abort``) and the core hands over AT ONCE to the bounded
+``SafeStateSequencer.run(..., tick_hook=...)`` back to rest, heartbeat continuing (the shutdown hook), then torque
+off; the attempt then counts as a failed re-energise (start-up raises ``StartupError``). Afterwards ``mark_energized()`` and the stale-command counters are reset (the command block is drained,
 so a command written before ARM is not "fresh" on the first RUN tick), so a stale count from the dwell cannot turn
 the thermal resume into a STALE_CMD stop. A failure calls ``notify_reenergize_failed()``.
 
@@ -66,6 +69,10 @@ continues, bounded by ``bound_s``; lenient: a missed heartbeat does not stop the
 delivered does not advance the sequence, so it cannot latch SEQ_ERROR), then torque off on every motor, then
 ``disconnect``. Every process exit
 (SIGINT, SIGTERM, exception, ``--max-ticks``) goes through it (``servo/process.py``).
+
+Escalation: on every tick of a safe-state run (shutdown or the re-energise hand-over) the hook checks
+``immediate_stop()`` (the runner: a SECOND stop signal) and the MCU's reported status (latched: relay open, e-stop).
+Either raises :class:`ImmediateStop` out of the sequencer and torque goes off on that same tick.
 
 State record and the log convention
 -----------------------------------
@@ -112,6 +119,7 @@ __all__ = [
     "CLAMP_CAUSES",
     "TICK_LOG_DTYPE",
     "HeartbeatLost",
+    "ImmediateStop",
     "ServoCore",
     "StartupError",
     "TickResult",
@@ -164,6 +172,10 @@ class StartupError(RuntimeError):
 
 class HeartbeatLost(RuntimeError):
     """A heartbeat was refused while the arm was being energised: the MCU is (about to be) latched."""
+
+
+class ImmediateStop(RuntimeError):
+    """Escalation during a safe-state run (second stop signal, MCU latched / e-stop): torque off now, no ramp."""
 
 
 @dataclass
@@ -286,6 +298,7 @@ class ServoCore:
         self._hb_misses = 0  # consecutive heartbeat sends that were not ACKED (normal running; HB_MISS_BUDGET)
         self._hb_hard_fail = False  # a strict-path miss (re-energise): latches on the next step
         self._abort: Callable[[], bool] = _never
+        self._immediate: Callable[[], bool] = _never  # escalation: cut torque now (a second stop signal)
         self._armed = False  # MCU ARM succeeded (only then is the link used)
         self._last_cmd_seq = 0
         self._rx_ns = clock.monotonic_ns()
@@ -344,16 +357,26 @@ class ServoCore:
 
     # ------------------------------------------------------------------------------------------------------
     # start-up
-    def start(self, *, should_abort: Callable[[], bool] | None = None, arm_timeout_s: float | None = None) -> None:
+    def start(
+        self,
+        *,
+        should_abort: Callable[[], bool] | None = None,
+        arm_timeout_s: float | None = None,
+        immediate_stop: Callable[[], bool] | None = None,
+    ) -> None:
         """Open the port (no handshake) -> BOOT, wait for the physical button + ARM -> ping every motor -> good
         read + write + ACKED heartbeat -> ``reenergize`` -> RUN.
 
         ``should_abort`` is kept for the life of the core: it also aborts a running re-energise and blocks a
-        thermal resume. Raises :class:`StartupError` (torque off) if the MCU never arms within ``arm_timeout_s``
+        thermal resume; a stop during the ramp hands over to the safe-state sequence (module docstring).
+        ``immediate_stop`` (also kept) escalates any safe-state run to torque off now. Raises
+        :class:`StartupError` (torque off) if the MCU never arms within ``arm_timeout_s``
         (None: wait forever, with a reminder every ``ARM_REMINDER_S``), if ``should_abort()`` becomes true, if
         the motors do not answer within ``BOOT_HEARTBEAT_WINDOW_S`` of ARM, or if re-energise fails."""
         abort = should_abort if should_abort is not None else _never
         self._abort = abort
+        if immediate_stop is not None:
+            self._immediate = immediate_stop
         self._bus.connect()  # opens the port only: before ARM the servo side is unpowered (review item 1)
         if self._hb is not None:
             self._wait_for_arm(abort, arm_timeout_s)
@@ -457,9 +480,12 @@ class ServoCore:
                 tick_hook=self._reenergize_hook,
                 fk=self._fk,
                 should_abort=self._abort_requested,
+                hand_over_on_abort=True,
             )
         except BaseException as exc:
             self.last_error = exc
+            if isinstance(exc, ReenergizeAborted) and exc.torque_on:
+                self._abort_handover()  # first: torque is on and the heartbeat must continue
             if isinstance(exc, CalibrationMismatch):
                 self.calib_mismatches += 1
                 self._sm.fault_bits |= TripCause.CALIB_MISMATCH
@@ -480,6 +506,19 @@ class ServoCore:
         self._hb_misses = 0  # every re-energise tick was ACKED
         self._interp_left = 1
         return True
+
+    def _abort_handover(self) -> None:
+        """Stop during the re-energise ramp (plan section 10, 2026-10-02): torque is on. Bounded safe-state sequence
+        from present back to rest with the heartbeat hook, then torque off (also after an escalation or a
+        failure)."""
+        self._log("re-energise: stop during the ramp, handing over to the safe-state sequence")
+        try:
+            self._safe.run(self._bus, self.block, servo_hz=self.cfg.rates.servo_hz, tick_hook=self._shutdown_hook)
+        except Exception as exc:  # noqa: BLE001 - ImmediateStop or torque-off refused: torque off below either way
+            self._log(f"re-energise hand-over: {exc!r}")
+        finally:
+            if not torque_off_retry(self._bus):
+                self._log("re-energise hand-over: torque off refused 3 times; the deadman is the next layer")
 
     def _abort_requested(self) -> bool:
         return self._stop_requested or bool(self._abort())
@@ -807,7 +846,17 @@ class ServoCore:
             self._log(f"shutdown: safe-state sequence failed: {exc!r}")
         sm.notify_safe_done()
 
+    def _cut_requested(self) -> bool:
+        """Escalation during a safe-state run: a second stop signal, or the MCU reports latched (relay open)."""
+        if self._immediate():
+            return True
+        st = self._hb.last_status if (self._hb is not None and self._armed) else None
+        return st is not None and st.latched
+
     def _shutdown_hook(self, ok: bool) -> None:
+        if self._cut_requested():
+            self._log("safe state: escalation (second stop / MCU latched): torque off now")
+            raise ImmediateStop("immediate stop requested during the safe-state sequence")
         t0 = self._clock.monotonic_ns()
         if ok:
             # lenient: keep going, the sequence is bounded anyway; an undelivered frame does not consume its seq

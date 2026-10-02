@@ -17,7 +17,10 @@
 5. Every exit (``--max-ticks``, SIGINT, SIGTERM, SIGHUP, SIGQUIT, an exception) goes through
    ``ServoCore.shutdown``. The signal handlers only set a flag; the loop checks it once per tick, and a running
    re-energise polls it too. SIGHUP matters: closing the ssh session that started the servo must ramp the arm
-   down, not kill the process (the arm would fall about 1 s later, when the MCU times out).
+   down, not kill the process (the arm would fall about 1 s later, when the MCU times out). A stop during the
+   boot re-energise ramp hands over to the same bounded safe-state sequence (plan section 10, 2026-10-02). A
+   SECOND stop signal escalates: ``ServoRunner.immediate`` is set and the core cuts torque on the next tick of
+   whatever safe-state run is in progress (``ServoCore.start(immediate_stop=...)``).
 
 Exit codes: 0 normal stop, 1 exception in the loop (after a clean shutdown), 2 start-up failed, 3 RT required
 but unavailable, 4 another servo process owns the shm segment.
@@ -116,19 +119,29 @@ class ServoRunner:
         self.resyncs = 0
         self.ticks = 0
         self.signal_received: int | None = None
+        self.stop_signals = 0  # stop signals received (the second one escalates to an immediate torque-off)
         self._stop = False
+        self._immediate = False
         self._log = log if log is not None else (lambda m: print(f"servo: {m}", file=sys.stderr, flush=True))
         self._last_overrun_log_ns = -(10**18)
         self._overruns_since_log = 0
 
     def request_stop(self, signum: int | None = None) -> None:
-        if signum is not None and self.signal_received is None:
-            self.signal_received = signum
+        if signum is not None:
+            self.stop_signals += 1
+            if self.signal_received is None:
+                self.signal_received = signum
+            if self.stop_signals >= 2:
+                self._immediate = True  # second stop signal: cut torque now, no ramp (escalation)
         self._stop = True
 
     @property
     def stopping(self) -> bool:
         return self._stop
+
+    @property
+    def immediate(self) -> bool:
+        return self._immediate
 
     def loop(self, max_ticks: int | None = None) -> int:
         """Tick until ``request_stop`` or ``max_ticks``; returns the number of ticks run."""
@@ -272,7 +285,11 @@ def run(
         if on_core is not None:
             on_core(core, runner)
         try:
-            core.start(should_abort=lambda: runner.stopping, arm_timeout_s=arm_timeout_s)
+            core.start(
+                should_abort=lambda: runner.stopping,
+                arm_timeout_s=arm_timeout_s,
+                immediate_stop=lambda: runner.immediate,
+            )
         except StartupError as exc:
             if runner.signal_received is not None:
                 log(f"start-up interrupted by signal {runner.signal_received}")
@@ -344,6 +361,8 @@ def _core_summary(core: ServoCore, runner: ServoRunner, gc_before: int) -> dict[
         "max_temp_c": {n: int(t) for n, t in zip(JOINT_NAMES, thermal.max_seen_c, strict=True)},
         "gc_collections": _gc_collections() - gc_before,
         "signal": runner.signal_received,
+        "stop_signals": runner.stop_signals,
+        "immediate_stop": runner.immediate,
         "last_error": repr(core.last_error) if core.last_error is not None else None,
     }
 
