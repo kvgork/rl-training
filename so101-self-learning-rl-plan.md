@@ -204,6 +204,26 @@ Each skill is pre-trained in GPU sim to high success, deployed on the real arm, 
   - contact-buffer overflow (`nconmax`);
   - parity against CPU MuJoCo, meaning the same trajectory within tolerance.
 
+**S0 spike result (2026-10-05, measured).** Full report: `plans/reviews/2026-10-05-mjwarp-feasibility-spike.md`.
+- **Works:** MuJoCo Warp 3.14 with mujoco 3.14 and warp-lang 1.17, all from conda-forge, runs our full scene (repo `load_model`) on the 3080 with no blockers.
+- **Mesh collisions:** supported. The 10 arm-link collision meshes have 9k–27k vertices each and needed no simplification.
+- **Required changes:**
+  - `margin=0` on the `jaw_col` default, because MJWarp rejects non-zero margins on box pairs.
+  - `njmax ≥ 256`, because the default 64 overflows, and overflow only prints a warning.
+  - `nconmax = 32` per world is enough.
+
+  | N envs | env-steps/s | VRAM |
+  |---|---|---|
+  | 256 | 300k | 0.4 GB |
+  | 1024 | 745k | 0.8 GB |
+  | 2048 | 1.09M | 1.3 GB |
+  | 4096 | 1.68M | 2.4 GB |
+
+  For comparison, one CPU core runs about 77k steps/s.
+- **Parity with CPU MuJoCo:** at most 5e-7 rad on the arm joints over 300 steps, with matching contact counts. Grasp-level contact parity has **not been tested yet**.
+- **Zero-copy torch interop:** confirmed, via `wp.to_torch`.
+- **Pin to verify in the repo:** `mujoco 3.14.*` and `mujoco-warp 3.14.*` in both envs. The spike resolved torch 2.12 and numpy 2.5, but **lerobot 0.6.1 needs torch < 2.12 and numpy < 2.3**, so the repo pin must be `pytorch-gpu 2.11.*` (CUDA 12.x) with numpy 2.2. Re-run `test_sim_model.py` under mujoco 3.14 before adopting it.
+
 **S1: Batched servo-parity env.** A torch-batched goal env on MuJoCo Warp that reproduces the ServoCore tick semantics exactly:
 - 3 servo ticks per policy step;
 - the same clamp chain in tick units (delta clamp, joint limits, velocity cap, tracking-error clamp, box);
