@@ -1,10 +1,11 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.6 (2026-10-01). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.11 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
+> - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
 >
-> **Still interface-only:** the servo core and process (U3), the env (U8), and the RL and world-model code (U9).
+> **Still interface-only:** the env (U8), and the RL and world-model code (U9).
 > **Source of truth for decisions:** `so101-self-learning-rl-plan.md` §10 (decision log). This doc describes *how* the system is built; the plan describes *what* and *why*.
 > **Keeping it current:** every change that adds, removes or renames a module, a process, or a cross-process interface updates this file in the same commit. See §10 at the bottom of this file.
 
@@ -90,6 +91,20 @@ flowchart LR
 
 **When the policy is late:** the servo process holds the last target. After N consecutive misses it trips to the safe state.
 
+**The servo process as built (U3).**
+- **Entry point:** `python -m so101_rl.servo.main --backend {feetech,fake,mujoco} [--port] [--heartbeat-port] [--no-mcu] [--shm-name] [--require-rt] [--max-ticks N] [--tick-log PATH] [--summary PATH] [--calibration PATH] [--config PATH] [--arm-timeout-s S] [--fake-start {home,rest}]` (pixi tasks `servo`, `servo-fake`).
+  - `fake`: FakeBus powered up at home (`--fake-start rest`: at rest, so the boot re-energise ramps for a few seconds), plus an in-process FakeMcu that boots latched and a simulated operator who presses the reset button.
+  - `mujoco`: MujocoBus, limp at the `rest` keyframe, with the physics stepped in real time.
+  - `feetech`: the real arm. It refuses to start without a watchdog port unless `--no-mcu` is given explicitly.
+- **Start-up (as built, U3 review item 1):** RT setup → the single-instance locks (the shm segment, then every serial port the servo owns) → the bus and heartbeat factories → `build_servo_core`, which runs `validate_geometry` → open the bus port **without a handshake** (the servo side of the relay is unpowered before ARM) → BOOT, waiting for the physical button with no bus traffic (the operator message repeats every 10 s) → ARM closes the relay → ping until every motor answers → one good read, goal write and **ACKED** heartbeat, all within 0.8 s of ARM → `reenergize` → RUN. lerobot's `connect(handshake=True)` before ARM would fail on every real start; `FakeBus(power=FakeMcu.relay_closed)` models that, and the fake backend uses it.
+- **RT setup:** `mlockall` (only under an RLIMIT_MEMLOCK of at least 512 MB), `SCHED_FIFO` priority 50, and pinning to one CPU (`SO101_SERVO_CPU`, else the last CPU). It is best effort. `rt_active` = SCHED_FIFO and mlockall both worked. `--require-rt` or `REQUIRE_RT=1` turns a failure into exit code 3.
+- After start-up: `gc.collect(); gc.freeze(); gc.disable()`.
+- **Loop:** absolute deadlines (`deadline += period`). A tick that ends a full period or more past its *next* deadline (two periods after its own) skips to the next grid point (a resync, counted) instead of bursting. Overruns are counted in the state record and the tick log and reported on stderr at most once per second.
+- **Exits:** SIGINT, SIGTERM, SIGHUP (the ssh session closed) and SIGQUIT only set a flag; a running `reenergize` polls it once per tick (`should_abort`), and a thermal resume never starts after it. A stop before `set_torque(True)` never energises; a stop during the re-energise ramp hands over to the bounded safe-state sequence back to rest, heartbeat continuing (plan §10, 2026-10-02 "Stop during re-energise"). A **second** stop signal escalates (`ServoRunner.immediate`, passed as `ServoCore.start(immediate_stop=...)`): the next tick of any safe-state run (shutdown or hand-over) cuts torque in place. The summary records `stop_signals` and `immediate_stop`. `--max-ticks`, a signal and an exception all leave through `ServoCore.shutdown`. Exit codes: 0 normal, 1 exception (after the shutdown), 2 start-up failed (bad geometry, calibration mismatch, re-energise failed, MCU never armed), 3 RT required but unavailable, 4 another servo owns the shm segment.
+- **Single instance (review carry-forward C1, U3 review item 14):** `ServoShm.create` holds an exclusive `flock` on `/dev/shm/<name>.so101.lock` until `close()`, and `run(..., serial_ports=...)` holds a `SerialPortLock` on `/dev/shm/so101-serial<resolved path>.lock` for every serial port it owns (the feetech bus and the watchdog port; the device itself is never opened for the lock). A second servo gets `ServoAlreadyRunning` (exit 4), also when it uses another shm name or another alias of the same port. The kernel releases the locks when the owner dies, even by `kill -9`, so a crashed servo's stale segment is still replaced.
+- **Outputs:** a binary tick log (`servo.core.TICK_LOG_DTYPE`, one record per tick, written through `RingWriter`) and a JSON summary at exit.
+- **Soak:** `python -m so101_rl.servo.soak --backend B --minutes M` (pixi task `soak`; `soak-fake` adds `--backend fake` and the repository calibration) runs the servo as a child process plus a random-policy shm client, then writes `runs/soak-<ts>/report.json`. `check_soak_report(strict=rt_active)` is the Tier-1 gate: at least 30 minutes, p99.9 tick jitter below 5 ms, no heartbeat gap over 200 ms (the window's start and end count as gap endpoints), no HOLD entry, no thermal trip and no calibration mismatch. On a non-RT host the gate is advisory: failures become warnings. A run that is not a valid soak fails on any host: a nonzero servo exit, no summary, a safe-state entry while the policy drove it, less than 90 % of the requested minutes, or less than 90 % of the expected loop-tick samples or policy steps (an empty run never passes).
+
 ## 4. Module view (package layout)
 
 ```
@@ -109,10 +124,10 @@ rl-trainer/
 ├── docs/HARDWARE_CHECKLIST.md    # procedures for H1–H13, BOM, power-path wiring, results table
 ├── src/so101_rl/
 │   ├── config/                   # single source of truth: so101.yaml, schema.py, loader.py, so101_kinematics.yaml (FK chain, generated from the MJCF)
-│   ├── servo/                    # servo process (U3); bus backends:
-│   │                             #   feetech_bus.py: real STS3215
-│   │                             #   fake_bus.py: plant, thermal and fault injection
-│   │                             # heartbeat.py: MCU link + FakeMcu; timing; shm
+│   ├── servo/                    # core.py: ServoCore.tick / start / shutdown; process.py: RT runner, deadline loop, exit codes;
+│   │                             # main.py: so101-servo CLI; soak.py: soak harness + gate; latency.py: latency hooks;
+│   │                             # bus backends: feetech_bus.py (real STS3215), fake_bus.py (plant, thermal, fault injection);
+│   │                             # heartbeat.py: MCU link + FakeMcu; timing; shm (seqlock + single-instance lock)
 │   ├── safety/                   # clamp, fk (pure-numpy FK + box), transit (rest<->home transit-zone planner), config_check (safe-state geometry/time-bound validation), thermal, stuck, safe_state, reenergize,
 │   │                             # calib_check, state_machine, pipeline. Never imports rl, wm or env.
 │   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface)
@@ -147,6 +162,9 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 **Bus (U1).**
 - `FeetechBus.read_block` issues **one** 11-byte `GroupSyncRead` at address 56 (position, speed, load, voltage, temperature, the unused byte 64, Status 65, Moving 66). The firmware protection bits are therefore checked every tick.
 - On any communication error, `ok=False` and the arrays keep their previous values.
+- `connect()` opens the port **without** lerobot's handshake (U3 review item 1); `connect(handshake=True)` is for bench tools on an externally powered bus.
+- `write_goal` is an un-acked `sync_write`: True means *transmitted*, not received (U3 review item 13). The next block read is the evidence. FakeBus matches this: a dropped or unpowered motor never makes `write_goal` fail, only an injected transmit fault does, while the acked `set_torque` / `read_reg` / `write_reg` fail on a silent motor.
+- `FakeBus(power=callable, boot_ms=...)`: with `power=FakeMcu.relay_closed` the motors are silent while the relay is open (torque drops to off on power loss) and answer `boot_ms` after it closes.
 - `disconnect()` never touches torque.
 - `write_registers()` writes every F1 register, including the protection registers LeRobot never writes. It refuses to run while torque is on.
 - `Bus` is `@runtime_checkable`.
@@ -155,7 +173,10 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - `SafetyPipeline.apply` runs only in RUN. In every other state (HOLD, SAFE_STOPPING, TORQUE_OFF) the core must call `monitor_only(block, v)` every tick, so the thermal dwell keeps advancing.
 - Call `resync(present)` when `SmOutputs.resync_target` is set.
 - When `SmOutputs.reenergize_requested` is set, run `reenergize(..., tick_hook=hb)`. Then call `mark_energized()` if it succeeded, or `notify_reenergize_failed()` if it failed.
-- `reenergize(bus, cfg, calibration, clock, block, *, timeout_s=5.0, tick_hook=None, heartbeat_gap_s=0.8, fk=None)`.
+- `reenergize(bus, cfg, calibration, clock, block, *, timeout_s=5.0, tick_hook=None, heartbeat_gap_s=0.8, fk=None, should_abort=None, hand_over_on_abort=False)`.
+  - `should_abort()` is polled once per tick in every waiting loop and in the ramp; when true it raises `ReenergizeAborted` (U3 review item 7). Before `set_torque(True)` the arm is never energised (`torque_on=False`). During the ramp the default turns torque off first; with `hand_over_on_abort=True` (the servo core) torque is left on and `ReenergizeAborted.torque_on` is True: the caller must run the safe-state sequence at once (plan §10, 2026-10-02). Every other failure after torque-on still turns torque off.
+  - The core's hand-over: `SafeStateSequencer.run(..., tick_hook=<shutdown hook>)` from present (home, then rest, bounded by `bound_s`), then torque off; the re-energise then counts as failed (`notify_reenergize_failed`; at boot `StartupError`, exit 0 when a signal caused it).
+  - Escalation: in every safe-state run the shutdown hook checks `immediate_stop()` (a second stop signal) and the MCU's `last_status.latched` (relay open, e-stop) first; either raises `ImmediateStop` out of the sequencer and torque goes off on that tick.
   - It calls `tick_hook(ok)` once per servo tick, with ok = the read succeeded AND the write was accepted. The core sends the heartbeat only when ok is true.
   - With a hook, the first good tick and every later one must come within 0.8 s.
   - It raises `UnsafeStartPose` if the start pose is neither within `rest_tolerance_ticks` of rest nor inside the box.
@@ -163,7 +184,7 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - **Box tolerance:** BOX_PRESENT trips only when the present pose is more than `box.present_tolerance_m` (5 mm) outside the box. The commanded target is clamped to the exact box.
 - **Calibration check:** `calib_check` does not compare `drive_mode`, because no servo register holds it. A motion-sign test is needed instead, on the hardware track or in U3.
 - **In TORQUE_OFF** the core keeps writing goal = present and keeps sending the heartbeat. Otherwise the MCU would latch during the thermal dwell and the automatic resume would need a human.
-- **Further obligations on the servo core (U3)**, found in the 2026-10-01 verification review:
+- **Further obligations on the servo core (U3)**, found in the 2026-10-01 verification review, are implemented in `servo/core.py` and tested in `tests/test_servo_core.py`:
   - Reset `consecutive_misses` after `mark_energized()`.
   - Do not feed `McuStatus.latched` into the state machine until the button has been pressed and ARM has succeeded, because the MCU boots latched.
   - Send a heartbeat immediately before calling `reenergize`, because `heartbeat_gap_s` is measured from when it is entered.
@@ -180,6 +201,31 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
   - `bound_s` is at least the worst limit-to-home time plus the home-to-rest time plus 1 s. That is 15.33 s for the shipped calibration, and 19.23 s for a full 0..4095 range.
   - The loader itself checks only that `-0.2 m ≤ table_z_m < box.z[0]`.
   - The replay assumes the arm follows perfectly. At run time the time bounds end any stall with torque off.
+
+**Servo core (U3).**
+- **Construction:** `build_servo_core(cfg, calibration, bus, ipc, heartbeat, clock, *, chain=None, tick_log=None, log=None)` is the one place the safety stack is wired. It calls `validate_geometry` first. Use it: the `ServoCore` constructor validates nothing.
+- `ServoCore(cfg, bus, ipc, heartbeat, pipeline, sm, safe, clock, tick_log=None, *, calibration, fk, thermal, log=None)`. The keyword-only arguments extend F6, because `reenergize` needs the calibration and the FK, and the state machine needs `ThermalMonitor.may_resume()`.
+- **`tick()` order:**
+  1. `read_block`.
+  2. `read_cmd`, deduplicated by `seq`.
+  3. Outside RUN, `monitor_only` first. Then `sm.step`.
+  4. In RUN with `use_policy`: `resync`, then `new_command`, then `apply`. If `apply` reports a state-machine cause (anything except the TRACKING, JOINT_LIMIT and BOX clamps), the machine is stepped again on the same tick, so that target is never written.
+  5. The state's duty:
+     - RUN: `check_range`, then `write_goal`.
+     - HOLD: re-write the target latched on entry (the last RUN target).
+     - SAFE_STOPPING: `SafeStateSequencer.start` / `next`, then `notify_safe_done`.
+     - TORQUE_OFF, CHECK and BOOT: torque off, and goal = present.
+     - LATCHED: torque off, with **no goal write and no heartbeat**, so the MCU drops the relay too.
+  6. The heartbeat, only if the read succeeded and every write of the tick was accepted. `max_bus_failures` consecutive ticks with a good read but a refused write add BUS_FAIL to the next step (the state machine itself only counts failed reads), so a bus that reads but no longer writes latches even without an MCU.
+  7. `write_state` (every tick, in every state) and one tick-log record.
+- **Command timing:** a command's age is measured on the servo clock from when the servo received it. `consecutive_misses` = age // policy period. Both restart at `mark_energized()`.
+- **Heartbeat link (plan §10, 2026-10-02; U3 review items 2 and 5):** `HeartbeatLink.send(seq) -> HbSend` is tri-state: `NOT_DELIVERED` (write timeout, dead link: the core reuses the sequence number), `DELIVERED_NO_ECHO` (written, no acknowledging echo, or the echo reports the MCU not armed: the number is consumed, since repeating it would also latch) and `ACKED`. Links expose `last_status` (the MCU's last reported status). In normal running (RUN, HOLD, SAFE_STOPPING, TORQUE_OFF, CHECK) a send that is not ACKED is a miss; the core passes `SmInputs.hb_misses` (consecutive misses) and, after ARM only, `SmInputs.mcu = last_status`. The machine latches after `HB_MISS_BUDGET` = 5 consecutive misses (about 150 ms, HEARTBEAT_FAIL) or at once when the MCU reports latched (DEADMAN). Re-energise stays strict: the heartbeat right before it and every heartbeat inside it must be ACKED, one miss aborts it (`HeartbeatLost`, torque off), and then `hb_ok = False` latches. The shutdown ramp is lenient: misses do not stop it.
+- **Thermal resume:** on `reenergize_requested` the core runs the full `reenergize` right after that tick's heartbeat, but only if it was ACKED and no stop was requested (STOP_REQ or the runner's flag). Otherwise it retries on the next CHECK tick.
+- **Commands (U3 review item 8):** only a RUN-mode command is fresh for the state machine, so an IDLE or HOLD command never turns HOLD into RUN. A RUN delta that arrives on a tick without `use_policy` (failed read) stays pending until the next tick that applies it; a newer command replaces it; any stop drops it. After every `mark_energized()` the command block is drained, so a command written while waiting for ARM (or during the dwell) is not fresh on the first RUN tick (a STOP_REQ in it still counts).
+- **`tick()` returns the same preallocated `TickResult` every call.** A `tracemalloc` test shows no net allocation in `servo/core.py`, `safety/` and `servo/shm.py` over 1000 RUN ticks after warm-up.
+- **State record:** `present_ticks` is read at the start of tick *k*, and `target_ticks` is written in tick *k*. `read_ok` = this tick's block read succeeded; when it is 0, `present_ticks` … `moving` repeat the last good reading (boot-wait records always have `read_ok = 0`). `applied_delta_ticks` and `clamped_mask` are zero on every tick where `pipeline.apply` did not run (HOLD, SAFE_STOPPING, TORQUE_OFF, …). `fault_bits` = the state-machine faults plus this tick's non-clamp trips. `hb_ok` = a heartbeat was sent and ACKED this tick. `servo.core.log_row(last record of step i, first record of step i+1)` produces the F8 row that satisfies the log convention below.
+- **Tick log:** one record per tick, including the re-energise and shutdown ticks. It holds the jitter, duration, state, ok/wrote/hb flags, trips, present, target, temperatures, `obs_to_cmd_ns` (state publish → command apply) and `cmd_age_ns` (policy write → servo receipt). `servo.latency.measure_obs_to_cmd` summarises it.
+- `FakeBus(record_writes=False)` turns off the `written_goals` / `torque_events` intercepts for long runs.
 
 **Sim (U4).**
 - `load_model()` compiles `so101_rl_scene.xml` through `MjSpec`. It adds primitive jaw box geoms and a `gripper_tip` site, and disables collisions on the jaw meshes.
@@ -205,7 +251,7 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 
 **Log convention (binding for U3).** `present_ticks[i]` is the reading taken **after** `target_ticks[i]` was applied for one policy step, which is `servo_hz / policy_hz` servo ticks. `sim.compare_real` depends on this.
 
-F3 originally asserted `STATE_DTYPE.itemsize == 192`; the listed fields need 232 bytes with natural alignment, and the plan now says 232. The state block stride is 256 B (64-byte aligned) and the shm segment is 384 B (`servo/shm.py`).
+F3 originally asserted `STATE_DTYPE.itemsize == 192`; the listed fields need 232 bytes with natural alignment, and the plan now says 232. The state block stride is 256 B (64-byte aligned) and the shm segment is 384 B (`servo/shm.py`). Layout version 2 (2026-10-02, plan §10) adds `read_ok` (u1) at offset 225, directly after `hb_ok`, in what was alignment padding: the size, the stride and every other offset are unchanged, and `attach` refuses a version-1 segment.
 
 Tick/angle conversion: `ticks_to_rad` / `rad_to_ticks` (`config/schema.py`) do **not** apply `homing_offset`. The STS3215 firmware applies the homing offset itself, so `Present_Position` and `Goal_Position` are already in the homed frame (mid-range of motion reads about 2047 for the arm joints). The calibration `homing_offset` is only read back and compared at connect (`CalibrationMismatch`, plan 2.4); `drive_mode` selects the sign. The gripper is not mid-range-centred; its 0-100 % mapping lives in `sim/` and uses the calibration `range_min/max`.
 
@@ -231,6 +277,7 @@ These are ordered from the outermost layer to the innermost.
 2. **Deadman.**
    - The servo process pulses the heartbeat each tick, but only after a successful read and write.
    - The MCU opens the relay if the pulses stop for 1 s.
+   - The host latches the state machine after 5 consecutive unacknowledged heartbeats, or as soon as the MCU reports itself latched (plan §10, 2026-10-02). During re-energise one miss aborts.
    - **Wire protocol (F4):**
      - Commands: ARM `0x5A`; HEARTBEAT `0xA5 seq ~seq`; STATUS_REQ `0xE0`; TEST_DROP `0xE1`.
      - Each complete frame gets one status byte back: bit0 relay, bit1 latched, bit2 armed, bit3 undervolt, bits4–7 reason.
@@ -249,12 +296,15 @@ These are ordered from the outermost layer to the innermost.
        | 6 | MCU_RESET |
        | 7 | WELD |
      - A partial heartbeat frame is dropped after 100 ms.
+     - **Host side** (`SerialHeartbeatLink`):
+       - A heartbeat counts as delivered only once all 3 bytes are out. A partial write returns NOT_DELIVERED, and the next send with the same seq completes the tail.
+       - A tail older than 80 ms is dropped, never sent. The link writes nothing until 120 ms after the last byte, so a stale tail can't be read as commands (for example seq 0x5A as ARM).
      - The spec is `firmware/watchdog_mcu/PROTOCOL.md`. `FakeMcu` is kept byte-identical to the firmware `Core` by replaying every test vector through both.
    - **Voltage sensing (two dividers):**
      - The PSU-side divider sits before the e-stop and relay (GP26). It gates ARM on undervoltage.
      - The servo-side divider sits after the relay (GP27). It is used for drop timing, and for a "bus dead" check before ARM.
      - It also detects a welded relay: if the relay is commanded open but the servo side reads at least 1 V for 500 ms, the MCU latches with reason 7 (WELD).
-   - **Host link:** `SerialHeartbeatLink.send` never raises. Any serial failure, such as a USB unplug, returns False and sets `dead`. A refused TEST_DROP raises `TestDropRefused` immediately.
+   - **Host link:** `SerialHeartbeatLink.send` never raises and returns an `HbSend`. A write timeout is `NOT_DELIVERED` (the sequence number is reused); any other serial failure, such as a USB unplug, is `NOT_DELIVERED` and sets `dead`. A missing echo, or one that reports the MCU not armed or latched, is `DELIVERED_NO_ECHO`. A refused TEST_DROP raises `TestDropRefused` immediately.
    - **Latching:**
      - Trips latch in the MCU. Only the physical reset button, held for 500 ms and not while the e-stop is asserted, clears them. Serial never can.
      - The e-stop input is wired through an NC contact, so a broken wire reads as asserted.
@@ -271,7 +321,7 @@ These are ordered from the outermost layer to the innermost.
       - A temperature reading older than 1 s, or a raw value of 0 or 255, is also a trip.
    5. The firmware protection bits: any non-zero `Status` is a trip.
    6. The stuck-action monitor.
-   7. `check_range` (integer dtype, 0..4095), always the last call before `write_goal`.
+   7. `check_range` (integer dtype, 0..4095) as the pipeline's last step. The servo core repeats it immediately before every `write_goal`, including the safe-state targets. A target that fails it is never written, and the RANGE trip stops the arm on the same tick. A limit above 4095 is caught there too (`tests/test_action_units.py`, Test 3).
 
    Clamps (TRACKING, JOINT_LIMIT, BOX) never change the state-machine state.
 4. **Safe-state sequence, bounded by `bound_s` (20 s).**
@@ -284,7 +334,8 @@ These are ordered from the outermost layer to the innermost.
    - If it cannot finish, it falls back to torque-off in place, then to the deadman.
    - The heartbeat continues through `tick_hook`.
    - A refused torque-off (3 attempts) raises.
-   - All process exits go through it.
+   - All process exits go through it, and so does a stop during the re-energise ramp (plan §10, 2026-10-02).
+   - Escalation: a second stop signal, or the MCU reporting latched (e-stop, relay open), cuts torque in place on the next tick.
 5. **Resume policy, by cause.**
 
    | Cause | State path | Resume |
@@ -292,10 +343,11 @@ These are ordered from the outermost layer to the innermost.
    | Thermal | RUN/HOLD → SAFE_STOPPING (to rest) → TORQUE_OFF → after the dwell → CHECK (`reenergize_requested`) → full `reenergize` → RUN (resync on a good read). It never holds pose energised; COOLDOWN is unused (decided 2026-10-01). | Automatic, at most 3 per hour, counted by the state machine. A 4th trip, or a failed re-energise, needs a human. |
    | NaN, stuck action, OOD, RANGE, BOX_PRESENT, N stale commands | → SAFE_STOPPING → TORQUE_OFF | A fresh process and a checkpoint |
    | Protection bit, calibration mismatch, user stop | → SAFE_STOPPING → TORQUE_OFF | A human |
-   | Heartbeat failure, MCU latched, deadman, 3 consecutive bus failures | → LATCHED (absorbing) | A human and a physical reset |
+   | Heartbeat failure (5 consecutive missed acks in normal running; 1 during re-energise), MCU latched, deadman, 3 consecutive bus failures | → LATCHED (absorbing) | A human and a physical reset |
 
    - Every resume requires `block_ok`.
    - LATCHED and TORQUE_OFF send torque-off every tick.
+   - TORQUE_OFF keeps writing goal = present and sending the heartbeat. LATCHED does neither, so the MCU also opens the relay.
 
    **Re-energise order** (`safety/reenergize.py`):
    1. `ping_all`
@@ -307,24 +359,31 @@ These are ordered from the outermost layer to the innermost.
    7. `set_torque(True)`
    8. ramp home through the transit zone, re-checking temperatures on every read
 
-   Any failure after torque is on turns torque off (3 attempts), then re-raises.
+   Any failure after torque is on turns torque off (3 attempts), then re-raises. The exception is a stop during step 8: the servo core hands over to the safe-state sequence (layer 4) instead, so the arm is ramped to rest rather than dropped. A stop before step 7 never energises.
 6. **Autonomy tiers.**
    - Tier 0 is attended.
    - Tier 1 is unattended, and is allowed only after the soak gates pass: 30 minutes, then 2 hours goal-directed, with p99.9 tick overrun below 5 ms.
 
 ## 7. Data and learning flow (Stage A)
 
+**Sim-first** (plan §10, 2026-10-05; plan §5 "Sim-first track"). Status: *planned*, not yet implemented.
+
 ```
-goal babbling ──► episode logger ──► replay buffer (RAM; ≤300k pixel steps)
-                                         │
-             state WM  ◄─────────────────┤
-             SAC+HER (SB3 HerReplayBuffer)◄┤   ← first on real arm
-             TD-MPC2+HER (vendored, relabel in _prepare_batch) ◄┘
-                                         │
-                   MuJoCo reach ≥90% gate before any real-arm episode
+ SIM (RTX 3080, MuJoCo Warp, 1024–2048 envs)                REAL ARM (ServoCore)
+ ┌───────────────────────────────────────────┐            ┌──────────────────────────┐
+ │ batched servo-parity env (S1)              │            │ zero-shot eval (N eps)   │
+ │  same tick rules: 3 ticks/step, clamps,    │  policy    │        │                 │
+ │  delay FIFO, applied action, sim tracker   │──────────► │ SAC+HER fine-tune (real) │
+ │ massively parallel SAC, privileged critic  │            │ TD-MPC2+HER fine-tune    │
+ │ DR centred on sysid fit (S2/S3)            │  rollouts  │  (WM + critic pre-trained│
+ │ exit gate ≥95 % over 1000 DR episodes      │──────────► │   offline from sim logs) │
+ └───────────────────────────────────────────┘            └──────────────────────────┘
+           ▲ sysid fit (CMA-ES / Optuna, parallel worlds)          │ real logs
+           └───────────────── compare-real ≤5 % RMS ◄──────────────┘
 ```
 
-**Sysid** fitting is a parallel track. Phase 0 only *checks* the error: `pixi run compare-real` must stay within 5 % RMS of each joint's range.
+- **Parity rule:** the batched sim env must reproduce `ServoCore` + `MujocoBus` exactly. A parity test requires identical goal sequences for the same actions.
+- **Sysid is a gate (S2), not a parallel track.** `pixi run compare-real` checks the error, and the fitted parameters become the centre of the domain randomisation.
 
 - **Reward and success** come from the object table and FK, never from pixels.
 - **The pixel world model** is a parallel track, with a fused RGB-conv and state-MLP encoder feeding SimNorm. It may drive MPPI on the real arm only after it passes the cross-session gate: a different day, under different lighting.
@@ -334,7 +393,7 @@ goal babbling ──► episode logger ──► replay buffer (RAM; ≤300k pix
 | Pixi feature | Contents | Used by |
 |---|---|---|
 | core (default deps) | python 3.12, numpy 2.2, conda `pytorch` + torchvision (variant chosen by `gpu`/`cpu`), lerobot[feetech,grpcio-dep] 0.6.1 (PyPI), gymnasium, h5py, pyyaml, pytest, hypothesis, ruff | servo, safety, env |
-| `sim` | mujoco-python (conda-forge) | sim, tests |
+| `sim` | mujoco-python (conda-forge). **Planned:** `mujoco-warp` and `warp-lang`, with **one MuJoCo version pinned across `cpu` and `default`**. On 2026-10-05 `cpu` had mujoco 3.13 while `default` had 3.3.2. | sim, tests, GPU pre-training (`default` env) |
 | `perception` | opencv (conda-forge), pyrealsense2 (PyPI) | perception |
 | `train` | torchrl, tensordict, stable-baselines3, hydra-core, omegaconf, termcolor, pandas (PyPI) | rl, wm |
 | `gpu` | `pytorch-gpu`, `cuda-version` 12.8 (re-pin to the driver's CUDA after H1) | training on the RTX 3080 |
@@ -348,7 +407,7 @@ goal babbling ──► episode logger ──► replay buffer (RAM; ≤300k pix
 
 - **Channels:** only conda-forge for torch and CUDA, and PyPI for lerobot, pyrealsense2 and the train stack. There is exactly one torch, the conda `pytorch` (`tests/test_env_sanity.py` enforces it).
 - **Solver pins** (so pixi's PyPI resolver accepts lerobot 0.6.1 on top of the conda solve): `setuptools<82`, `packaging<26`, `opencv<4.14`, `gymnasium<1.3`; `[tool.pixi.system-requirements] cuda = "12"` lets the `default` environment lock without a driver; `PYTHONNOUSERSITE=1` is set on activation so `~/.local` packages never leak in. Solved versions are recorded in `README.md`.
-- **Tasks:** every entry point is a `pixi run` task: `test`, `test-hw`, `lint`, `ci`, `smoke-tdmpc2`, `fetch-assets`, `extract-kinematics`, `servo`, `servo-fake`, `soak`, `calib-check`, `hand-eye` (runs `perception.calibrate_hand_eye`), `compare-real`, `random-policy-sim`, `random-policy-real`, `train-reach-sac`, `train-reach-tdmpc2`, `train-wm-state`, `check-milestone`. Tasks whose module a later unit creates fail until that unit lands.
+- **Tasks:** every entry point is a `pixi run` task: `test`, `test-hw`, `lint`, `ci`, `smoke-tdmpc2`, `fetch-assets`, `extract-kinematics`, `servo`, `servo-fake`, `soak`, `soak-fake`, `calib-check`, `hand-eye` (runs `perception.calibrate_hand_eye`), `compare-real`, `random-policy-sim`, `random-policy-real`, `train-reach-sac`, `train-reach-tdmpc2`, `train-wm-state`, `check-milestone`. Tasks whose module a later unit creates fail until that unit lands. `servo-fake` and `soak-fake` pass `--calibration tests/data/so101_follower.calib.json` (the repository copy of the arm's calibration), so the fake runs are reproducible on any host.
 
 The vendored TD-MPC2 tree is generated by `scripts/vendor_tdmpc2.py`. The upstream tarball cache is verified against the recorded `tarball_sha256` on every read, and `scripts/vendor_tdmpc2.manifest.json` records the sha256 of every vendored file so hand-edits fail an offline test.
 
@@ -359,7 +418,7 @@ The full log is in plan §10. The decisions that shape this architecture are:
 - pure Python, with no ROS2;
 - a separate real-time servo process;
 - clamped joint deltas at 10 Hz;
-- MuJoCo with the official MJCF;
+- MuJoCo with the official MJCF. **GPU sim-first pre-training with MuJoCo Warp** (2026-10-05) trains SAC at scale in sim, then fine-tunes on the real arm;
 - TD-MPC2 vendored, with a SAC + HER baseline run first;
 - a colour + depth tracker in Stage A;
 - a pixel world model, off the critical path;
@@ -386,3 +445,8 @@ Bump the version line at the top and add an entry below.
 | 0.4 | 2026-09-30 | Wave 1 integrated (U1, U2, U4, U5, U6, U7): the servo backends and heartbeat link, the safety layer, the MuJoCo backend, Stage A perception, episode logging, and the watchdog firmware with its hardware checklist (§4). Interface behaviour and the binding log convention (§5). The F4 wire protocol and latch semantics, the implemented check order, and the resume state paths (§6). The sysid check (§7). The `hand-eye` task fixed and `compare-real` added (§8). |
 | 0.5 | 2026-10-01 | Wave-1 review fixes (`plans/reviews/2026-09-30-wave1-review.md`). §4: `safety/transit.py`. §5: the `reenergize` and sequencer signatures, `tick_hook`, the TORQUE_OFF duties, the measured rest pose and in-box home, the loader geometry and time-bound checks, the box tolerance, live MujocoBus registers with a de-energised start. §6: the MCU boots latched, the two voltage dividers and weld detection, the never-raising host link, the 20 s safe-state bound and transit zone, thermal → rest → torque off → re-energise, and the hardened re-energise order. |
 | 0.6 | 2026-10-01 | Verification-review follow-ups. §4: `safety/config_check.py`. §5: the safe-state geometry and time-bound checks move from the `config` loader to `safety.config_check.validate_geometry`, restoring the dependency direction; U3 must call it. The bound is 15.33 s for the shipped calibration. Further U3 obligations are recorded: reset the miss counter, handle the boot latch, send a heartbeat before re-energise. The re-energise timing risk is noted. |
+| 0.7 | 2026-10-01 | Wave 2 (U3). §3: the servo process as built: CLI and backends, start-up order, RT setup and `rt_active`, the deadline loop with resync, signals and exit codes, the single-instance shm lock, the tick log and summary, and the soak harness and gate. §4: `servo/core.py`, `process.py`, `main.py`, `soak.py`, `latency.py`. §5: the servo core: `build_servo_core`, the keyword-only extension of the F6 `ServoCore` signature, the tick order and per-state duties, command timing, heartbeat and boot-latch handling, the thermal resume, the state-record semantics with `log_row`, the tick log, and `FakeBus(record_writes=False)`. §6: the core repeats `check_range` before every write, and LATCHED sends no heartbeat. §8: `servo-fake` uses the repository copy of the calibration. |
+| 0.8 | 2026-10-02 | U3 review fixes (`plans/reviews/2026-10-01-u3-review.md`) and the 2026-10-02 plan §10 decisions. §3: the real-arm start order (port without handshake → button + ARM → ping → re-energise), the serial-port locks, SIGHUP/SIGQUIT and the re-energise abort, the overrun wording, the soak gate's validity checks, gap endpoints and HOLD count, the `soak-fake` task. §5: `Bus.connect` without handshake and `write_goal` = transmitted, `FakeBus(power=, boot_ms=)`, `reenergize(should_abort=)` / `ReenergizeAborted`, the tri-state `HeartbeatLink.send -> HbSend` with `last_status`, `SmInputs.hb_misses` and the 5-miss budget (re-energise strict), command freshness / pending delta / drain, the state record's `read_ok` (F3 layout v2) and zeroed applied delta. §6: the host-side miss budget and the LATCHED row. §8: `soak-fake`. |
+| 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
+| 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
+| 0.11 | 2026-10-05 | U3 verification follow-ups. §6: host-side heartbeat partial-frame rule (delivered only when the frame is complete; stale tails over 80 ms dropped). New tests cover the strict re-energise heartbeat on a lost or latched echo, and the abort check just before torque-on. |

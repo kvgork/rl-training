@@ -250,3 +250,13 @@ def test_24h_soak_on_fake_clock_is_fast():
         clock.advance(33_333_333)
         bus.read_block(out)
     assert out.ok
+
+
+def test_record_writes_false_keeps_the_intercepts_empty(fake_clock):
+    """Long soaks run FakeBus with record_writes=False so written_goals / torque_events do not grow."""
+    bus = FakeBus(fake_clock, record_writes=False)
+    bus.connect()
+    assert bus.set_torque(True)
+    assert bus.write_goal(np.full(6, 2047, dtype=np.int32))
+    assert bus.written_goals == [] and bus.written_goal_t_ns == [] and bus.torque_events == []
+    assert bus.read_reg("Goal_Position", 1) == 2047  # the write itself still happened

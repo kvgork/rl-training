@@ -21,6 +21,10 @@ servo-side bus that stays live 500 ms after the relay is commanded open latches 
 
 from __future__ import annotations
 
+import os
+import select
+import time
+from enum import IntEnum
 from typing import NamedTuple, Protocol
 
 from so101_rl.servo.timing import Clock
@@ -85,11 +89,32 @@ class TestDropRefused(RuntimeError):
         self.status = status
 
 
+class HbSend(IntEnum):
+    """Result of :meth:`HeartbeatLink.send` (U3 review item 2).
+
+    * ``NOT_DELIVERED``: the frame never left the host (write timeout, dead link). The MCU saw nothing, so the
+      caller must NOT advance its sequence number: the next heartbeat reuses it (a gap would latch SEQ_ERROR).
+    * ``DELIVERED_NO_ECHO``: the frame was written, but no acknowledging echo came back (echo lost or late, or
+      the echo reports the MCU not armed / latched: see ``last_status``). The MCU may have counted it, so the
+      sequence DOES advance (repeating a sequence number also latches SEQ_ERROR).
+    * ``ACKED``: written and acknowledged by an armed, unlatched MCU.
+
+    The values are chosen so that a legacy ``bool`` compares sensibly: ``True == ACKED`` and
+    ``False == NOT_DELIVERED``.
+    """
+
+    NOT_DELIVERED = 0
+    ACKED = 1
+    DELIVERED_NO_ECHO = 2
+
+
 class HeartbeatLink(Protocol):
+    last_status: McuStatus | None  # the most recent status byte the MCU sent (any echo / reply); None = none yet
+
     def arm(self) -> McuStatus: ...
 
-    def send(self, seq: int) -> bool:
-        """Non-blocking and never raises; False on write timeout, bad/missing echo or a dead link (USB unplugged)."""
+    def send(self, seq: int) -> HbSend:
+        """Non-blocking and never raises; see :class:`HbSend` for the three outcomes."""
 
     def status(self) -> McuStatus: ...
 
@@ -202,6 +227,12 @@ class FakeMcu:
             self._last_seq = None
             self._poll()  # a still-live servo side re-latches WELD once its 500 ms window has run
 
+    def relay_closed(self) -> bool:
+        """Relay state at ``clock.monotonic_ns()`` (runs the firmware loop first). Power source for
+        ``FakeBus(power=...)``: the servo side is live only while the relay is closed."""
+        self._poll()
+        return self.relay_on
+
     def power_cycle(self) -> None:
         """MCU reset (power, hardware WDT, USB re-enumeration): boots LATCHED, reason MCU_RESET, relay open."""
         self._boot()
@@ -302,10 +333,16 @@ class FakeHeartbeatLink:
     def __init__(self, mcu: FakeMcu) -> None:
         self.mcu = mcu
         self._drop_writes = 0
+        self._drop_echoes = 0
+        self.last_status: McuStatus | None = None
 
     def fail_writes(self, n: int = 1) -> None:
-        """The next ``n`` sends behave like a write timeout: nothing reaches the MCU, ``send`` returns False."""
+        """The next ``n`` sends behave like a write timeout: nothing reaches the MCU (``NOT_DELIVERED``)."""
         self._drop_writes += n
+
+    def drop_echoes(self, n: int = 1) -> None:
+        """The next ``n`` sends reach the MCU but their echo is lost (``DELIVERED_NO_ECHO``)."""
+        self._drop_echoes += n
 
     def unplug(self) -> None:
         """USB cable pulled: every later ``send`` returns False and ``dead`` is True."""
@@ -313,22 +350,27 @@ class FakeHeartbeatLink:
 
     def arm(self) -> McuStatus:
         reply = self.mcu.feed(bytes([CMD_ARM]))
-        return McuStatus.from_byte(reply[-1])
+        self.last_status = McuStatus.from_byte(reply[-1])
+        return self.last_status
 
-    def send(self, seq: int) -> bool:
+    def send(self, seq: int) -> HbSend:
         if self.dead:
-            return False
+            return HbSend.NOT_DELIVERED
         if self._drop_writes > 0:
             self._drop_writes -= 1
-            return False
+            return HbSend.NOT_DELIVERED
         reply = self.mcu.feed(bytes([CMD_HEARTBEAT, seq & 0xFF, ~seq & 0xFF]))
+        if self._drop_echoes > 0:
+            self._drop_echoes -= 1
+            return HbSend.DELIVERED_NO_ECHO
         if not reply:
-            return False
-        s = McuStatus.from_byte(reply[-1])
-        return s.armed and not s.latched
+            return HbSend.DELIVERED_NO_ECHO
+        s = self.last_status = McuStatus.from_byte(reply[-1])
+        return HbSend.ACKED if s.armed and not s.latched else HbSend.DELIVERED_NO_ECHO
 
     def status(self) -> McuStatus:
-        return McuStatus.from_byte(self.mcu.feed(bytes([CMD_STATUS_REQ]))[-1])
+        self.last_status = McuStatus.from_byte(self.mcu.feed(bytes([CMD_STATUS_REQ]))[-1])
+        return self.last_status
 
     def test_drop(self) -> int:
         """Waits (on the fake clock) for the servo-side bus to fall, like the real link; raises at once on refusal."""
@@ -350,12 +392,41 @@ class FakeHeartbeatLink:
 class SerialHeartbeatLink:
     """pyserial link. ``send`` never blocks or raises: it writes (<= ``write_timeout_s``) and drains the echo.
 
-    The echo of heartbeat *k* is normally there before heartbeat *k+1*; if the previous one is still unacknowledged
-    when the next is sent (or the write times out, or the echo says LATCHED / not armed), ``send`` returns False.
-    Any other serial failure (USB unplugged: ``SerialException`` / ``OSError``, a closed port, ...) marks the link
-    :attr:`dead`: ``send`` returns False from then on without touching the port. There is no auto-reconnect: the
-    MCU would time out and latch long before, so recovery is a new process plus the physical button.
+    The echo of heartbeat *k* is normally there before heartbeat *k+1*, so ``ACKED`` here means "written, and the
+    previous heartbeat was acknowledged by an armed, unlatched MCU" (one heartbeat behind). A previous heartbeat
+    still unacknowledged, or an echo that says LATCHED / not armed, gives ``DELIVERED_NO_ECHO``; a write timeout
+    gives ``NOT_DELIVERED``. Any other serial failure (USB unplugged: ``SerialException`` / ``OSError``, a closed
+    port, ...) marks the link :attr:`dead`: ``send`` returns ``NOT_DELIVERED`` from then on without touching the
+    port. There is no auto-reconnect: the MCU would time out and latch long before, so recovery is a new process
+    plus the physical button.
+
+    Delivery is decided from the bytes the kernel accepted, NOT from pyserial's ``SerialTimeoutException``:
+    pyserial raises that also AFTER ``os.write`` took the whole frame (when ``write_timeout`` expired while the
+    thread was preempted, or the fd was not writable again in time). Treating that as "not delivered" would reuse
+    the sequence number of a frame the MCU did receive and latch it with SEQ_ERROR. So with a real pyserial port
+    the frame goes through non-blocking ``os.write`` on its fd (at most ``write_timeout_s`` of waiting for
+    writability): 0 bytes accepted = ``NOT_DELIVERED``.
+
+    **Partial writes** (practically impossible for 3 bytes on an empty USB-CDC buffer; U3 verification N2). The MCU
+    counts a heartbeat only when its third byte arrives, and it discards a frame head that gets no further byte
+    within ``PARTIAL_FRAME_MS`` (100 ms, ``firmware/watchdog_mcu/PROTOCOL.md`` "Partial frames"); bytes after that
+    are line noise, and a heartbeat tail ``seq ~seq`` read as noise can be a command (``0x5A`` ARM, ``0xA5`` a new
+    head, ``0xE1`` TEST_DROP). So a frame counts as delivered only once all 3 bytes were accepted:
+
+    * a partial write returns ``NOT_DELIVERED`` (the MCU has not counted it, the caller reuses the number) and keeps
+      the unsent tail with its age;
+    * on the next ``send`` a tail whose last written byte is younger than ``_TAIL_MAX_AGE_S`` (80 ms, 20 ms under
+      the MCU window, which restarts on every byte) is written first. Once it is complete the kept frame is delivered: if the caller asks for the same number again (the
+      normal case after ``NOT_DELIVERED``) nothing more is written and the result is that of a delivered frame;
+      a different number is written after it as a new frame;
+    * an older tail is DROPPED, never sent. The MCU never counted that frame, so ``NOT_DELIVERED`` stays true for
+      it. Until ``_HEAD_EXPIRY_S`` (120 ms) after its last written byte nothing is written at all and ``send``
+      returns ``NOT_DELIVERED``: a new frame would otherwise complete the stale head the MCU may still hold and
+      latch it with SEQ_ERROR. After that the requested frame is written normally.
     """
+
+    _TAIL_MAX_AGE_S = 0.08  # a tail older than this is dropped, not sent (the MCU window is PARTIAL_FRAME_MS)
+    _HEAD_EXPIRY_S = (PARTIAL_FRAME_MS + 20) / 1000  # after a dropped tail: write nothing until the MCU dropped the head
 
     _REPLY_WAIT_S = 0.1
     _DROP_WAIT_S = 2.5  # the MCU reports at most 2000 ms
@@ -365,14 +436,49 @@ class SerialHeartbeatLink:
 
         self._serial_mod = serial
         self._ser = serial.Serial(port, 115200, timeout=0, write_timeout=write_timeout_s)
+        self._write_timeout_s = write_timeout_s
+        self._tail = b""  # unsent rest of a partially written heartbeat frame
+        self._tail_seq = 0  # sequence number of that frame
+        self._tail_ns = 0  # when its last byte was written (``clock``)
+        self._quiet_until_ns = 0  # after a dropped tail: no byte before this (the MCU still holds the stale head)
         self._clock = clock
         self._pending = 0
         self._last_status: McuStatus | None = None
         self.dead = False
         self.last_error: BaseException | None = None
 
+    @property
+    def last_status(self) -> McuStatus | None:
+        return self._last_status
+
     def close(self) -> None:
         self._ser.close()
+
+    def _write_frame(self, frame: bytes) -> int:
+        """Bytes of ``frame`` the OS accepted (0..3); waits at most ``write_timeout_s`` for writability.
+
+        Uses the pyserial fd directly (non-blocking ``os.write``) when there is one. Test doubles without an int
+        ``fd`` go through ``write()``, where a ``SerialTimeoutException`` means "nothing written"."""
+        fd = getattr(self._ser, "fd", None)
+        if not isinstance(fd, int):
+            try:
+                self._ser.write(frame)
+            except self._serial_mod.SerialTimeoutException:
+                return 0
+            return len(frame)
+        written = 0
+        deadline = time.monotonic() + self._write_timeout_s
+        while written < len(frame):
+            try:
+                written += os.write(fd, frame[written:])
+                continue
+            except (BlockingIOError, InterruptedError):
+                pass
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            select.select([], [fd], [], left)
+        return written
 
     def _drain(self) -> None:
         n = self._ser.in_waiting
@@ -406,25 +512,44 @@ class SerialHeartbeatLink:
         self._last_status = McuStatus.from_byte(self._read_exact(1, self._REPLY_WAIT_S)[0])
         return self._last_status
 
-    def send(self, seq: int) -> bool:
+    def send(self, seq: int) -> HbSend:
         if self.dead:
-            return False
+            return HbSend.NOT_DELIVERED
         try:
             self._drain()
             acked_previous = self._pending == 0
-            try:
-                self._ser.write(bytes([CMD_HEARTBEAT, seq & 0xFF, ~seq & 0xFF]))
-            except self._serial_mod.SerialTimeoutException:
-                return False  # transient: a missed heartbeat, the link may recover
+            now = self._clock.monotonic_ns()
+            completed = None  # sequence number of a kept frame completed by this call
+            if self._tail and now - self._tail_ns >= int(self._TAIL_MAX_AGE_S * 1e9):
+                # too old: the MCU drops (or already dropped) the head; sent now, the tail would be read as commands
+                self._tail = b""
+                self._quiet_until_ns = self._tail_ns + int(self._HEAD_EXPIRY_S * 1e9)
+            if now < self._quiet_until_ns:
+                return HbSend.NOT_DELIVERED  # the stale head may still be buffered in the MCU: write nothing
+            if self._tail:  # finish the previous, partially written frame first
+                n = self._write_frame(self._tail)
+                self._tail = self._tail[n:]
+                if n:
+                    self._tail_ns = now  # the MCU's partial-frame timer restarts on every byte
+                if self._tail:
+                    return HbSend.NOT_DELIVERED  # still incomplete: the MCU has counted nothing
+                completed = self._tail_seq
+            if completed is None or completed != seq & 0xFF:
+                frame = bytes([CMD_HEARTBEAT, seq & 0xFF, ~seq & 0xFF])
+                n = self._write_frame(frame)
+                if n < len(frame):
+                    if n > 0:  # head written: keep the tail; the frame is delivered only once it is complete
+                        self._tail, self._tail_seq, self._tail_ns = frame[n:], seq & 0xFF, now
+                    return HbSend.NOT_DELIVERED  # not complete, so not counted (0 bytes: transient, may recover)
         except Exception as exc:  # noqa: BLE001 - the tick path must never raise: unplug, closed port, termios error
             self.dead, self.last_error = True, exc
-            return False
+            return HbSend.NOT_DELIVERED
         # A lost echo is forgotten (pending=1) so one missed heartbeat does not poison every later one.
         self._pending = 1 if not acked_previous else self._pending + 1
         if not acked_previous:
-            return False
+            return HbSend.DELIVERED_NO_ECHO
         st = self._last_status
-        return st is None or (st.armed and not st.latched)
+        return HbSend.ACKED if st is None or (st.armed and not st.latched) else HbSend.DELIVERED_NO_ECHO
 
     def status(self) -> McuStatus:
         self._flush_input()

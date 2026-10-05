@@ -4,9 +4,21 @@
 integrated lazily: every bus call first advances the physical state to ``clock.monotonic_ns()``, so a
 ``FakeClock`` makes a 24 h soak run in seconds and results do not depend on wall time.
 
-Failure semantics mirror the real bus: an injected read failure returns ``False``, sets ``out.ok = False`` and
-leaves every array untouched (never zeros); ``write_goal`` is an un-acked sync write, so a dropped motor does not
-make it fail - only an injected write failure does.
+Failure semantics mirror the real bus (U3 review item 13):
+
+* an injected read failure returns ``False``, sets ``out.ok = False`` and leaves every array untouched (never zeros);
+* ``write_goal`` is an un-acked sync write: ``True`` means TRANSMITTED, exactly like ``FeetechBus`` (lerobot's
+  ``sync_write`` only reports a port/transmit error). A dropped motor or an unpowered servo side does not make it
+  fail; only an injected write failure (``fail_next_write``, the model of a transmit error) does. Whether the
+  motors received the goal is only visible in the next block read;
+* ``set_torque``, ``read_reg`` and ``write_reg`` are acked single-motor transactions: a missing or unpowered motor
+  fails them.
+
+Power (U3 review item 1): ``FakeBus(power=...)`` takes a callable that says whether the servo side of the relay is
+live (``FakeMcu.relay_closed``). While it is False every motor is silent (pings and reads fail, torque drops to
+off), and after it turns True the motors need ``boot_ms`` before they answer, like STS3215s booting behind the
+watchdog relay. ``connect(handshake=True)`` pings like lerobot's handshake and raises ``ConnectionError`` on a
+silent bus: the old start order (handshake before ARM) fails against this model, as it does on the real arm.
 """
 
 from __future__ import annotations
@@ -133,12 +145,16 @@ class FakeBus:
         thermal: ThermalModel | None = None,
         initial_ticks: Sequence[int] | None = None,
         load_gain: float = 5.0,
+        record_writes: bool = True,
+        power: Callable[[], bool] | None = None,
+        boot_ms: float = 0.0,
     ) -> None:
         self.clock = clock
         self.plant = plant if plant is not None else FirstOrderPlant()
         self.faults = faults if faults is not None else FaultInjector()
         self.thermal = thermal if thermal is not None else ThermalModel()
         self.load_gain = load_gain
+        self.record_writes = record_writes  # False: no written_goals / torque_events growth (long soaks)
         self.calibration = calibration or {
             n: MotorCalibration(id=i + 1, drive_mode=0, homing_offset=0, range_min=0, range_max=_TICK_MAX)
             for i, n in enumerate(JOINT_NAMES)
@@ -162,6 +178,10 @@ class FakeBus:
             self._regs[("ID", c.id)] = c.id
             self._regs[("Return_Delay_Time", c.id)] = _FACTORY_RETURN_DELAY
         self.connected = False
+        self._power = power  # None = always powered (bench supply, no relay model)
+        self._boot_ns = round(boot_ms * 1e6)
+        self._powered_since_ns: int | None = None if power is not None else clock.monotonic_ns() - self._boot_ns
+        self.pings = 0  # ping_all calls (tests: no bus traffic before ARM)
         self.written_goals: list[np.ndarray] = []
         self.written_goal_t_ns: list[int] = []
         self.torque_events: list[tuple[int, bool, tuple[int, ...]]] = []
@@ -209,20 +229,46 @@ class FakeBus:
         if lat:
             self.clock.sleep_until(self.clock.monotonic_ns() + lat)
 
+    # -- power ---------------------------------------------------------------------------------
+    def alive(self) -> bool:
+        """The servo side is powered and the motors have booted. A power loss drops torque on every motor."""
+        if self._power is None:
+            return True
+        now = self.clock.monotonic_ns()
+        if not self._power():
+            if self._powered_since_ns is not None:
+                self._advance()
+                self._torque[:] = False  # power gone: the servos boot torque-off next time
+            self._powered_since_ns = None
+            return False
+        if self._powered_since_ns is None:
+            self._powered_since_ns = now
+        return now - self._powered_since_ns >= self._boot_ns
+
+    def _silent(self, motor_id: int) -> bool:
+        return self.faults.is_dropped(motor_id) or not self.alive()
+
     # -- Bus protocol --------------------------------------------------------------------------
-    def connect(self) -> None:
+    def connect(self, *, handshake: bool = False) -> None:
+        """Open the (simulated) port. ``handshake=True`` pings every motor first, like lerobot's
+        ``connect(handshake=True)``, and raises ``ConnectionError`` if one is silent."""
+        if handshake:
+            missing = [i for i, answered in self.ping_all().items() if not answered]
+            if missing:
+                raise ConnectionError(f"handshake: missing motor ids {missing} (servo side unpowered?)")
         self.connected = True
 
     def disconnect(self) -> None:
         self.connected = False  # never touches torque
 
     def ping_all(self) -> dict[int, bool]:
-        return {int(i): not self.faults.is_dropped(int(i)) for i in self._ids}
+        self.pings += 1
+        return {int(i): not self._silent(int(i)) for i in self._ids}
 
     def read_block(self, out: BlockRead) -> bool:
         self._wait_latency()
         self._advance()
-        if self.faults.consume_read_failure() or any(self.faults.is_dropped(int(i)) for i in self._ids):
+        if self.faults.consume_read_failure() or any(self._silent(int(i)) for i in self._ids):
             out.ok = False
             return False
         out.position[:] = np.clip(np.rint(self._pos), 0, _TICK_MAX).astype(np.int32)
@@ -247,10 +293,11 @@ class FakeBus:
         if self.faults.consume_write_failure():
             return False
         for j, motor_id in enumerate(self._ids):
-            if not self.faults.is_dropped(int(motor_id)):  # un-acked sync write: a dead motor is silent
+            if not self._silent(int(motor_id)):  # un-acked sync write: a dead / unpowered motor is silent
                 self._goal[j] = float(goal[j])
-        self.written_goals.append(goal.astype(np.int32, copy=True))
-        self.written_goal_t_ns.append(self.clock.monotonic_ns())
+        if self.record_writes:
+            self.written_goals.append(goal.astype(np.int32, copy=True))
+            self.written_goal_t_ns.append(self.clock.monotonic_ns())
         return True
 
     def set_torque(self, enabled: bool, ids: Sequence[int] | None = None) -> bool:
@@ -259,12 +306,13 @@ class FakeBus:
         if self.faults.consume_write_failure():
             return False
         target = tuple(int(i) for i in (self._ids if ids is None else ids))
-        if any(self.faults.is_dropped(i) for i in target):
-            return False  # acked write: a missing motor is an error here
+        if any(self._silent(i) for i in target):
+            return False  # acked write: a missing (or unpowered) motor is an error here
         for j, motor_id in enumerate(self._ids):
             if int(motor_id) in target:
                 self._torque[j] = enabled
-        self.torque_events.append((self.clock.monotonic_ns(), bool(enabled), target))
+        if self.record_writes:
+            self.torque_events.append((self.clock.monotonic_ns(), bool(enabled), target))
         return True
 
     def torque_enabled(self) -> np.ndarray:
@@ -272,7 +320,7 @@ class FakeBus:
 
     def read_reg(self, name: str, motor_id: int) -> int:
         self._advance()
-        if self.faults.is_dropped(motor_id):
+        if self._silent(motor_id):
             raise ConnectionError(f"motor {motor_id} does not answer")
         j = int(np.flatnonzero(self._ids == motor_id)[0])
         live = {
@@ -288,7 +336,7 @@ class FakeBus:
 
     def write_reg(self, name: str, motor_id: int, value: int) -> None:
         self._advance()
-        if self.faults.is_dropped(motor_id):
+        if self._silent(motor_id):
             raise ConnectionError(f"motor {motor_id} does not answer")
         if name == "Torque_Enable":
             self.set_torque(bool(value), [motor_id])
@@ -303,6 +351,8 @@ class FakeBus:
                 self._regs[(name, int(motor_id))] = int(getattr(registers, f.name))
 
     def read_calibration_regs(self) -> dict[str, MotorCalibration]:
+        if not self.alive():
+            raise ConnectionError("calibration read: servo side unpowered")
         out: dict[str, MotorCalibration] = {}
         for name in JOINT_NAMES:
             c = self.calibration[name]

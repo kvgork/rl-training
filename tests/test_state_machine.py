@@ -355,6 +355,34 @@ def test_heartbeat_fail_latches_and_nothing_leaves_latched(sm, out):
     assert sm.resume_policy() is ResumePolicy.HUMAN_PHYSICAL_RESET
 
 
+# ---- heartbeat miss budget (plan section 10, 2026-10-02) ---------------------------------------------------------
+def test_four_missed_acks_keep_running_and_an_ack_resets(sm, out):
+    from so101_rl.safety.state_machine import HB_MISS_BUDGET
+
+    assert HB_MISS_BUDGET == 5
+    run_state(sm, out)
+    for n in range(1, HB_MISS_BUDGET):
+        sm.step(fresh(hb_misses=n), out)
+        assert out.state is SmState.RUN and out.use_policy
+    sm.step(fresh(hb_misses=0), out)  # an ack
+    assert out.state is SmState.RUN and not sm.fault_bits & T.HEARTBEAT_FAIL
+
+
+@pytest.mark.parametrize("state", ["RUN", "HOLD", "SAFE_STOPPING", "TORQUE_OFF"])
+def test_five_missed_acks_latch(sm, out, state):
+    run_state(sm, out)
+    if state == "HOLD":
+        sm.step(SmInputs(cmd_fresh=False, cmd_age_ns=10**9), out)
+    elif state in ("SAFE_STOPPING", "TORQUE_OFF"):
+        sm.step(fresh(trips=T.NAN), out)
+        if state == "TORQUE_OFF":
+            sm.notify_safe_done()
+            sm.step(fresh(), out)
+    assert out.state.name == state
+    sm.step(SmInputs(cmd_fresh=False, cmd_age_ns=10**9 if state == "HOLD" else 0, hb_misses=5), out)
+    assert out.state is SmState.LATCHED and sm.fault_bits & T.HEARTBEAT_FAIL
+
+
 def test_mcu_latched_latches(sm, out):
     run_state(sm, out)
     sm.step(fresh(mcu=SimpleNamespace(latched=True)), out)

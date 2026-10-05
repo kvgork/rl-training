@@ -32,7 +32,9 @@ class BlockRead:
 
 @runtime_checkable
 class Bus(Protocol):
-    def connect(self) -> None: ...
+    def connect(self) -> None:
+        """Open the port WITHOUT a motor handshake: before ARM the servo side of the watchdog relay is unpowered
+        (U3 review item 1). The servo core pings the motors itself, after ARM and before ``reenergize``."""
 
     def disconnect(self) -> None:
         """Never changes torque implicitly."""
@@ -44,7 +46,10 @@ class Bus(Protocol):
         """ONE sync_read of addr 56, length 11 (56..66); returns ``out.ok``."""
 
     def write_goal(self, goal_ticks: np.ndarray) -> bool:
-        """sync_write Goal_Position, raw; the caller guarantees int32 in 0..4095."""
+        """sync_write Goal_Position, raw; the caller guarantees int32 in 0..4095.
+
+        Un-acked: True means the packet was TRANSMITTED, not that any motor received it (the next block read is
+        the evidence). The servo core's "write accepted" heartbeat condition therefore means "transmitted"."""
 
     def set_torque(self, enabled: bool, ids: Sequence[int] | None = None) -> bool: ...
 

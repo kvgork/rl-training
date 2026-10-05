@@ -38,6 +38,37 @@ def test_dtype_itemsizes():
     assert shm_mod.STATE_STRIDE == 256 and shm_mod.STATE_OFFSET % 64 == 0
 
 
+def test_state_record_has_read_ok_in_former_padding():
+    """U3 review item 9 / plan section 10 (2026-10-02): read_ok, without moving any other field (layout v2)."""
+    f = STATE_DTYPE.fields
+    assert f["read_ok"][0] == np.dtype("u1") and f["read_ok"][1] == f["hb_ok"][1] + 1
+    assert f["crc32"][1] == 228 and STATE_DTYPE.itemsize == 232
+    assert SHM_LAYOUT_VERSION == 2
+    blk = SeqlockBlock(memoryview(bytearray(256)), STATE_DTYPE)
+    rec = np.zeros(1, STATE_DTYPE)
+    rec["read_ok"] = 1
+    blk.write(rec)
+    out = np.zeros(1, STATE_DTYPE)
+    assert blk.read(out) and out["read_ok"][0] == 1  # covered by the CRC like every payload byte
+
+
+def test_serial_port_lock_is_exclusive_and_keyed_on_the_resolved_path(tmp_path):
+    dev = tmp_path / "ttyFAKE0"
+    dev.write_text("")
+    alias = tmp_path / "by-id-usb-arm"
+    alias.symlink_to(dev)
+    a = shm_mod.SerialPortLock(str(dev))
+    try:
+        with pytest.raises(shm_mod.ServoAlreadyRunning, match="serial port"):
+            shm_mod.SerialPortLock(str(alias))  # the same port under another name
+        other = shm_mod.SerialPortLock(str(tmp_path / "ttyFAKE1"))
+        other.release()
+    finally:
+        a.release()
+    shm_mod.SerialPortLock(str(alias)).release()  # free again after release
+    assert dev.read_text() == ""  # the device path itself was never opened for writing
+
+
 def test_create_attach_roundtrip(name):
     with ServoShm.create(name) as servo:
         pol = ServoShm.attach(name)
