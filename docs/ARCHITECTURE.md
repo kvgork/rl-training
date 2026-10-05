@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.11 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.12 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -393,21 +393,22 @@ These are ordered from the outermost layer to the innermost.
 | Pixi feature | Contents | Used by |
 |---|---|---|
 | core (default deps) | python 3.12, numpy 2.2, conda `pytorch` + torchvision (variant chosen by `gpu`/`cpu`), lerobot[feetech,grpcio-dep] 0.6.1 (PyPI), gymnasium, h5py, pyyaml, pytest, hypothesis, ruff | servo, safety, env |
-| `sim` | mujoco-python (conda-forge). **Planned:** `mujoco-warp` and `warp-lang`, with **one MuJoCo version pinned across `cpu` and `default`**. On 2026-10-05 `cpu` had mujoco 3.13 while `default` had 3.3.2. | sim, tests, GPU pre-training (`default` env) |
+| `sim` | `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` (conda-forge): **one MuJoCo version in `cpu` and `default`** (S0.1, 2026-10-05; resolved 3.14.0 / 3.14.0 / 1.17.0 cuda129) | sim, tests, GPU pre-training (`default` env) |
 | `perception` | opencv (conda-forge), pyrealsense2 (PyPI) | perception |
-| `train` | torchrl, tensordict, stable-baselines3, hydra-core, omegaconf, termcolor, pandas (PyPI) | rl, wm |
-| `gpu` | `pytorch-gpu`, `cuda-version` 12.8 (re-pin to the driver's CUDA after H1) | training on the RTX 3080 |
-| `cpu` | `pytorch-cpu` | CI, driver-less hosts, all Phase 0 acceptance |
+| `train` | torchrl, tensordict, stable-baselines3, hydra-core, omegaconf, termcolor, pandas, cma (CMA-ES for sysid) (PyPI) | rl, wm, sim/sysid |
+| `gpu` | `pytorch-gpu 2.11.*`, `cuda-version 12.9.*` (D-CUDA; matches the cuda129 warp build; fallback 12.8 / 12.6) | training and GPU tests on the RTX 3080 |
+| `cpu` | `pytorch-cpu 2.11.*` | CI, driver-less hosts, all Phase 0 acceptance |
 
 | Environment | Features | Purpose |
 |---|---|---|
-| `default` | sim, perception, train, gpu | Training host (locked, but not installable while the NVIDIA driver is down) |
+| `default` | sim, perception, train, gpu | Training host and GPU tests (`pixi run test-gpu`); the driver works since H1 |
 | `cpu` | sim, perception, train, cpu | Tests and smoke runs everywhere |
 | `robot` | perception, cpu | Servo host process: no GPU stack beyond what lerobot imports |
 
-- **Channels:** only conda-forge for torch and CUDA, and PyPI for lerobot, pyrealsense2 and the train stack. There is exactly one torch, the conda `pytorch` (`tests/test_env_sanity.py` enforces it).
+- **Channels:** only conda-forge for torch, CUDA, MuJoCo and Warp, and PyPI for lerobot, pyrealsense2 and the train stack. There is exactly one torch, the conda `pytorch` 2.11 in every env, and one MuJoCo, 3.14 in every sim-capable env (`tests/test_env_sanity.py` enforces both).
+- **Version pins (S0.1):** `pytorch 2.11.*` and `numpy 2.2.*` everywhere, because lerobot 0.6.1 needs torch < 2.12 and numpy < 2.3; `torchvision >=0.26,<0.27`.
 - **Solver pins** (so pixi's PyPI resolver accepts lerobot 0.6.1 on top of the conda solve): `setuptools<82`, `packaging<26`, `opencv<4.14`, `gymnasium<1.3`; `[tool.pixi.system-requirements] cuda = "12"` lets the `default` environment lock without a driver; `PYTHONNOUSERSITE=1` is set on activation so `~/.local` packages never leak in. Solved versions are recorded in `README.md`.
-- **Tasks:** every entry point is a `pixi run` task: `test`, `test-hw`, `lint`, `ci`, `smoke-tdmpc2`, `fetch-assets`, `extract-kinematics`, `servo`, `servo-fake`, `soak`, `soak-fake`, `calib-check`, `hand-eye` (runs `perception.calibrate_hand_eye`), `compare-real`, `random-policy-sim`, `random-policy-real`, `train-reach-sac`, `train-reach-tdmpc2`, `train-wm-state`, `check-milestone`. Tasks whose module a later unit creates fail until that unit lands. `servo-fake` and `soak-fake` pass `--calibration tests/data/so101_follower.calib.json` (the repository copy of the arm's calibration), so the fake runs are reproducible on any host.
+- **Tasks:** every entry point is a `pixi run` task: `test`, `test-hw`, `lint`, `ci`, `smoke-tdmpc2`, `fetch-assets`, `extract-kinematics`, `servo`, `servo-fake`, `soak`, `soak-fake`, `calib-check`, `hand-eye` (runs `perception.calibrate_hand_eye`), `compare-real`, `random-policy-sim`, `random-policy-real`, `train-reach-sac`, `train-reach-tdmpc2`, `train-wm-state`, `check-milestone`; sim-first track (S0.1): `test-gpu` (`pytest -m "gpu and not hardware"`), `ci-gpu` (lint + test + test-gpu), `bench-warp`, `sim-parity`, `tray-check`, `sysid-excite`, `sysid-fit`, `sim-gates`, `train-sim-sac`, `eval-sim`, `export-policy`, `deploy-policy`, `pretrain-tdmpc2`, `gap-report`. Tasks whose module a later unit creates fail until that unit lands. `servo-fake` and `soak-fake` pass `--calibration tests/data/so101_follower.calib.json` (the repository copy of the arm's calibration), so the fake runs are reproducible on any host.
 
 The vendored TD-MPC2 tree is generated by `scripts/vendor_tdmpc2.py`. The upstream tarball cache is verified against the recorded `tarball_sha256` on every read, and `scripts/vendor_tdmpc2.manifest.json` records the sha256 of every vendored file so hand-edits fail an offline test.
 
@@ -450,3 +451,4 @@ Bump the version line at the top and add an entry below.
 | 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
 | 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
 | 0.11 | 2026-10-05 | U3 verification follow-ups. §6: host-side heartbeat partial-frame rule (delivered only when the frame is complete; stale tails over 80 ms dropped). New tests cover the strict re-energise heartbeat on a lost or latched echo, and the abort check just before torque-on. |
+| 0.12 | 2026-10-05 | Sim-first track SU0 (`plans/sim-track-implementation-plan.md`). §8: S0.1 version pin — `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` in `sim`, `pytorch 2.11.*` in every env (`pytorch-gpu 2.11.*` + `cuda-version 12.9.*` in `gpu`), `cma` in `train`, the sim-track pixi tasks incl. `test-gpu` / `ci-gpu`. |

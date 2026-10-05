@@ -47,3 +47,26 @@ def test_python_version():
 @pytest.mark.parametrize("mod", ["torchrl", "tensordict", "mujoco", "cv2", "stable_baselines3"])
 def test_train_stack_imports(mod):
     __import__(mod)
+
+
+# S0.1 (plans/sim-track-implementation-plan.md, D-PIN): one MuJoCo and one torch across every env.
+def test_mujoco_version_pinned():
+    mujoco = pytest.importorskip("mujoco")  # the `robot` env has no `sim` feature
+    assert mujoco.__version__.startswith("3.14"), mujoco.__version__
+
+
+def test_mujoco_warp_importable():
+    """Every env with the `sim` feature has MuJoCo Warp; `import warp` must work on a host without CUDA too."""
+    pytest.importorskip("mujoco")
+    import mujoco_warp
+    import warp
+
+    assert hasattr(mujoco_warp, "put_model")
+    major, minor = (int(x) for x in warp.__version__.split(".")[:2])
+    assert (major, minor) >= (1, 17) and major < 2, warp.__version__
+
+
+def test_torch_version_pinned():
+    import torch
+
+    assert torch.__version__.startswith("2.11."), torch.__version__
