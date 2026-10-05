@@ -6,6 +6,8 @@
 
 > **Status note (2026-10-01, updated after U3):** wave 2 (U3, servo core/process/soak) is built on the fake and MuJoCo backends; F6 below is annotated as-built (keyword-only additions to `ServoCore` and `run`). Wave 0 and wave 1 are built, reviewed and fixed (`plans/reviews/2026-09-30-wave1-review.md`). Where this plan's frozen interfaces differ from the code, **`docs/ARCHITECTURE.md` §5–§6 (v0.5+) is authoritative**; the F5 signatures below have been updated to the as-built versions. Hardware risk to measure in H-track: the re-energise register phase (~132 single-register transactions) must fit the 0.8 s pre-torque heartbeat budget over USB-serial; if not, switch to sync_write/sync_read.
 
+> **Status note (2026-10-05, sim-first track):** U8, U9 and U10 are **superseded or absorbed** by `plans/sim-track-implementation-plan.md` — see its table "How the sim track supersedes or absorbs Phase 0 U8 / U9 / U10" (plan §10 2026-10-05, D-SUPERSEDE). In short: F7's 15-D `observation` and `So101ReachEnv` are superseded by the FS3 layout (`env/obs.py`, built in S0.4) and `So101GoalEnv(task)` (FS12, SR1); reward/success live once in `env/tasks.py` (FS4, built in S0.4); `env/local_ipc.py` is dropped (`servo.shm.LocalIpc` exists); `SimBackend` is kept as the parity reference rig; 9.2 is absorbed into S5; 10.1/10.2 continue as SR3. F7 and F11 below are kept as written for history; where they differ, the sim-track FS sections and `docs/ARCHITECTURE.md` §5 win.
+
 ## Overview
 
 | Item | Value |

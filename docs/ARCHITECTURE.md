@@ -5,7 +5,9 @@
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
 >
-> **Still interface-only:** the env (U8), and the RL and world-model code (U9).
+> - *Sim-first track SU0 (S0, 2026-10-05; `plans/sim-track-implementation-plan.md`):* one MuJoCo 3.14 / torch 2.11 in every env, MuJoCo Warp (`sim/warp_model.py`, failing overflow detector, S0 gate passed), and the frozen FS3 observation layout (`env/obs.py`) and FS4 task specs (`env/tasks.py`).
+>
+> **Still interface-only:** the env itself (SR1/SU1: `So101GoalEnv`, `BatchedGoalEnv`), and the RL and world-model code (U9 → SU4/SR2).
 > **Source of truth for decisions:** `so101-self-learning-rl-plan.md` §10 (decision log). This doc describes *how* the system is built; the plan describes *what* and *why*.
 > **Keeping it current:** every change that adds, removes or renames a module, a process, or a cross-process interface updates this file in the same commit. See §10 at the bottom of this file.
 
@@ -131,7 +133,9 @@ rl-trainer/
 │   │                             # heartbeat.py: MCU link + FakeMcu; timing; shm (seqlock + single-instance lock)
 │   ├── safety/                   # clamp, fk (pure-numpy FK + box), transit (rest<->home transit-zone planner), config_check (safe-state geometry/time-bound validation), thermal, stuck, safe_state, reenergize,
 │   │                             # calib_check, state_machine, pipeline. Never imports rl, wm or env.
-│   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface)
+│   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface); built: obs (FS3 frozen
+│   │                             # policy/critic layout, numpy + torch builders), tasks (FS4 REACH / DIE_TO_ZONE: the
+│   │                             # one reward / success / debounce definition for sim and real)
 │   ├── perception/               # camera (D435 by serial, FakeCamera), die_tracker (HSV + depth, None when occluded),
 │   │                             # frames (Umeyama hand-eye), fiducial (ArUco camera-moved gate), object_table (shm),
 │   │                             # calibrate_hand_eye (driver)
@@ -152,10 +156,12 @@ rl-trainer/
 ```
 rl, wm ──► env ──► servo(shm client) , perception(shm client)
 env ──► sim            safety ◄── servo
+env/batched_env ──► sim (WarpSim, batched servo chain)
+sim ──► safety.types, safety.fk   (constants only: TripCause, KinematicChain; D-DEPS)
 all ──► config, logging
 ```
 
-`safety` has no dependency on `rl`, `wm` or `env`. That is what "policy-independent" means in the code.
+`safety` has no dependency on `rl`, `wm` or `env`. That is what "policy-independent" means in the code. Sim-first additions (plan §10 2026-10-05, D-DEPS): `rl → env`; `rl/` and `env/` never import the `safety/` clamps (the batched sim re-implements the chain in `sim/batched_servo.py`, pinned to `safety/pipeline.py` by the parity test); `env/obs.py` and `env/tasks.py` import only `config` (test-enforced).
 
 ## 5. Key interfaces (Stage A)
 
@@ -251,6 +257,10 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - `contact_count(geoms_a, geoms_b) -> int32[N]`, `copy_world_to(world, MjData)` (rendering), `vram_bytes` (Warp mempool only).
 - `scripts/bench_warp.py` (`pixi run bench-warp`) measures env-steps/s, process VRAM, peak `nefc`/`nacon` and CPU-vs-Warp parity and exits 1 if the S0 gate fails (N=1024: ≥ 500k env-steps/s, ≤ 1.5 GB, no overflow at njmax 256 / nconmax 32, arm parity ≤ 1e-6 rad over 300 steps). Measured 2026-10-05: 731k env-steps/s and 786 MB at N=1024, parity 3.9e-7 rad, peak nefc 188/256.
 - `so101_rl.sim` stays lazy: importing it loads neither `mujoco`, `mujoco_warp` nor `warp` (test-enforced).
+
+**Sim-first interfaces (FS-series, `plans/sim-track-implementation-plan.md`).** FS1 (`SimWarpConfig`, the `sim_warp:` section) and FS2 (`WarpSim`) are built (S0.3, above). FS3 and FS4 are frozen in code (S0.4):
+- **FS3 observation** (`env/obs.py`, `OBS_LAYOUT_VERSION = 1`, supersedes F7's 15-D layout): `q_norm` 6 = (present − 2047)/2048, `dq_norm` 6 = Present_Speed [ticks/s] / servo_hz / `max_ticks_per_tick` clipped ±2, `last_applied` 6 = `applied_delta_ticks / max_delta_ticks` clipped ±1, `tip_xyz` 3 (FK of present); die tasks add `die_xyz` 3 (last-known, held), `die_visible` 1, `die_age` 1 = min(frames since seen, 30)/30. Reach 21, die 26; policy input + 3 goal = 24 / 29. `build_policy_obs_np` / `build_policy_obs_torch` agree to 1e-6 (test). `PRIV_OBS` (61, critic only, sim only) is a layout.
+- **FS4 tasks** (`env/tasks.py`): `REACH` (50 steps, γ 0.97, success |tip − goal| ≤ 15 mm, debounce 1) and `DIE_TO_ZONE` (100 steps, γ 0.98, debounce 2, zone (0.22, 0.10) ± 30 mm from the scene site, die start well (0.20, −0.05) σ 5 mm, `measured_on_hardware: false` until H9). Reward = −dist/0.30 + 1.0 × predicate. The die predicate uses the **tracker-reported** position and needs `visible` (missing `visible` is an error; invisible is UNKNOWN, never SUCCESS), the centroid's xy inside the zone square around `desired` and the centroid at most one die edge above `desired`'s resting height (`ZoneSpec.max_height_m` = 16 mm above the table for the real goal; relative to `desired`, so HER-relabelled goals stay consistent); termination needs the predicate on 2 consecutive steps (`debounce_*`). SB3 HER's `compute_reward` takes the stored transition's visibility from `info["tracker_visible"]` (`visible_from_info`; never defaults to visible). `GoalBounds` = `cfg.box` shrunk by 20 mm, z ≥ 30 mm, radius ≤ 0.30 m (shared by the numpy and torch goal samplers).
 
 **Perception (U5).**
 - The object table is one seqlock'd `OBJECT_TABLE_DTYPE` record in its own shm segment. Perception creates it, and the env attaches read-only.
@@ -379,7 +389,7 @@ These are ordered from the outermost layer to the innermost.
 
 ## 7. Data and learning flow (Stage A)
 
-**Sim-first** (plan §10, 2026-10-05; plan §5 "Sim-first track"). Status: *planned*, not yet implemented.
+**Sim-first** (plan §10, 2026-10-05; plan §5 "Sim-first track"). Status: **S0 built** (2026-10-05): version pin, MuJoCo Warp backend with the S0 gate passed (N=1024: ~0.73–0.80 M env-steps/s, 786 MB, no overflow at `sim_warp` njmax 256 / nconmax 32, CPU-vs-Warp arm parity 3.9e-7 rad over 300 steps), FS3/FS4 interface freeze. S1–S5 are planned. Grasp-level contact parity (Layer C) is still open.
 
 ```
  SIM (RTX 3080, MuJoCo Warp, 1024–2048 envs)                REAL ARM (ServoCore)
@@ -464,4 +474,4 @@ Bump the version line at the top and add an entry below.
 | 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
 | 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
 | 0.11 | 2026-10-05 | U3 verification follow-ups. §6: host-side heartbeat partial-frame rule (delivered only when the frame is complete; stale tails over 80 ms dropped). New tests cover the strict re-energise heartbeat on a lost or latched echo, and the abort check just before torque-on. |
-| 0.12 | 2026-10-05 | Sim-first track SU0 (`plans/sim-track-implementation-plan.md`). §8: S0.1 version pin — `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` in `sim`, `pytorch 2.11.*` in every env (`pytorch-gpu 2.11.*` + `cuda-version 12.9.*` in `gpu`), `cma` in `train`, the sim-track pixi tasks incl. `test-gpu` / `ci-gpu`. §5 Sim: S0.2 scene timestep 1/510 s (17 substeps = one servo tick) and `jaw_col` margin 0. §4/§5: S0.3 `sim/warp_model.py` (`WarpSim`, failing overflow detector, per-world params), the `sim_warp:` config section (`SimWarpConfig`), `scripts/bench_warp.py` and the S0 gate. |
+| 0.12 | 2026-10-05 | Sim-first track SU0 (`plans/sim-track-implementation-plan.md`). §8: S0.1 version pin — `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` in `sim`, `pytorch 2.11.*` in every env (`pytorch-gpu 2.11.*` + `cuda-version 12.9.*` in `gpu`), `cma` in `train`, the sim-track pixi tasks incl. `test-gpu` / `ci-gpu`. §5 Sim: S0.2 scene timestep 1/510 s (17 substeps = one servo tick) and `jaw_col` margin 0. §4/§5: S0.3 `sim/warp_model.py` (`WarpSim`, failing overflow detector, per-world params), the `sim_warp:` config section (`SimWarpConfig`), `scripts/bench_warp.py` and the S0 gate. Header: SU0 status. §4: `env/obs.py`, `env/tasks.py`; dependency arrows per D-DEPS (`sim → safety.types/fk` constants only, `env/batched_env → sim`, `rl → env`). §5: FS1–FS4 pointers and behaviour. §7: status "S0 built" with the measured gate values. |
