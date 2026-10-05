@@ -7,6 +7,7 @@ least one test here; the test name says which.
 from __future__ import annotations
 
 import dataclasses
+import gc
 import os
 import signal
 import tracemalloc
@@ -517,13 +518,17 @@ def test_logged_action_is_the_applied_post_clamp_delta(h):
     assert float(st["applied_delta_ticks"][0]) == float(h.cfg.action.max_delta_ticks[0])
 
 
+_SCALAR_SHUFFLE_BYTES = 32  # an int <-> float re-attribution through the free lists: 24..32 B, never per tick
+
+
 @pytest.mark.parametrize("leak", [False, True], ids=["core", "control-leak-detected"])
 def test_zero_net_allocation_over_1000_ticks_after_warmup(cfg, calibration, leak):
     hn = Harness(cfg, calibration, fake_bus_kwargs={"record_writes": False}).boot()
+    leak_bytes = 1024
     if leak:  # control: a deliberate per-tick leak must be caught by exactly this measurement
         kept = []
         real_hb = hn.core._send_heartbeat
-        hn.core._send_heartbeat = lambda: (kept.append(object()), real_hb())[1]
+        hn.core._send_heartbeat = lambda: (kept.append(bytearray(leak_bytes)), real_hb())[1]
     hn.run_policy(40, delta=[3, -2, 2, 1, 0, 1])  # warm-up: every code path of a RUN tick has run
     pkg = os.path.dirname(core_mod.__file__).rsplit(os.sep, 1)[0]
     filters = [
@@ -539,6 +544,17 @@ def test_zero_net_allocation_over_1000_ticks_after_warmup(cfg, calibration, leak
             hn.core.tick()
             hn.clock.advance(hn.period)
 
+    # U3 verification N5 (flaky under load / test order): tracemalloc attributes a block to the line that last
+    # malloc'ed it, and CPython recycles small scalars through free lists that tracemalloc does not see. Whether a
+    # long-lived scalar is re-malloc'ed inside the window therefore depends on free-list state left by earlier
+    # tests and GC passes. Observed: an int freed at core.py (``age``: -1 object, -28 B) and a float malloc'ed at
+    # thermal.py (``hottest_c``: +1 object, +24 B), net 0 objects, and the old "sum of the growing lines == 0"
+    # failed on it. The core is now judged by NET object count (exact: <= 0) and net bytes (<= a scalar-size
+    # mismatch, 32 B, far below any per-tick growth over 1000 ticks). Determinism: one full collection before
+    # tracing, no cyclic-GC pass inside the traced region.
+    gc_was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
     tracemalloc.start()
     try:
         run(600)  # traced warm-up (seq numbers past the small-int cache): the long-lived scalars (seq, timestamps) are now traced objects too
@@ -547,12 +563,21 @@ def test_zero_net_allocation_over_1000_ticks_after_warmup(cfg, calibration, leak
         after = tracemalloc.take_snapshot().filter_traces(filters)
     finally:
         tracemalloc.stop()
+        if gc_was_enabled:
+            gc.enable()
     assert hn.core.state is SmState.RUN
-    growth = [s for s in after.compare_to(before, "lineno") if s.size_diff > 0]
+    diff = after.compare_to(before, "lineno")
+    growth = [s for s in diff if s.size_diff > 0]
     if leak:
-        assert sum(s.size_diff for s in growth) > 0
+        # the control leaks 1000 heartbeats x 1 KiB on one line of this file: at least 90 % of that must be seen
+        here = sum(s.size_diff for s in growth if s.traceback[0].filename == __file__)
+        assert here >= 0.9 * 1000 * leak_bytes, [(str(s.traceback), s.size_diff) for s in growth]
         return
-    assert sum(s.size_diff for s in growth) == 0, [(str(s.traceback), s.size_diff) for s in growth]
+    # the core allocates nothing net over 1000 ticks: a leaked object of any kind, once per tick or even once in
+    # the window, raises the net object count; a container that grows without new objects raises the bytes
+    detail = [(str(s.traceback), s.count_diff, s.size_diff) for s in diff if s.count_diff or s.size_diff]
+    assert sum(s.count_diff for s in diff) <= 0, detail
+    assert sum(s.size_diff for s in diff) <= _SCALAR_SHUFFLE_BYTES, detail
 
 
 def test_tick_returns_the_same_preallocated_result(h):

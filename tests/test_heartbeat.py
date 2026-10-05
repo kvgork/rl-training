@@ -736,23 +736,113 @@ def test_serial_link_no_byte_accepted_is_not_delivered(pty_link, monkeypatch):
     assert p.mcu._last_seq == 0 and not p.mcu.latched
 
 
-def test_serial_link_partial_write_is_completed_on_the_next_send(pty_link, monkeypatch):
-    link, p = pty_link
-    _arm_over_pty(link, p)
+def _one_byte_then_full(monkeypatch):
+    """The next ``os.write`` accepts only the first byte; every later one would block (until ``monkeypatch.undo``)."""
     real_write = hb.os.write
     calls = {"n": 0}
 
-    def one_byte_then_full(fd, data):
+    def write(fd, data):
         calls["n"] += 1
         if calls["n"] == 1:
             return real_write(fd, data[:1])
         raise BlockingIOError
 
-    monkeypatch.setattr(hb.os, "write", one_byte_then_full)
-    assert link.send(0) is not HbSend.NOT_DELIVERED  # 1 of 3 bytes accepted: delivered, the rest is kept
+    monkeypatch.setattr(hb.os, "write", write)
+
+
+class _SkewClock(RealClock):
+    """Real time plus a test-controlled offset: ages the link's kept tail without waiting."""
+
+    def __init__(self) -> None:
+        self.skew_ns = 0
+
+    def monotonic_ns(self) -> int:
+        return time.monotonic_ns() + self.skew_ns
+
+    def sleep_until(self, t_ns: int) -> None:
+        super().sleep_until(t_ns - self.skew_ns)
+
+
+@pytest.fixture
+def skew_link(clock):
+    p = _PtyMcu(clock)
+    sk = _SkewClock()
+    link = SerialHeartbeatLink(p.port, sk)
+    yield link, p, sk
+    link.close()
+    p.close()
+
+
+def test_serial_link_partial_write_is_not_delivered_until_the_frame_is_complete(pty_link, monkeypatch):
+    """U3 verification N2: the MCU counts a heartbeat only at its third byte, so a partial write is NOT_DELIVERED
+    (the caller reuses the number); the next send of that number only completes the kept tail (no duplicate)."""
+    link, p = pty_link
+    _arm_over_pty(link, p)
+    p.rx.clear()  # the ARM byte
+    _one_byte_then_full(monkeypatch)
+    assert link.send(0) is HbSend.NOT_DELIVERED and not link.dead  # 1 of 3 bytes: the MCU has counted nothing
+    monkeypatch.undo()
+    p.pump()
+    assert p.mcu._last_seq is None
+    assert link.send(0) is not HbSend.NOT_DELIVERED  # the same number again: the tail completes frame 0
+    p.pump()
+    assert bytes(p.rx) == bytes([0xA5, 0, 0xFF])  # exactly one frame 0, no duplicate (a repeat latches)
+    assert p.mcu._last_seq == 0 and not p.mcu.latched
+    assert link.send(1) is not HbSend.NOT_DELIVERED
+    p.pump()
+    assert bytes(p.rx[-3:]) == bytes([0xA5, 1, 0xFE]) and p.mcu._last_seq == 1 and not p.mcu.latched
+
+
+def test_serial_link_partial_write_then_a_new_number_sends_the_tail_first(pty_link, monkeypatch):
+    link, p = pty_link
+    _arm_over_pty(link, p)
+    p.rx.clear()  # the ARM byte
+    _one_byte_then_full(monkeypatch)
+    assert link.send(0) is HbSend.NOT_DELIVERED
     monkeypatch.undo()
     p.pump()
     assert link.send(1) is not HbSend.NOT_DELIVERED  # tail of frame 0 first, then frame 1
     p.pump()
-    assert bytes(p.rx[-6:]) == bytes([0xA5, 0, 0xFF, 0xA5, 1, 0xFE])
+    assert bytes(p.rx) == bytes([0xA5, 0, 0xFF, 0xA5, 1, 0xFE])
     assert p.mcu._last_seq == 1 and not p.mcu.latched
+
+
+def test_serial_link_stale_partial_tail_is_dropped_not_sent(skew_link, clock, monkeypatch):
+    """U3 verification N2: a tail older than 80 ms is never sent (past the MCU's 100 ms window it would be line
+    noise: here 0x5A ~0x5A = ARM, then a new 0xA5 head). Nothing is written until the MCU has dropped the head,
+    then the same number goes out as a whole frame and the MCU counts it."""
+    link, p, sk = skew_link
+    _arm_over_pty(link, p)
+    p.rx.clear()  # the ARM byte
+    _one_byte_then_full(monkeypatch)
+    assert link.send(0x5A) is HbSend.NOT_DELIVERED
+    monkeypatch.undo()
+    p.pump()
+    assert bytes(p.rx) == bytes([0xA5])  # the MCU holds a frame head
+    for ms in (85, 15):  # 85 ms, 100 ms after the head: dropped, and still within the quiet window
+        sk.skew_ns += ms * MS
+        clock.advance(ms * MS)
+        assert link.send(0x5A) is HbSend.NOT_DELIVERED and not link.dead
+        p.pump()
+        assert bytes(p.rx) == bytes([0xA5])  # nothing written: neither the stale tail nor a new frame
+    sk.skew_ns += 25 * MS
+    clock.advance(25 * MS)
+    assert link.send(0x5A) is not HbSend.NOT_DELIVERED  # 125 ms: the MCU dropped the head; a whole frame
+    p.pump()
+    assert bytes(p.rx) == bytes([0xA5, 0xA5, 0x5A, 0xA5])
+    assert p.mcu._last_seq == 0x5A and not p.mcu.latched and p.mcu.armed
+
+
+def test_serial_link_young_tail_is_still_completed(skew_link, clock, monkeypatch):
+    link, p, sk = skew_link
+    _arm_over_pty(link, p)
+    p.rx.clear()  # the ARM byte
+    _one_byte_then_full(monkeypatch)
+    assert link.send(7) is HbSend.NOT_DELIVERED
+    monkeypatch.undo()
+    p.pump()
+    sk.skew_ns += 70 * MS
+    clock.advance(70 * MS)  # inside the MCU's 100 ms window
+    assert link.send(7) is not HbSend.NOT_DELIVERED
+    p.pump()
+    assert bytes(p.rx) == bytes([0xA5, 7, 0xF8]) and p.mcu._last_seq == 7 and not p.mcu.latched

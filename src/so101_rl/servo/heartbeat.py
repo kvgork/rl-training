@@ -405,10 +405,28 @@ class SerialHeartbeatLink:
     thread was preempted, or the fd was not writable again in time). Treating that as "not delivered" would reuse
     the sequence number of a frame the MCU did receive and latch it with SEQ_ERROR. So with a real pyserial port
     the frame goes through non-blocking ``os.write`` on its fd (at most ``write_timeout_s`` of waiting for
-    writability): 0 bytes accepted = ``NOT_DELIVERED``. A partial write (practically impossible for 3 bytes on an
-    empty USB-CDC buffer) keeps the remaining bytes and sends them first on the next call, so the MCU sees the
-    frame complete (within its 100 ms partial-frame window unless the link stalls); it counts as delivered.
+    writability): 0 bytes accepted = ``NOT_DELIVERED``.
+
+    **Partial writes** (practically impossible for 3 bytes on an empty USB-CDC buffer; U3 verification N2). The MCU
+    counts a heartbeat only when its third byte arrives, and it discards a frame head that gets no further byte
+    within ``PARTIAL_FRAME_MS`` (100 ms, ``firmware/watchdog_mcu/PROTOCOL.md`` "Partial frames"); bytes after that
+    are line noise, and a heartbeat tail ``seq ~seq`` read as noise can be a command (``0x5A`` ARM, ``0xA5`` a new
+    head, ``0xE1`` TEST_DROP). So a frame counts as delivered only once all 3 bytes were accepted:
+
+    * a partial write returns ``NOT_DELIVERED`` (the MCU has not counted it, the caller reuses the number) and keeps
+      the unsent tail with its age;
+    * on the next ``send`` a tail whose last written byte is younger than ``_TAIL_MAX_AGE_S`` (80 ms, 20 ms under
+      the MCU window, which restarts on every byte) is written first. Once it is complete the kept frame is delivered: if the caller asks for the same number again (the
+      normal case after ``NOT_DELIVERED``) nothing more is written and the result is that of a delivered frame;
+      a different number is written after it as a new frame;
+    * an older tail is DROPPED, never sent. The MCU never counted that frame, so ``NOT_DELIVERED`` stays true for
+      it. Until ``_HEAD_EXPIRY_S`` (120 ms) after its last written byte nothing is written at all and ``send``
+      returns ``NOT_DELIVERED``: a new frame would otherwise complete the stale head the MCU may still hold and
+      latch it with SEQ_ERROR. After that the requested frame is written normally.
     """
+
+    _TAIL_MAX_AGE_S = 0.08  # a tail older than this is dropped, not sent (the MCU window is PARTIAL_FRAME_MS)
+    _HEAD_EXPIRY_S = (PARTIAL_FRAME_MS + 20) / 1000  # after a dropped tail: write nothing until the MCU dropped the head
 
     _REPLY_WAIT_S = 0.1
     _DROP_WAIT_S = 2.5  # the MCU reports at most 2000 ms
@@ -420,6 +438,9 @@ class SerialHeartbeatLink:
         self._ser = serial.Serial(port, 115200, timeout=0, write_timeout=write_timeout_s)
         self._write_timeout_s = write_timeout_s
         self._tail = b""  # unsent rest of a partially written heartbeat frame
+        self._tail_seq = 0  # sequence number of that frame
+        self._tail_ns = 0  # when its last byte was written (``clock``)
+        self._quiet_until_ns = 0  # after a dropped tail: no byte before this (the MCU still holds the stale head)
         self._clock = clock
         self._pending = 0
         self._last_status: McuStatus | None = None
@@ -497,16 +518,29 @@ class SerialHeartbeatLink:
         try:
             self._drain()
             acked_previous = self._pending == 0
+            now = self._clock.monotonic_ns()
+            completed = None  # sequence number of a kept frame completed by this call
+            if self._tail and now - self._tail_ns >= int(self._TAIL_MAX_AGE_S * 1e9):
+                # too old: the MCU drops (or already dropped) the head; sent now, the tail would be read as commands
+                self._tail = b""
+                self._quiet_until_ns = self._tail_ns + int(self._HEAD_EXPIRY_S * 1e9)
+            if now < self._quiet_until_ns:
+                return HbSend.NOT_DELIVERED  # the stale head may still be buffered in the MCU: write nothing
             if self._tail:  # finish the previous, partially written frame first
                 n = self._write_frame(self._tail)
                 self._tail = self._tail[n:]
+                if n:
+                    self._tail_ns = now  # the MCU's partial-frame timer restarts on every byte
                 if self._tail:
-                    return HbSend.NOT_DELIVERED  # the new frame was not even started
-            frame = bytes([CMD_HEARTBEAT, seq & 0xFF, ~seq & 0xFF])
-            n = self._write_frame(frame)
-            if n == 0:
-                return HbSend.NOT_DELIVERED  # transient: a missed heartbeat, the link may recover
-            self._tail = frame[n:]
+                    return HbSend.NOT_DELIVERED  # still incomplete: the MCU has counted nothing
+                completed = self._tail_seq
+            if completed is None or completed != seq & 0xFF:
+                frame = bytes([CMD_HEARTBEAT, seq & 0xFF, ~seq & 0xFF])
+                n = self._write_frame(frame)
+                if n < len(frame):
+                    if n > 0:  # head written: keep the tail; the frame is delivered only once it is complete
+                        self._tail, self._tail_seq, self._tail_ns = frame[n:], seq & 0xFF, now
+                    return HbSend.NOT_DELIVERED  # not complete, so not counted (0 bytes: transient, may recover)
         except Exception as exc:  # noqa: BLE001 - the tick path must never raise: unplug, closed port, termios error
             self.dead, self.last_error = True, exc
             return HbSend.NOT_DELIVERED

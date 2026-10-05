@@ -594,3 +594,66 @@ def test_item13_fakebus_goal_write_on_an_unpowered_bus_is_transmitted_not_acked(
     assert not any(bus.ping_all().values())
     with pytest.raises(ConnectionError):
         bus.read_reg("Present_Position", 1)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# U3 verification S1: the strict re-energise heartbeat check is ``== ACKED``, not ``!= NOT_DELIVERED``. A frame
+# that was written but not acknowledged (lost echo, or an echo from a latched MCU) must abort re-energise too.
+# Mutation-killing: these fail when servo/core.py ``_reenergize_hook`` accepts DELIVERED_NO_ECHO.
+def _inject(h, fault):
+    if fault == "drop_echoes":
+        h.link.drop_echoes(1)  # the frame reaches the MCU, its echo is lost: DELIVERED_NO_ECHO
+    else:
+        h.mcu.set_estop(True)  # the MCU latches (ESTOP_PIN): every later echo says latched: DELIVERED_NO_ECHO
+
+
+@pytest.mark.parametrize("fault", ["drop_echoes", "estop"])
+def test_s1_unacked_heartbeat_during_boot_reenergize_aborts_with_torque_off(cfg, calibration, fault):
+    hn = Harness(cfg, calibration, start=cfg.safe_state.rest_ticks)  # a long ramp: rest -> home
+    real = hn.link.send
+    n = {"k": 0, "res": []}
+
+    def send(seq):
+        n["k"] += 1
+        if n["k"] == 20:  # well inside the ramp, torque on
+            assert hn.bus.torque_enabled().any()
+            _inject(hn, fault)
+        res = real(seq)
+        n["res"].append(res)
+        return res
+
+    hn.link.send = send
+    hn.mcu.set_button(True)
+    with pytest.raises(StartupError):
+        hn.core.start(arm_timeout_s=5.0)
+    assert n["k"] == 20 and n["res"][-1] is HbSend.DELIVERED_NO_ECHO  # aborted on the first unacknowledged frame
+    assert isinstance(hn.core.last_error, HeartbeatLost)
+    assert not hn.bus.torque_enabled().any()
+
+
+@pytest.mark.parametrize("fault", ["drop_echoes", "estop"])
+def test_s1_unacked_heartbeat_during_thermal_resume_aborts_with_torque_off(h, fault):
+    _thermal_to_torque_off(h)
+    for n in JOINT_NAMES:
+        h.bus.set_temperature(n, 45.0)
+    real = h.link.send
+    state = {"armed": False, "res": None}
+
+    def send(seq):
+        if h.core.state is SmState.CHECK and not state["armed"] and h.bus.torque_enabled().any():
+            state["armed"] = True
+            _inject(h, fault)  # inside the re-energise ramp, torque on
+            state["res"] = real(seq)
+            return state["res"]
+        return real(seq)
+
+    h.link.send = send
+    for _ in range(35 * 30):
+        h.tick()
+        if state["armed"] and h.core.state is not SmState.CHECK:
+            break
+    assert state["armed"] and state["res"] is HbSend.DELIVERED_NO_ECHO
+    assert isinstance(h.core.last_error, HeartbeatLost)
+    assert not h.bus.torque_enabled().any()
+    h.tick()
+    assert h.core.state is SmState.LATCHED  # strict path: the unacknowledged heartbeat latches

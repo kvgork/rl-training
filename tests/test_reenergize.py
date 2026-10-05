@@ -586,3 +586,25 @@ def test_other_failures_during_the_ramp_still_turn_torque_off_with_hand_over(cfg
     with pytest.raises(RuntimeError, match="boom"):
         reenergize(bus, cfg, calibration, clock, BlockRead(), tick_hook=hook, should_abort=lambda: False, hand_over_on_abort=True)
     assert not bus.torque and bus.log[-1] == "set_torque:False"
+
+
+def test_abort_raised_by_the_last_goal_readback_never_energises(cfg, calibration, bus, clock):
+    """U3 verification N1: the ``check_abort()`` right before ``set_torque(True)`` ("5. only now") is the last gate.
+    A stop that arrives during the Goal_Position read-back (after every step-4 wait-loop poll) must still prevent
+    torque. Mutation-killing: fails when that check is removed from ``safety/reenergize.py``."""
+    reads = {"n": 0}
+    real_read_reg = bus.read_reg
+
+    def read_reg(name, motor_id):
+        if name == "Goal_Position":
+            reads["n"] += 1
+        return real_read_reg(name, motor_id)
+
+    bus.read_reg = read_reg
+    with pytest.raises(ReenergizeAborted) as ei:
+        reenergize(
+            bus, cfg, calibration, clock, BlockRead(), should_abort=lambda: reads["n"] >= N_JOINTS, hand_over_on_abort=True
+        )
+    assert reads["n"] == N_JOINTS  # the abort turned true on the LAST read-back, after all wait-loop polls
+    assert not ei.value.torque_on
+    assert "set_torque:True" not in bus.log and not bus.torque
