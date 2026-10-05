@@ -7,7 +7,19 @@
   - a 16 mm die (4 g, free joint), a 60 x 60 mm target `zone` site, a 30 mm `fiducial` site (ArUco-sized),
   - the `base` site (world origin) and the `rest` / `home` keyframes,
   - default classes `jaw_col` (primitive jaw collision geoms) and `die`.
-  - a later `<compiler meshdir="upstream/assets">`, because upstream's `meshdir="assets"` is relative to the main file.
+  - a later `<compiler meshdir="upstream/assets">`, because upstream's `meshdir="assets"` is relative to the main file,
+  - `<option timestep="1/510 s">` (decision D-TIMESTEP, 2026-10-05): `MujocoBus` runs `round((1/servo_hz)/dt) = 17`
+    substeps per servo tick, so one tick is exactly 1/30 s of sim time and one policy step exactly 100 ms (with
+    upstream's default 0.002 s a tick was 34 ms, a 2 % time-scale error). The CPU backend, the parity rig and the
+    batched MuJoCo Warp env all use the same 17 substeps.
+
+## MuJoCo Warp compatibility (S0.2)
+
+- `jaw_col` has `margin="0"` (was 0.0005): MuJoCo Warp 3.14 rejects box-box / box-mesh contact pairs with a non-zero
+  margin (`NotImplementedError`), and the CPU and GPU engines must simulate the same model. Spike:
+  `plans/reviews/2026-10-05-mjwarp-feasibility-spike.md`.
+- The 10 arm-link collision meshes (9k–27k vertices) run unmodified on MuJoCo Warp; no simplification is needed.
+- Euler integrator, Newton solver and the pyramidal cone (MuJoCo defaults) are all supported by MuJoCo Warp.
 
 ## Always load through `so101_rl.sim.model.load_model()`
 
