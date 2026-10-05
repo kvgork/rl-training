@@ -1,10 +1,13 @@
 # SO-101 Self-Learning Robot Arm — Project Plan
 
-> **Version 2 (2026-09-30).** This version adds evidence from the Second Brain vault and existing code to the v1 plan (`so101-self-learning-rl-plan.v1.md`).
+> **Version 3 (2026-10-05).**
+> - Version 2 (2026-09-30) added evidence from the Second Brain vault and existing code to the v1 plan (`so101-self-learning-rl-plan.v1.md`).
+> - Version 3 makes **GPU sim-first pre-training** the main learning path: §5 "Sim-first track", and §10 rows dated 2026-10-05.
 >
 > Markers:
 > - **[v2]** marks new or changed content.
 > - **[v2-conflict]** marks a place where vault evidence contradicts v1. Each conflict is an open decision in §8 until it is resolved.
+> - **[v3]** marks the sim-first changes (2026-10-05).
 >
 > The sources are listed in §11. Vault paths are relative to `~/Documents/Vaults/Local`, and `LIT` means `/mnt/data/workspaces/lerobot-isaac-training`.
 
@@ -43,7 +46,7 @@ RL is the main learning engine. Other techniques (simulation, demonstrations, fo
 |---|---|
 | Robot | SO-101 follower arm with Feetech STS3215 servos (5 DOF + gripper). **[v2]** It is on `/dev/ttyACM0` at 12 V and calibrated. The calibration file is `~/.cache/huggingface/lerobot/calibration/robots/so_follower/so101_follower.json`. |
 | Camera | Intel RealSense D435 (RGB + depth), fixed, pointed at the work area. **[v2]** Serial 819312071240. The colour stream is `/dev/video4`, but indices change on every USB replug. It needs about 45 warmup frames. At 0.614 m, 1 px ≈ 0.99 mm. It has only ever been used as an RGB overhead view at 640×480 and 30 Hz, never for depth in a policy. |
-| Training compute | **[v2]** One RTX 3080 with 10 GB. **The driver is currently not loaded.** `nvidia-smi` fails and `/dev/nvidia*` is missing, so it needs a reboot or a DKMS fix, which is a Phase 0 blocker. One vault note calls this machine a laptop, so check its thermals and power. |
+| Training compute | **[v2]** One RTX 3080 with 10 GB, plus 16 CPU cores and 31 GB RAM. **[v3] The driver works as of 2026-10-05** (610.57, CUDA 12.6 in the `default` pixi env; a matmul is verified). One vault note calls this machine a laptop, so check its thermals and power under multi-hour GPU sim load. |
 | ~~Optional: leader arm~~ | **[v2-conflict]** The leader arm is **permanently gone**, so the plan cannot rely on teleop demos. Demos must be scripted (IK), generated in sim, or taken from existing datasets (`LIT/datasets/so101-pickplace-new`, 50 episodes). |
 | **[v2]** Objects on the rig | A white cup with green leaves, a red 16 mm die and a white arm. |
 | **[v2]** Missing | A **hardware e-stop**. Today only cutting power stops the arm, and Ctrl-C cannot interrupt a blocked serial write (`LIT/SESSION_STATE.md`). |
@@ -59,7 +62,7 @@ All earlier RL on the SO-101 ran in **simulation** (Isaac Lab, DreamerV3 via she
 | L3 | **Pure RL (DreamerV3) never discovered placing, and pure BC (ACT) scored 0/20 in sim.** A scripted IK controller reached 67–80%, so the direction changed to **residual RL on a scripted base**. | `04-Archive/2026-06-28-so101-carryplace-rl-campaign.md` | Consider residual RL (a scripted IK base plus an RL correction) as the path for grasp and transport. It is still RL. |
 | L4 | **Action clamps are a hazard.** Five days were lost to a [-1,1] clamp that only worked when an env var was exported. The replay buffer must store the *post-clamp* action. | `04-Archive/2026-07-24-residual-rl-clamp-saga-lessons.md`, `05-Wiki/log.md` | The safety layer fails loudly, has one source of truth for its config, and logs the action that was actually applied. Diff launch environments. |
 | L5 | **Resets are the bottleneck for autonomy.** A 1% reset-failure rate forces heavy supervision, and extra human demos beat autonomous data (Mirchandani, CoRL 2024). No published system runs multi-hour unattended RL on a real arm. | `04-Archive/2026-09-10-claude-driven-so101-recording-research.md`, `05-Wiki/concepts/Autonomous-Robot-Data-Collection.md` | This conflicts with "minimal human time". Design resets in from Phase 0 with a bounded tray and reset-free skills first, instead of waiting until Phase 5. |
-| L6 | **Pure sim pretraining did not transfer** (community HIL-SERL SO-101 result). Use sim for augmentation or warm starts only. The vault's SO-101 sim was never validated against the real arm. | `05-Wiki/entities/SO-101.md`, `05-Wiki/entities/HIL-SERL.md` | Keep the plan's "sim light" stance, and add a sim-vs-real validation step. |
+| L6 | ~~**Pure sim pretraining did not transfer** (community HIL-SERL SO-101 result). Use sim for augmentation or warm starts only.~~ **[v3] Revisited 2026-10-05.** That was a single anecdote. Squint (arXiv 2602.21203, 2026) trained visual SAC on 8 SO-101 tasks in ManiSkill3 in about 15 min on one RTX 3090 and transferred them **zero-shot** to a real SO-101, with 73 of 80 trials succeeding. Its recipe: 10 Hz joint-delta actions, 1024 parallel envs, broad domain randomisation, and a wrist camera. The vault's SO-101 sim has still never been validated against the real arm. | `05-Wiki/entities/SO-101.md`, `05-Wiki/entities/HIL-SERL.md`, arXiv 2602.21203 | **[v3] Sim-first pre-training is now the main path** (§5 "Sim-first track", §10). Sim-vs-real validation and sysid become gates, not extras. |
 | L7 | **Real-arm IK in LeRobot 0.6.0 (placo) never reports failure.** Its default orientation weight gives 54.8 mm of error, and one call runs only one solve step. | `05-Wiki/concepts/SO-101-Inverse-Kinematics-(Placo-LeRobot).md` | End-effector actions or a scripted base need an FK residual check on every command. |
 | L8 | **Naive motor babbling does not scale; goal babbling replaced it.** The world model needs coverage: 200–500 or more exploratory episodes. | `05-Wiki/research/2026-08-08-onyx-per-joint-composition.md`, `LIT/plans/2026-06-23-world-model-training-plan.md` | Phase 2 uses goal babbling (random targets in the workspace), with random joint motion only as a seed. |
 | L9 | **Learned options rarely beat flat policies on real robots, and Option-Critic collapses.** Hierarchy *inside* a world model has support (Director, HWM). | `05-Wiki/research/2026-06-21-hierarchical-planning-world-models-robotics.md` | Phase 6 v2 (RL over skills) is the weakest part. It moves to Stage C as research. |
@@ -121,10 +124,11 @@ Perception runs alongside all layers and supplies the object table, gripper stat
 |---|---|---|
 | Hindsight Experience Replay (HER) | Relabels failed attempts as successes toward the position actually reached | All goal-conditioned skills. **[v2]** It helps reach most. Grasp and lift needed a shaping term such as grip × ee_height. HER is not built into TD-MPC2, so it must be implemented. |
 | Model-based RL (TD-MPC2, with DreamerV3 as an alternative) | Trains largely inside the learned world model, so fewer real movements are needed | Skill level. **[v2]** TD-MPC2 has never been run by the user and is not installed anywhere. DreamerV3 has run in the user's setup, but it failed at placing (L3, L13). |
-| MuJoCo pretraining | Short warm start with domain randomization; most training happens on the real arm | Reach, and possibly grasp. **[v2]** Use the official SO-101 MJCF (TheRobotStudio/SO-ARM100), then system-identify it. Randomize in this priority order: camera pose, then dynamics, then textures. |
+| **[v3] GPU sim pre-training (MuJoCo Warp)** | Trains each skill to high success in 1024–2048 parallel randomised sims on the 3080, so the real arm only fine-tunes | **Every Stage A/B skill** (§5 "Sim-first track"). Uses the official SO-101 MJCF, system-identified. Randomisation priority: camera and tracker pose, then servo dynamics and delay, then contact and object properties, then lighting. |
 | ~~Teleop demos (RLPD-style)~~ **[v2] Scripted or prior demos (RLPD-style)** | Seeds the replay buffer with 10–20 demos | Grasp. **[v2-conflict]** With no leader arm, the demos come from a scripted IK controller, from sim, or from `so101-pickplace-new`. |
 | **[v2] Residual RL (fallback only)** | RL learns a correction on top of a scripted IK controller | **Not the main path**: the user decided on pure RL everywhere (see §10). It is kept as a documented fallback in case pure RL stalls. A scripted controller reached 67–80% in sim (L3). |
-| **[v2] SAC + HER baseline** | A cheap model-free baseline trained on the same reach task | Phase 3. It shows whether the TD-MPC2 world model actually helps. |
+| **[v3] Massively parallel SAC (FastSAC/Squint-style)** | Off-policy SAC tuned for thousands of parallel envs: true clamp-unit action bounds, low initial entropy, a moderate update-to-data ratio | **The sim pre-training learner.** It also stays as the real-arm baseline (SB3 SAC + HER) that shows whether TD-MPC2's world model helps. |
+| **[v3] Offline TD-MPC2 pre-training from sim rollouts** | TD-MPC2's world model and critic are pre-trained on logged sim SAC rollouts, so the real-arm TD-MPC2 starts informed | Before every real-arm TD-MPC2 run |
 | **[v2] Goal babbling** | Reaches random targets instead of random joint noise | World-model data (L8) |
 | Foundation models | SAM2 and Grounding DINO for perception, an LLM for the initial task planner | Perception and task level. **[v2]** There are no VRAM or latency numbers for SAM2 or Grounding DINO on the 3080, and they compete with training for the GPU. Run perception at a low rate (object table at 5 Hz or faster, from cached masks plus tracking). |
 | Self-resets | The robot resets the scene itself once basic skills work | **[v2]** Designed in from Phase 0 (a bounded tray and reset-free skills first). Full scene reset stays in Phase 5 (L5). |
@@ -176,15 +180,75 @@ Only these items block the first real-arm RL result:
 
 1. The safety layer with the deadman relay.
 2. A colour + depth die tracker.
-3. A state-based world model.
-4. SAC + HER on reach.
-5. TD-MPC2 + HER on reach.
+3. **[v3] The GPU sim pre-training track for reach** (S0–S3 below): a batched MuJoCo Warp env with servo parity, the sysid gate, and SAC reach at ≥ 95 % in randomised sim.
+4. A state-based world model, pre-trained from sim rollouts.
+5. Reach on the real arm, starting from the sim policy: zero-shot evaluation first, then fine-tuning with SAC + HER. TD-MPC2 + HER is pre-trained from sim rollouts and compared against it.
 
 These are developed **in parallel, off the critical path**, and attach when their own gates pass:
 
 - **Pixel world model.** "Pixels from the start" is kept, but it does not block Phase 3.
 - **SAM2 and Grounding DINO**, in Stage B.
-- **Full MuJoCo sysid.** In Stage A, sim covers kinematics, safety-box validation and the HER unit tests.
+- ~~**Full MuJoCo sysid.** In Stage A, sim covers kinematics, safety-box validation and the HER unit tests.~~ **[v3]** Sysid is now on the critical path, as gate S2.
+
+### [v3] Sim-first track (decided 2026-10-05)
+
+Each skill is pre-trained in GPU sim to high success, deployed on the real arm, then fine-tuned with real RL. The real arm is used for evaluation, sysid data and fine-tuning, not for learning from scratch.
+
+**S0: GPU sim backend.**
+- **Version pin:** one MuJoCo version in *every* pixi env, so the physics we train on is the physics we test on. On 2026-10-05 `cpu` had mujoco 3.13 / torch 2.11 while `default` had mujoco 3.3.2 / torch 2.7.1. Add `mujoco-warp` + `warp-lang` (conda-forge or PyPI, torch interop through `wp.to_torch`, no JAX) to the `sim` feature.
+- **Collision meshes:** replace the MJCF's link collision meshes with primitives or convex hulls of about 32 vertices or fewer, like the jaw boxes we already add.
+- **Integrator:** check the MJCF integrator against MuJoCo Warp's supported list. Its PyPI metadata lists IMPLICITFAST as unsupported.
+- **Measure, as gates:**
+  - steps/s against N parallel envs on our scene;
+  - VRAM;
+  - contact-buffer overflow (`nconmax`);
+  - parity against CPU MuJoCo, meaning the same trajectory within tolerance.
+
+**S1: Batched servo-parity env.** A torch-batched goal env on MuJoCo Warp that reproduces the ServoCore tick semantics exactly:
+- 3 servo ticks per policy step;
+- the same clamp chain in tick units (delta clamp, joint limits, velocity cap, tracking-error clamp, box);
+- the calibration mapping;
+- an action-delay FIFO;
+- the applied post-clamp action as the logged action.
+
+A **parity test** runs the same action sequence through `ServoCore` + `MujocoBus` and through the batched env, and requires identical goal sequences and matching trajectories within tolerance. A policy trained in sim must not see any rule the real servo loop wouldn't apply.
+
+**S2: Sysid gate.**
+- **Data:** log real multisine and random-policy trajectories through ServoCore. This needs the Phase 0 e-stop and deadman, and runs Tier 0 (attended).
+- **Fit:** fit kp, kv, damping, armature, friction and delay as parallel worlds with CMA-ES or Optuna. The gripper is the likeliest misfit, and BAM / Rhoban STS3215 data can serve as a prior.
+- **Pass:** held-out `compare-real` within 5 % RMS of each joint's range.
+- **Use:** the fitted values become the **centre** of the randomisation ranges.
+
+**S3: Randomisation set**, in priority order. Each range is widened only after the task reaches ≥ 70 % success in sim.
+1. D435 / tracker pose and noise. The simulated die tracker reproduces the real one's noise, delay and occlusion, including UNKNOWN when the gripper covers the die.
+2. Servo kp, kv, friction, damping and armature (±25 % around the sysid fit), plus a servo delay of 2–5 ticks.
+3. Backlash and proprio noise.
+4. Die mass, size and friction, and gripper closing speed.
+5. Lighting. This only matters for the pixel world-model track.
+
+**S4: Per-skill pre-training.**
+- **Learner and inputs:**
+  - Massively parallel SAC with 1024–2048 envs.
+  - The policy sees state only: noisy joints, the last action, the goal, and the die from the simulated tracker.
+  - The critic is privileged and sees the true sim state.
+- **Gates:**
+  - **Feasibility and predicate gates first** (L1, L2): the task must be reachable, and the success predicate must not be gameable, both checked in sim before any reward tuning.
+  - **Exit gate:** ≥ 95 % success over 1000 randomised episodes, with no predicate gaming visible in rendered rollouts.
+- **Wall-clock estimates on the 3080:** these are research estimates, not measurements.
+
+  | Skill | Estimate |
+  |---|---|
+  | Reach | 10–30 min |
+  | Die push to zone | 1–4 h |
+  | Place | 4–12 h, and may need scripted-IK seeds (L3) |
+
+**S5: Real deployment and fine-tuning.**
+1. Zero-shot evaluation on the real arm, with N episodes and a confidence bound.
+2. Fine-tuning with SAC + HER on real data.
+3. TD-MPC2: its world model and critic are pre-trained offline from sim rollouts, then it fine-tunes on real data and is compared against SAC.
+4. Record the sim → real success gap per skill. It is the Stage A research result.
+
+**Pixels.** The pixel world model stays on its parallel track. MuJoCo Warp's batch renderer gives 64–96 px overhead frames at about 256 envs. A 1M-step pixel replay buffer does not fit in VRAM, so keep it in host RAM at 300k steps or fewer.
 - **Stage B/C extras:** native extensions, the ROS2 bridge and `pip install` support.
 
 ### Phase 0: Foundation — Stage A
@@ -263,6 +327,7 @@ These are developed **in parallel, off the critical path**, and attach when thei
   - **[v2] Camera-moved gate:** a fiducial fixed to the table in view is checked every episode. If its reprojection error is above 2 px, training halts.
   - **[v2] Reuse:** `LIT/scripts/calibrate_hand_eye.py` and `_object_pose_depth.py` (±3 mm over 3 runs). Whether hand-eye calibration was ever finished is not recorded.
 - Build a data logging pipeline for all episodes (states, actions, images, rewards). **[v2]** It logs the *applied* action (L4) and checks its output files (L12). **[v2]** Budget disk space: images at 30 Hz and 640×480 run to tens of GB per day. Store downscaled frames for world-model training, keep full frames only for evaluation and failure episodes, and delete anything older than N days.
+- **[v3]** GPU sim: S0 (backend and version pin) and S1 (servo-parity batched env) of the sim-first track belong to Phase 0. S2 sysid data collection follows once the e-stop and deadman pass.
 - Set up the MuJoCo model of the SO-101, matched to the real joint limits. **[v2]** Adopt the **official MJCF** from `TheRobotStudio/SO-ARM100/Simulation/SO101/` (`so101_new_calib.xml`, `scene.xml`) instead of building one from the URDF. Then system-identify it (see `05-Wiki/concepts/Sim-Calibration-Loop.md`) and validate it against logged real trajectories (L6). MuJoCo's contact fidelity for this arm is unproven, because GAUGE did not evaluate standalone MuJoCo.
 
 **Milestone:** the same script runs a random policy in both sim and real, safely, with logging. **[v2]** Add these checks:
@@ -312,10 +377,16 @@ These are developed **in parallel, off the critical path**, and attach when thei
 
 ### Phase 3: Reach Skill — Stage A
 
-- Goal-conditioned policy `reach(xyz)`. **[v2] Order:** SAC + HER runs first on the real arm, for a fast first result. TD-MPC2 + HER, the main algorithm, runs second, starting from the state-based world model, and is compared against it.
+- Goal-conditioned policy `reach(xyz)`. **[v3] Order:**
+  1. Sim pre-training with massively parallel SAC (S4).
+  2. Zero-shot real evaluation.
+  3. Real fine-tuning with SAC + HER.
+  4. TD-MPC2 + HER, pre-trained offline from sim rollouts, fine-tuned on the real arm and compared against SAC.
+
+  ~~SAC + HER first on the real arm from scratch.~~
 - **[v2]** Train a SAC + HER baseline on the same task, with the same budget of real steps. Compare the steps each one needs to reach 90% success.
 - Reward: negative distance from gripper to goal, with a success bonus.
-- Warm-start briefly in MuJoCo, then train on the real arm.
+- ~~Warm-start briefly in MuJoCo, then train on the real arm.~~ **[v3]** Pre-train in GPU sim to ≥ 95 %, then fine-tune on the real arm (sim-first track).
 - **[v2] Implementation facts** (checked in the LeRobot 0.6.0 source and the TD-MPC2 repo):
   - **SAC:**
     - SAC lives in `lerobot/rl/algorithms/sac/`, not `policies/sac`, and is tied to the HIL-SERL actor/learner gRPC split.
@@ -340,6 +411,7 @@ These are developed **in parallel, off the critical path**, and attach when thei
 - **[v2] Feasibility gate:** measure the real arm's minimum graspable height and its reach to the start well and the zone before training. Scripted IK seeds must reach 30% or more success on the real arm before they go into the buffer, otherwise they are not used.
 - ~~Bootstrap with 10–20 teleop demos~~ **[v2]** The main path is pure RL (TD-MPC2 + HER + shaped reward). Scripted IK grasps may seed the replay buffer as RLPD-style demos. Residual RL is a fallback only (see §10).
 - Reuse the reach skill and the world model.
+- **[v3]** Pre-train die-to-zone in GPU sim first (S4, push and place, with the simulated tracker including occlusion). Real fine-tuning starts from the sim policy. The gravity-return tray is modelled in sim, too.
 
 **Milestone:** ~~stable grasp of 2–3 different objects at a success rate above 70%~~ **[v2]** die-to-zone above 70% success over N=50 episodes. A second and third object are named and pass the L1 gate before they are added.
 
@@ -368,7 +440,8 @@ These are developed **in parallel, off the critical path**, and attach when thei
 | Native extensions | **[v2]** Optional C++ (nanobind or scikit-build-core) or Rust (PyO3 or maturin), added only after profiling identifies a hot path |
 | Packaging and environments | **[v2] Decided: a pixi package** (user requirement). It is its own workspace, separate from the `LIT` pixi.toml, which is fragile because gymnasium conflicts with sheeprl. Heavy optional stacks (perception, sim, LLM) go in pixi features and environments so the core env stays small. The layout is still open (§8). |
 | Simulation | MuJoCo. **[v2] Decided** (§10). It supersedes the Isaac choice in the May 2026 vault plans for this project. The model is the **official MJCF** (onshape-to-robot, class `sts3215` actuators). Its damping, armature and friction come from Open Duck Mini and are not identified for the SO-101, so treat kp, kv, damping and armature as sysid targets. Add primitive jaw collision geoms (its mesh-to-mesh contact is slow), a rest-pose keyframe, and a test for the gripper mapping between 0–100 and radians. |
-| RL | TD-MPC2 (main), with HER implemented in the replay buffer. **[v2]** Not installed and never run. The **SAC + HER baseline** is decided. DreamerV3 (sheeprl) is the tested alternative. |
+| RL | **[v3]** **Sim:** massively parallel SAC (FastSAC/Squint-style) on MuJoCo Warp. **Real:** SAC + HER (SB3) fine-tuning, and TD-MPC2 + HER (vendored), pre-trained offline from sim rollouts. DreamerV3 (sheeprl) is the tested alternative. |
+| GPU simulation | **[v3]** MuJoCo Warp (`mujoco-warp`, `warp-lang`) with torch interop, no JAX, in the `sim` feature. It is alpha, so its throughput and parity are gates (S0). Fallback: ManiSkill3, which has SO-101 tasks via Squint but runs on PhysX and would need a port. Rejected: Isaac Lab (needs 16 GB or more) and MJX/Playground (JAX next to torch). |
 | Segmentation | SAM2 **[v2] (Stage B; Stage A uses an HSV colour threshold + depth)** |
 | Detection and labeling | Grounding DINO **[v2] (Stage B)** |
 | Camera | pyrealsense2. **[v2]** Version 2.57.7 is installed. |
@@ -382,7 +455,9 @@ These are developed **in parallel, off the critical path**, and attach when thei
 |---|---|
 | Servo wear or overheating | Temperature monitoring, duty cycle limits, action smoothing. **[v2]** Measure duty cycle in Phase 0 and Phase 2. |
 | Manual resets slow down training | Self-resets from phase 5; a tray or bounded workspace. **[v2]** Design for resets from Phase 0, and start with reset-free skills. |
-| Sim-to-real gap | Keep sim light; domain randomization; most training on the real arm. **[v2]** Validate the sim against real trajectories. |
+| Sim-to-real gap | ~~Keep sim light; most training on the real arm.~~ **[v3]** Sysid gate S2, with fitted values as the randomisation centre; the S1 servo-parity env, so sim applies exactly the real clamp and tick rules; a simulated tracker with real noise, delay and occlusion; and real fine-tuning. The sim → real gap is measured per skill. |
+| **[v3]** MuJoCo Warp is alpha (nondeterministic GPU execution, some solvers and integrators unsupported) | Gate S0 measures throughput and parity against CPU MuJoCo before any training. ManiSkill3 is the fallback. |
+| **[v3]** The overhead camera and push contacts are not covered by the Squint evidence (it used a wrist camera) | Simulate the overhead tracker with occlusion. Treat die push and place transfer as the open research question, and measure it. |
 | Sparse rewards for grasping | HER, demos, dense shaped rewards from perception. **[v2]** Add residual RL on a scripted base. |
 | Perception errors corrupt rewards | Validate the object table; use the ArUco marker as ground truth at first. **[v2]** Measure the verifier's false-accept rate before training. |
 | Unsafe exploration | Hard safety layer independent of the policy |
@@ -402,8 +477,8 @@ These are developed **in parallel, off the critical path**, and attach when thei
 - [x] Which objects to use for the first grasp experiments: **the red 16 mm die, moved into a marked zone** (§10)
 - [x] Local or API LLM for the planner: **API** (default, §10)
 - [x] Control frequency: **the policy runs at 10 Hz, and the safety and servo loop at 30 Hz or faster with interpolation** (§10)
-- [x] **[v2]** Simulator: **MuJoCo** (§10)
-- [x] **[v2]** Main RL algorithm: **TD-MPC2, with a SAC + HER baseline** (§10)
+- [x] **[v2]** Simulator: **MuJoCo** (§10). **[v3]** GPU: **MuJoCo Warp**, sim-first pre-training (§10).
+- [x] **[v2]** Main RL algorithm: **TD-MPC2, with a SAC + HER baseline** (§10). **[v3]** Sim: massively parallel SAC; real: SAC + HER fine-tuning, and TD-MPC2 pre-trained from sim rollouts (§10).
 - [x] **[v2]** Skill learning: **pure RL everywhere** (§10). A fallback to residual RL is decided per case.
 - [x] **[v2]** Demo source: **scripted IK seeds** (§10)
 - [x] **[v2]** Autonomy and consent model: **a hardware e-stop, then tiered autonomy** (§10)
@@ -450,6 +525,10 @@ Each decision is recorded here once it is made, so it is not argued again.
 | 2026-10-02 | Heartbeat miss policy | In normal running, latch when the MCU reports latched or after 5 consecutive missed heartbeat acknowledgements (about 150 ms, inside the MCU's 1 s deadline). Re-energise stays strict: one miss aborts it. | User answer to the U3 review. One lost USB echo must not end an unattended run. |
 | 2026-10-02 | State record `read_ok` | The F3 shared-memory state record gets a `read_ok` flag, so readers can tell a fresh reading from a repeated one | User answer to the U3 review |
 | 2026-10-02 | Stop during re-energise | A stop (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT, STOP_REQ) during the re-energise ramp hands over to the time-bounded safe-state sequence back to rest, with heartbeats. A stop before torque-on never energises. A second stop signal, or the e-stop, cuts torque or power immediately. | User answer to the U3 fix report. Keeps the rule that every exit goes through the safe-state sequence. |
+| 2026-10-05 | Sim role | **Sim-first pre-training**: each skill is trained to ≥ 95 % in GPU sim with heavy randomisation, deployed zero- or few-shot on the real arm, then fine-tuned with real RL. Supersedes "sim light, warm-start only" (L6 revisited). | User request plus research: Squint, arXiv 2602.21203, zero-shot SO-101 transfer with 91 % success |
+| 2026-10-05 | GPU simulator | MuJoCo Warp on the RTX 3080, in the same engine family as our MJCF and MujocoBus. One MuJoCo version pinned across all pixi envs. ManiSkill3 is the fallback. | User answer. Isaac Lab doesn't fit 10 GB, and MJX would need JAX next to torch. |
+| 2026-10-05 | Sim/real algorithm split | Massively parallel SAC in sim. Its rollouts pre-train TD-MPC2's world model and critic offline, then SAC + HER and TD-MPC2 fine-tune on the real arm. | User answer. TD-MPC2's MPPI is too slow at 1000+ envs. |
+| 2026-10-05 | Pre-training observations | State plus a simulated overhead tracker (noise, delay, occlusion), with a privileged critic. Works with the current D435. Pixels stay on the parallel world-model track, and no wrist camera is added. | User answer |
 | 2026-09-30 | RL algorithm | TD-MPC2 as main, plus a SAC + HER baseline on reach | Tests whether the world model helps. Fitting in 10 GB is a hypothesis to be measured in Phase 2. TD-MPC2 is **vendored** (MIT licence, no packaging files in the repo). |
 | 2026-09-30 | Simulator | MuJoCo, using the official TheRobotStudio MJCF, system-identified | Light on VRAM, good contacts. Supersedes the Isaac choice from the earlier plans for this project. |
 | 2026-09-30 | Autonomy | Hardware e-stop, then tiers: attended until the 30-minute soak test passes, then unattended with a watchdog that cuts power | Resolves the conflict between minimal human time and the current consent rule. |
@@ -499,6 +578,22 @@ Each decision is recorded here once it is made, so it is not argued again.
 - `LIT/plans/2026-09-12-overhead-verification-camera-plan.md`
 - `/mnt/data/workspaces/robot_data_runner`
 - `~/tools/claude_code/skills/binary_success_verifier`
+
+**[v3] Sim pre-training sources:**
+
+- Squint, arXiv 2602.21203 (zero-shot SO-101 transfer)
+- MuJoCo Warp: https://github.com/google-deepmind/mujoco_warp and https://pypi.org/project/mujoco-warp/
+- GPUSimBench, arXiv 2607.13059
+- FastSAC / SAC on massive sim: https://araffin.github.io/post/sac-massive-sim/
+- SimLauncher, arXiv 2507.04452
+- BAM actuator models: https://github.com/Rhoban/bam
+- so101-magic (mjlab + fitted motor model): https://github.com/bigfoot1144/so101-magic
+
+**Vault:**
+
+- `05-Wiki/concepts/Domain-Randomization-(SO-101-MuJoCo).md`
+- `Sim-to-Real-Transfer.md`
+- `Actuator-System-Identification.md`
 
 **Papers:**
 

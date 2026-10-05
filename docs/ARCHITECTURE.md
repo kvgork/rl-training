@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.9 (2026-10-02). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.10 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -363,17 +363,24 @@ These are ordered from the outermost layer to the innermost.
 
 ## 7. Data and learning flow (Stage A)
 
+**Sim-first** (plan §10, 2026-10-05; plan §5 "Sim-first track"). Status: *planned*, not yet implemented.
+
 ```
-goal babbling ──► episode logger ──► replay buffer (RAM; ≤300k pixel steps)
-                                         │
-             state WM  ◄─────────────────┤
-             SAC+HER (SB3 HerReplayBuffer)◄┤   ← first on real arm
-             TD-MPC2+HER (vendored, relabel in _prepare_batch) ◄┘
-                                         │
-                   MuJoCo reach ≥90% gate before any real-arm episode
+ SIM (RTX 3080, MuJoCo Warp, 1024–2048 envs)                REAL ARM (ServoCore)
+ ┌───────────────────────────────────────────┐            ┌──────────────────────────┐
+ │ batched servo-parity env (S1)              │            │ zero-shot eval (N eps)   │
+ │  same tick rules: 3 ticks/step, clamps,    │  policy    │        │                 │
+ │  delay FIFO, applied action, sim tracker   │──────────► │ SAC+HER fine-tune (real) │
+ │ massively parallel SAC, privileged critic  │            │ TD-MPC2+HER fine-tune    │
+ │ DR centred on sysid fit (S2/S3)            │  rollouts  │  (WM + critic pre-trained│
+ │ exit gate ≥95 % over 1000 DR episodes      │──────────► │   offline from sim logs) │
+ └───────────────────────────────────────────┘            └──────────────────────────┘
+           ▲ sysid fit (CMA-ES / Optuna, parallel worlds)          │ real logs
+           └───────────────── compare-real ≤5 % RMS ◄──────────────┘
 ```
 
-**Sysid** fitting is a parallel track. Phase 0 only *checks* the error: `pixi run compare-real` must stay within 5 % RMS of each joint's range.
+- **Parity rule:** the batched sim env must reproduce `ServoCore` + `MujocoBus` exactly. A parity test requires identical goal sequences for the same actions.
+- **Sysid is a gate (S2), not a parallel track.** `pixi run compare-real` checks the error, and the fitted parameters become the centre of the domain randomisation.
 
 - **Reward and success** come from the object table and FK, never from pixels.
 - **The pixel world model** is a parallel track, with a fused RGB-conv and state-MLP encoder feeding SimNorm. It may drive MPPI on the real arm only after it passes the cross-session gate: a different day, under different lighting.
@@ -383,7 +390,7 @@ goal babbling ──► episode logger ──► replay buffer (RAM; ≤300k pix
 | Pixi feature | Contents | Used by |
 |---|---|---|
 | core (default deps) | python 3.12, numpy 2.2, conda `pytorch` + torchvision (variant chosen by `gpu`/`cpu`), lerobot[feetech,grpcio-dep] 0.6.1 (PyPI), gymnasium, h5py, pyyaml, pytest, hypothesis, ruff | servo, safety, env |
-| `sim` | mujoco-python (conda-forge) | sim, tests |
+| `sim` | mujoco-python (conda-forge). **Planned:** `mujoco-warp` and `warp-lang`, with **one MuJoCo version pinned across `cpu` and `default`**. On 2026-10-05 `cpu` had mujoco 3.13 while `default` had 3.3.2. | sim, tests, GPU pre-training (`default` env) |
 | `perception` | opencv (conda-forge), pyrealsense2 (PyPI) | perception |
 | `train` | torchrl, tensordict, stable-baselines3, hydra-core, omegaconf, termcolor, pandas (PyPI) | rl, wm |
 | `gpu` | `pytorch-gpu`, `cuda-version` 12.8 (re-pin to the driver's CUDA after H1) | training on the RTX 3080 |
@@ -408,7 +415,7 @@ The full log is in plan §10. The decisions that shape this architecture are:
 - pure Python, with no ROS2;
 - a separate real-time servo process;
 - clamped joint deltas at 10 Hz;
-- MuJoCo with the official MJCF;
+- MuJoCo with the official MJCF. **GPU sim-first pre-training with MuJoCo Warp** (2026-10-05) trains SAC at scale in sim, then fine-tunes on the real arm;
 - TD-MPC2 vendored, with a SAC + HER baseline run first;
 - a colour + depth tracker in Stage A;
 - a pixel world model, off the critical path;
@@ -438,3 +445,4 @@ Bump the version line at the top and add an entry below.
 | 0.7 | 2026-10-01 | Wave 2 (U3). §3: the servo process as built: CLI and backends, start-up order, RT setup and `rt_active`, the deadline loop with resync, signals and exit codes, the single-instance shm lock, the tick log and summary, and the soak harness and gate. §4: `servo/core.py`, `process.py`, `main.py`, `soak.py`, `latency.py`. §5: the servo core: `build_servo_core`, the keyword-only extension of the F6 `ServoCore` signature, the tick order and per-state duties, command timing, heartbeat and boot-latch handling, the thermal resume, the state-record semantics with `log_row`, the tick log, and `FakeBus(record_writes=False)`. §6: the core repeats `check_range` before every write, and LATCHED sends no heartbeat. §8: `servo-fake` uses the repository copy of the calibration. |
 | 0.8 | 2026-10-02 | U3 review fixes (`plans/reviews/2026-10-01-u3-review.md`) and the 2026-10-02 plan §10 decisions. §3: the real-arm start order (port without handshake → button + ARM → ping → re-energise), the serial-port locks, SIGHUP/SIGQUIT and the re-energise abort, the overrun wording, the soak gate's validity checks, gap endpoints and HOLD count, the `soak-fake` task. §5: `Bus.connect` without handshake and `write_goal` = transmitted, `FakeBus(power=, boot_ms=)`, `reenergize(should_abort=)` / `ReenergizeAborted`, the tri-state `HeartbeatLink.send -> HbSend` with `last_status`, `SmInputs.hb_misses` and the 5-miss budget (re-energise strict), command freshness / pending delta / drain, the state record's `read_ok` (F3 layout v2) and zeroed applied delta. §6: the host-side miss budget and the LATCHED row. §8: `soak-fake`. |
 | 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
+| 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
