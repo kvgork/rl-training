@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.10 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.11 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -296,6 +296,9 @@ These are ordered from the outermost layer to the innermost.
        | 6 | MCU_RESET |
        | 7 | WELD |
      - A partial heartbeat frame is dropped after 100 ms.
+     - **Host side** (`SerialHeartbeatLink`):
+       - A heartbeat counts as delivered only once all 3 bytes are out. A partial write returns NOT_DELIVERED, and the next send with the same seq completes the tail.
+       - A tail older than 80 ms is dropped, never sent. The link writes nothing until 120 ms after the last byte, so a stale tail can't be read as commands (for example seq 0x5A as ARM).
      - The spec is `firmware/watchdog_mcu/PROTOCOL.md`. `FakeMcu` is kept byte-identical to the firmware `Core` by replaying every test vector through both.
    - **Voltage sensing (two dividers):**
      - The PSU-side divider sits before the e-stop and relay (GP26). It gates ARM on undervoltage.
@@ -446,3 +449,4 @@ Bump the version line at the top and add an entry below.
 | 0.8 | 2026-10-02 | U3 review fixes (`plans/reviews/2026-10-01-u3-review.md`) and the 2026-10-02 plan §10 decisions. §3: the real-arm start order (port without handshake → button + ARM → ping → re-energise), the serial-port locks, SIGHUP/SIGQUIT and the re-energise abort, the overrun wording, the soak gate's validity checks, gap endpoints and HOLD count, the `soak-fake` task. §5: `Bus.connect` without handshake and `write_goal` = transmitted, `FakeBus(power=, boot_ms=)`, `reenergize(should_abort=)` / `ReenergizeAborted`, the tri-state `HeartbeatLink.send -> HbSend` with `last_status`, `SmInputs.hb_misses` and the 5-miss budget (re-energise strict), command freshness / pending delta / drain, the state record's `read_ok` (F3 layout v2) and zeroed applied delta. §6: the host-side miss budget and the LATCHED row. §8: `soak-fake`. |
 | 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
 | 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
+| 0.11 | 2026-10-05 | U3 verification follow-ups. §6: host-side heartbeat partial-frame rule (delivered only when the frame is complete; stale tails over 80 ms dropped). New tests cover the strict re-energise heartbeat on a lost or latched echo, and the abort check just before torque-on. |
