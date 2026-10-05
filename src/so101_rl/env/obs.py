@@ -22,6 +22,7 @@ or last-known die xyz (die), ``desired_goal`` = goal xyz / zone centre; the poli
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -170,21 +171,29 @@ def build_policy_obs_np(
     return out
 
 
-_TORCH_SCALES: dict[tuple[int, str], tuple[object, ...]] = {}
+# cfg -> {device: (max_ticks_per_tick, max_delta_ticks)}. Weak keys: an entry lives exactly as long as its config
+# (So101Config is eq=False, so it hashes by identity), so the cache stays bounded by the live configs and a dead
+# config's id can never alias a new one.
+_TORCH_SCALES: weakref.WeakKeyDictionary[So101Config, dict[str, tuple[torch.Tensor, torch.Tensor]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _torch_scales(cfg: So101Config, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """``max_ticks_per_tick`` / ``max_delta_ticks`` as float64 tensors, built once per (cfg, device): no host->device
-    copy per step (CUDA-graph friendly). The cfg is kept alive in the cache so its id cannot be reused."""
+    copy per step (CUDA-graph friendly)."""
     import torch
 
-    key = (id(cfg), str(device))
-    hit = _TORCH_SCALES.get(key)
-    if hit is None or hit[0] is not cfg:
+    per_cfg = _TORCH_SCALES.get(cfg)
+    if per_cfg is None:
+        per_cfg = _TORCH_SCALES[cfg] = {}
+    key = str(device)
+    hit = per_cfg.get(key)
+    if hit is None:
         per_tick = torch.tensor(cfg.action.max_ticks_per_tick.tolist(), dtype=torch.float64, device=device)
         max_delta = torch.tensor(cfg.action.max_delta_ticks.tolist(), dtype=torch.float64, device=device)
-        hit = _TORCH_SCALES[key] = (cfg, per_tick, max_delta)
-    return hit[1], hit[2]
+        hit = per_cfg[key] = (per_tick, max_delta)
+    return hit
 
 
 def build_policy_obs_torch(

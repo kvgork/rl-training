@@ -112,9 +112,9 @@ def test_die_block_required_exactly_for_die_layouts(cfg):
 
 
 def test_env_obs_and_tasks_do_not_import_safety():
-    """D-DEPS: env/ never imports safety/ clamps (and these two modules import nothing but config)."""
+    """D-DEPS: env/ never imports safety/ clamps (these modules import only config and each other)."""
     root = Path(__file__).parent.parent / "src" / "so101_rl" / "env"
-    for name in ("obs.py", "tasks.py"):
+    for name in ("obs.py", "tasks.py", "reward.py"):
         tree = ast.parse((root / name).read_text())
         mods = {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
         mods |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
@@ -137,3 +137,23 @@ def test_die_block_visible_age_and_never_seen(cfg):
             die=DieObsT(torch.zeros(1, 3), torch.tensor([True]), torch.tensor([age])), out=torch.empty(1, 26),
         )
         assert float(t[0, 25]) == pytest.approx(expect) and float(t[0, 24]) == 1.0
+
+
+def test_torch_scale_cache_is_weak_and_bounded(calibration):
+    """The per-(cfg, device) tensor cache must not keep configs alive (SU0 review NIT)."""
+    import gc
+
+    import torch
+
+    from so101_rl.config import load_config
+    from so101_rl.env import obs
+
+    before = len(obs._TORCH_SCALES)
+    cfgs = [load_config(calibration=calibration) for _ in range(3)]
+    for c in cfgs:
+        a = obs._torch_scales(c, torch.device("cpu"))
+        assert obs._torch_scales(c, torch.device("cpu"))[0] is a[0]  # cached per (cfg, device)
+    assert len(obs._TORCH_SCALES) == before + 3
+    del cfgs, c
+    gc.collect()
+    assert len(obs._TORCH_SCALES) == before

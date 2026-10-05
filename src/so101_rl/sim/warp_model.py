@@ -27,6 +27,21 @@ plan's names came from the 3.5 package and all still hold, plus the additions ma
 - ``wp.ScopedCapture`` around ``nsteps`` calls of ``step`` captures without a warm-up call and does not advance
   the state; ``wp.capture_launch(graph, stream)`` replays it.
 
+Unbatched fields and ``stat.meaninertia`` (verified in the 3.14 source, ``io.put_model`` / ``set_const`` /
+``solver``): ``batch_sizes`` only accepts ``Model`` fields, and ``Model.stat`` (a ``Statistic``) is created with a
+leading dimension of 1 regardless. ``stat.meaninertia`` is still declared per-world (``array("*", float)``): the
+solver reads ``meaninertia[worldid % shape[0]]`` (it scales the convergence tolerance) and ``set_const`` launches
+one thread per row of it. This wrapper therefore replaces it with an ``[nworld]`` array right after ``put_model``
+(before any graph capture), so ``set_world_params`` -> ``set_const`` gives each world its own mean inertia instead
+of world 0's. Every other ``Model`` field not in :data:`BATCHED_FIELDS` is shared by all worlds.
+
+Determinism: NOT bitwise reproducible. All worlds share one contact pool filled with atomics (``nacon``), so the
+contact (and constraint-row) order within a world can change between runs and the solver sums in that order; the
+float32 differences are then amplified by contact dynamics. Measured 2026-10-05 (two identical runs, 256 worlds,
+1020 mj_steps of random ctrl from ``home``): every world differed, max |dqpos| 0.041 rad. Short smooth runs agree
+to float32 rounding (graph replay vs eager over 102 steps: 1e-6, test). Seeded training runs are therefore
+reproducible statistically, not bitwise; per-world results never depend on the other worlds' parameters.
+
 Streams: Warp launches on its own (non-blocking) device stream, torch on its current stream. Every public call
 fences both ways with events (no host sync), so torch writes to ``ctrl``/``qpos`` happen before the graph and torch
 reads of ``qpos``/``site_xpos`` after it. Graphs bake in array pointers: nothing here rebinds a Model/Data array
@@ -50,7 +65,7 @@ from so101_rl.config.schema import JOINT_NAMES, SimWarpConfig
 if TYPE_CHECKING:  # FS7 (SU2) defines BatchedSimParams; set_world_params only needs its attributes
     from so101_rl.sim.sysid.params import BatchedSimParams
 
-__all__ = ["BATCHED_FIELDS", "BUFFER_OVERFLOW_MASK", "ContactBufferOverflow", "WarpSim", "WarpSizes"]
+__all__ = ["BATCHED_FIELDS", "BUFFER_OVERFLOW_MASK", "PARAM_RULES", "ContactBufferOverflow", "WarpSim", "WarpSizes"]
 
 # Model fields allocated with a leading world dimension (per-world sysid / domain randomisation, FS7/FS8).
 BATCHED_FIELDS: Final[tuple[str, ...]] = (
@@ -78,6 +93,37 @@ BUFFER_OVERFLOW_MASK: Final[int] = int(mjw.OverflowType.ALL) & ~_SOLVER_FLAGS
 DIE_BODY: Final[str] = "die"
 DIE_GEOM: Final[str] = "die_geom"
 TABLE_GEOM: Final[str] = "table"
+
+
+# set_world_params value rules: True = strictly positive, False = non-negative (all must be finite).
+PARAM_RULES: Final[dict[str, bool]] = {
+    "kp": True,
+    "kv": False,
+    "damping": False,
+    "frictionloss": False,
+    "armature": False,
+    "forcerange": True,
+    "die_mass": True,
+    "die_friction": False,
+    "table_friction": False,
+}
+
+
+def _validate_params(raw: dict[str, torch.Tensor]) -> None:
+    """Raise ValueError naming every out-of-range field. Host tensors are checked on the host; device tensors are
+    reduced on the device and read back with ONE copy for all of them."""
+    names = list(raw)
+    flags = [
+        (~torch.isfinite(raw[k].double()) | ((raw[k] <= 0) if PARAM_RULES[k] else (raw[k] < 0))).any() for k in names
+    ]
+    bad: list[str] = [k for k, f in zip(names, flags, strict=True) if f.device.type == "cpu" and bool(f)]
+    dev = [(k, f) for k, f in zip(names, flags, strict=True) if f.device.type != "cpu"]
+    if dev:
+        host = torch.stack([f for _, f in dev]).cpu()  # the one device->host sync
+        bad += [k for (k, _), b in zip(dev, host.tolist(), strict=True) if b]
+    if bad:
+        rules = ", ".join(f"{k} {'> 0' if PARAM_RULES[k] else '>= 0'}" for k in bad)
+        raise ValueError(f"invalid world params (non-finite or out of range): {rules}")
 
 
 class ContactBufferOverflow(RuntimeError):
@@ -128,6 +174,10 @@ class WarpSim:
         mem0 = self._mempool_used()
         with wp.ScopedDevice(self._wp_device):
             self.m = mjw.put_model(model, batch_sizes=dict.fromkeys(BATCHED_FIELDS, nworld))
+            # stat is not covered by batch_sizes; meaninertia is per-world in every kernel that reads it (docstring)
+            mi = wp.array(np.full(nworld, model.stat.meaninertia, dtype=np.float32), dtype=wp.float32)
+            mi._is_batched = True
+            self.m.stat.meaninertia = mi
             # print only real capacity overflows; solver-iteration limits are counted in stats instead
             self.m.opt.warn_overflow = BUFFER_OVERFLOW_MASK
             self.d = mjw.make_data(model, nworld=nworld, njmax=cfg.njmax, nconmax=cfg.nconmax_per_world)
@@ -144,9 +194,11 @@ class WarpSim:
         self._contact_geom, self._contact_world = t(self.d.contact.geom), t(self.d.contact.worldid)
         self._overflow_acc = torch.zeros(nworld, dtype=torch.int32, device=self.device)
         self._contact_idx = torch.arange(self.sizes.naconmax, device=self.device, dtype=torch.int32)
+        self._geom_sets: dict[tuple[tuple[int, ...], tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
 
         # Per-world parameter views (shape [N, ...]); in-place writes keep the graph pointers valid.
         self._p = {name: t(getattr(self.m, name)) for name in BATCHED_FIELDS}
+        self._meaninertia = t(self.m.stat.meaninertia)  # [N]
         self._arm_dofs = torch.tensor(
             [int(model.jnt_dofadr[model.joint(n).id]) for n in JOINT_NAMES], device=self.device, dtype=torch.long
         )
@@ -325,7 +377,7 @@ class WarpSim:
             self._act.masked_fill_(m2, 0.0)
         self._forward()
 
-    def set_world_params(self, params: BatchedSimParams) -> None:
+    def set_world_params(self, params: BatchedSimParams, *, validate: bool = True) -> None:
         """Per-world servo, die and table parameters (FS7 ``BatchedSimParams``; attributes used, no import).
 
         ``kp``/``kv`` -> position actuator ``gainprm[0] = kp``, ``biasprm[1] = -kp``, ``biasprm[2] = -kv``;
@@ -335,37 +387,49 @@ class WarpSim:
         the max of the two geoms (the jaw boxes have 1.2), so randomise ``die_friction`` above the partner geoms'
         values or lower those (FS8 decides; this method only writes the per-geom values). ``delay_ticks`` / ``deadband_ticks`` are
         servo-chain parameters (env side), not physics. Runs ``mjw.set_const`` so the derived constants
-        (subtree mass, invweight0, actuator_acc0) follow mass and armature.
+        (subtree mass, invweight0, actuator_acc0, meaninertia) follow mass and armature.
+
+        Writes are in place, so captured step graphs pick the new values up on their next replay (test-pinned).
+
+        ``validate`` (default on) rejects non-finite values and out-of-range ones (:data:`PARAM_RULES`: ``kp``,
+        ``forcerange``, ``die_mass`` > 0; the rest >= 0) BEFORE anything is written, naming the field. Inputs on the
+        host (numpy, CPU tensors — the FS7/FS8 samplers' output) are checked on the host: no device sync. Inputs
+        already on the GPU cost exactly one device->host sync for all fields together; a caller that validated at
+        its sampler passes ``validate=False`` to keep resets sync-free.
         """
         self._check_open()
-        self._torch_after_warp()
         n = self.sizes.nworld
-        p = self._p
-
-        def col(x: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
-            x = torch.as_tensor(x, device=self.device, dtype=torch.float32)
+        shapes = {"kp": (n, 6), "kv": (n, 6), "damping": (n, 6), "frictionloss": (n, 6), "armature": (n, 6),
+                  "forcerange": (n, 6), "die_mass": (n,), "die_friction": (n,), "table_friction": (n,)}
+        raw: dict[str, torch.Tensor] = {}
+        for name, shape in shapes.items():
+            x = torch.as_tensor(getattr(params, name))
             if tuple(x.shape) != shape:
-                raise ValueError(f"expected shape {shape}, got {tuple(x.shape)}")
-            return x
-
-        kp, kv = col(params.kp, (n, 6)), col(params.kv, (n, 6))
+                raise ValueError(f"{name}: expected shape {shape}, got {tuple(x.shape)}")
+            raw[name] = x
+        if validate:
+            _validate_params(raw)
+        self._torch_after_warp()
+        v = {k: x.to(device=self.device, dtype=torch.float32) for k, x in raw.items()}
+        p = self._p
+        kp, kv = v["kp"], v["kv"]
         act = self._actuators
         p["actuator_gainprm"][:, act, 0] = kp
         p["actuator_biasprm"][:, act, 1] = -kp
         p["actuator_biasprm"][:, act, 2] = -kv
-        fr = col(params.forcerange, (n, 6))
+        fr = v["forcerange"]
         p["actuator_forcerange"][:, act, 0] = -fr
         p["actuator_forcerange"][:, act, 1] = fr
         dofs = self._arm_dofs
-        p["dof_damping"][:, dofs] = col(params.damping, (n, 6))
-        p["dof_armature"][:, dofs] = col(params.armature, (n, 6))
-        p["dof_frictionloss"][:, dofs] = col(params.frictionloss, (n, 6))
+        p["dof_damping"][:, dofs] = v["damping"]
+        p["dof_armature"][:, dofs] = v["armature"]
+        p["dof_frictionloss"][:, dofs] = v["frictionloss"]
         die_b, die_g, table_g = self.model.body(DIE_BODY).id, self.model.geom(DIE_GEOM).id, self.model.geom(TABLE_GEOM).id
-        mass = col(params.die_mass, (n,))
+        mass = v["die_mass"]
         p["body_mass"][:, die_b] = mass
         p["body_inertia"][:, die_b] = self._nominal_body_inertia[die_b] * (mass / self._nominal_body_mass[die_b])[:, None]
-        p["geom_friction"][:, die_g, 0] = col(params.die_friction, (n,))
-        p["geom_friction"][:, table_g, 0] = col(params.table_friction, (n,))
+        p["geom_friction"][:, die_g, 0] = v["die_friction"]
+        p["geom_friction"][:, table_g, 0] = v["table_friction"]
         self._warp_after_torch()
         with wp.ScopedDevice(self._wp_device), wp.ScopedStream(self._wp_stream):
             mjw.set_const(self.m, self.d)  # not captured: allocates scratch, runs rarely (episode resets)
@@ -377,10 +441,18 @@ class WarpSim:
         self._check_open()
         self._torch_after_warp()
         ng = self.model.ngeom
-        in_a = torch.zeros(ng + 1, dtype=torch.bool, device=self.device)  # index ng = "no geom" (-1, flex)
-        in_b = torch.zeros_like(in_a)
-        in_a[torch.as_tensor(list(geoms_a), dtype=torch.long, device=self.device)] = True
-        in_b[torch.as_tensor(list(geoms_b), dtype=torch.long, device=self.device)] = True
+        key = (tuple(int(g) for g in geoms_a), tuple(int(g) for g in geoms_b))
+        sets = self._geom_sets.get(key)
+        if sets is None:  # built once per geom-set pair: no host->device copy on later calls
+            for g in (*key[0], *key[1]):
+                if not 0 <= g < ng:
+                    raise IndexError(f"geom id {g} outside 0..{ng - 1}")
+            in_a = torch.zeros(ng + 1, dtype=torch.bool, device=self.device)  # index ng = "no geom" (-1, flex)
+            in_b = torch.zeros_like(in_a)
+            in_a[torch.as_tensor(key[0], dtype=torch.long, device=self.device)] = True
+            in_b[torch.as_tensor(key[1], dtype=torch.long, device=self.device)] = True
+            sets = self._geom_sets[key] = (in_a, in_b)
+        in_a, in_b = sets
         g = self._contact_geom.long()
         g = torch.where(g < 0, ng, g)
         hit = (in_a[g[:, 0]] & in_b[g[:, 1]]) | (in_b[g[:, 0]] & in_a[g[:, 1]])
@@ -402,15 +474,27 @@ class WarpSim:
     def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
+        if exc is None:
+            self.close()
+            return
+        # Leaving with an exception: never replace it. A failing final check (overflow, or a CUDA error) is
+        # attached to the original exception as a note, and the original propagates.
+        try:
+            self.close()
+        except Exception as final:  # noqa: BLE001 - reported on the original exception, not swallowed
+            exc.add_note(f"WarpSim.close() final overflow check also failed: {type(final).__name__}: {final}")
 
     def close(self) -> None:
-        """Check for overflows one last time (a run cannot end with an undetected overflow), then release graphs."""
+        """Check for overflows one last time (a run cannot end with an undetected overflow), then release graphs.
+
+        Raises :class:`ContactBufferOverflow` like :meth:`check_overflow`; the instance is closed either way. Inside
+        ``with WarpSim(...)`` an exception already in flight is never masked (see ``__exit__``)."""
         if self._closed:
             return
         try:
             self.check_overflow()
         finally:
             self._graphs.clear()
+            self._geom_sets.clear()
             self._closed = True

@@ -396,3 +396,127 @@ def test_set_world_params_die_mass_runs_set_const(scene, cfg):
         p.kp = p.kp[:1]
         ws.set_world_params(p)
     ws.close()
+
+
+# ---------------------------------------------------------------- SU0 review fixes
+
+
+@gpu
+def test_params_changed_after_capture_are_replayed_per_world(scene, cfg):
+    """Regression: set_world_params after the first CAPTURED step must reach the replayed graph (in-place writes,
+    no rebinding), per world, and match an eager run with the same parameters set up front."""
+    import torch
+
+    model = scene[0]
+
+    def run(capture: bool, change_after_capture: bool):
+        ws = _sim(scene, cfg.sim_warp, 3, capture_graph=capture)
+        p = _mjcf_params(model, 3, ws.device)
+        if not change_after_capture:
+            p.kp[1, 0] = 300.0
+            p.die_mass[2] = 0.04
+        ws.set_world_params(p)
+        _to_key(ws, model, "home")
+        ws.step(51)  # first call: captures the graph (capture=True)
+        graph = ws._graphs.get(("step", 51))
+        if change_after_capture:
+            p.kp[1, 0] = 300.0
+            p.die_mass[2] = 0.04
+            ws.set_world_params(p)
+        _to_key(ws, model, "home")
+        target = ws.ctrl.clone()
+        target[:, 0] += 0.3
+        ws.ctrl.copy_(target)
+        ws.step(51)
+        if capture:
+            assert graph is not None and ws._graphs[("step", 51)] is graph  # replayed, not re-captured
+        q = ws.qpos.clone()
+        mi = ws._meaninertia.clone()
+        ws.close()
+        return q, mi
+
+    q_replay, mi = run(True, True)
+    q_eager, _ = run(False, False)
+    np.testing.assert_allclose(q_replay.cpu().numpy(), q_eager.cpu().numpy(), atol=1e-6)
+    home0 = float(model.key("home").qpos[0])
+    moved = (q_replay[:, 0] - home0).cpu().numpy()
+    assert moved[0] > moved[1] > 0.0, moved  # world 1 got kp 300 after capture; world 0 untouched
+    assert moved[2] == pytest.approx(moved[0], abs=1e-6)  # die mass does not change the arm's tracking here
+    assert mi.shape == (3,) and torch.isfinite(mi).all()
+
+
+@gpu
+def test_meaninertia_is_per_world(scene, cfg):
+    model = scene[0]
+    ws = _sim(scene, cfg.sim_warp, 2)
+    assert tuple(ws.m.stat.meaninertia.shape) == (2,)
+    assert float(ws._meaninertia[0]) == pytest.approx(model.stat.meaninertia, rel=1e-5)
+    p = _mjcf_params(model, 2, ws.device)
+    p.armature[1] *= 10.0
+    ws.set_world_params(p)
+    mi = ws._meaninertia.cpu().numpy()
+    assert mi[0] == pytest.approx(model.stat.meaninertia, rel=1e-3)  # set_const recomputed world 0 unchanged
+    assert mi[1] > mi[0] * 1.5  # world 1's own value, not world 0's
+    ws.close()
+
+
+@gpu
+@pytest.mark.parametrize(
+    ("field", "row", "value"),
+    [("kv", (0, 2), -0.1), ("die_mass", (1,), 0.0), ("die_mass", (0,), -1.0), ("kp", (1, 0), 0.0),
+     ("damping", (0, 0), float("nan")), ("forcerange", (1, 3), float("inf"))],
+)
+def test_set_world_params_rejects_invalid(scene, cfg, field, row, value):
+    model = scene[0]
+    ws = _sim(scene, cfg.sim_warp, 2)
+    p = _mjcf_params(model, 2, ws.device)
+    before = ws._p["actuator_biasprm"].clone()
+    getattr(p, field)[row] = value
+    with pytest.raises(ValueError, match=field):
+        ws.set_world_params(p)
+    assert (ws._p["actuator_biasprm"] == before).all()  # nothing written
+    # host-side params (the sampler's output) are validated without touching the device
+    host = _mjcf_params(model, 2, "cpu")
+    getattr(host, field)[row] = value
+    with pytest.raises(ValueError, match=field):
+        ws.set_world_params(host)
+    ws.close()
+
+
+@gpu
+def test_contact_count_caches_geom_sets(scene, cfg):
+    model = scene[0]
+    ws = _sim(scene, cfg.sim_warp, 2)
+    _to_key(ws, model, "rest")
+    ws.step(17)
+    die, table = model.geom("die_geom").id, model.geom("table").id
+    a = ws.contact_count([die], [table])
+    assert len(ws._geom_sets) == 1
+    b = ws.contact_count((die,), (table,))
+    assert len(ws._geom_sets) == 1 and (a == b).all()
+    with pytest.raises(IndexError):
+        ws.contact_count([model.ngeom], [table])
+    ws.close()
+
+
+@gpu
+def test_exit_with_exception_is_not_masked_by_overflow(scene, cfg):
+    """An exception inside ``with WarpSim(...)`` propagates unchanged; the overflow found by close() is a note."""
+    small = dataclasses.replace(cfg.sim_warp, njmax=16)
+
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom) as info, _sim(scene, small, 8) as ws:
+        _to_key(ws, scene[0], "rest")
+        ws.step(17)
+        raise Boom("original")
+    assert str(info.value) == "original"
+    assert any("ContactBufferOverflow" in n for n in getattr(info.value, "__notes__", []))
+    assert ws._closed
+    # without an exception in flight the overflow is raised as before
+    from so101_rl.sim.warp_model import ContactBufferOverflow
+
+    with pytest.raises(ContactBufferOverflow), _sim(scene, small, 8) as ws2:
+        _to_key(ws2, scene[0], "rest")
+        ws2.step(17)

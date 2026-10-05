@@ -6,10 +6,14 @@ Per N (each in a fresh child process, so VRAM is that N's own footprint): random
 every 50 mj_steps (as in the spike), one captured single-step graph per mj_step, the running max of ``nefc`` /
 ``nacon`` kept on the device every step (no host sync in the timed loop), and ``check_overflow()`` at the end
 (MJWarp's per-world overflow flags are sticky, so every step is covered). Plus one CPU-vs-Warp parity run (sinusoid
-around ``rest``, 300 steps). Writes ``runs/bench/warp-<ts>.json`` and exits 1 if an S0 gate fails.
+around ``rest``, 300 steps). Writes ``runs/bench/warp-<ts>.json``; exit code per the gate status below.
 
 S0 gate (plan §5 S0, sim-track plan S0.3), evaluated at N = 1024: env_steps_per_s >= 500000, process VRAM <= 1500 MB,
 no overflow at the configured njmax / nconmax, arm parity <= 1e-6 rad over 300 steps.
+
+Exit codes: 0 gate PASS, 1 gate FAIL, 2 gate NOT EVALUATED — the run cannot certify the gate because N=1024 was not
+run, ``--no-parity`` skipped the parity check, ``--njmax`` / ``--nconmax`` overrode the configured sizes (the gate is
+about the shipped config), or ``--steps`` < 2000. The measurements are still printed and written.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ GATE_N = 1024
 GATE_STEPS_PER_S = 500_000
 GATE_VRAM_MB = 1500
 GATE_PARITY_RAD = 1e-6
+GATE_MIN_STEPS = 2000
 
 
 def _process_vram_mb(pid: int) -> float | None:
@@ -174,6 +179,35 @@ def _child(args, mode: str, n: int | None = None) -> dict:
     return json.loads(lines[-1])
 
 
+def gate_status(
+    rows: list[dict], parity: dict | None, *, steps: int, njmax: int | None, nconmax: int | None
+) -> tuple[str, dict[str, bool], list[str]]:
+    """``(status, per-check results, not-evaluated reasons)``; status is "PASS", "FAIL" or "NOT EVALUATED".
+
+    The gate certifies the SHIPPED configuration at full length: any reason below makes the run NOT EVALUATED
+    even if every measured number would pass (a partial run must not read as a pass)."""
+    reasons: list[str] = []
+    g = next((r for r in rows if r["nworld"] == GATE_N), None)
+    if g is None:
+        reasons.append(f"N={GATE_N} not in --nworld")
+    if parity is None:
+        reasons.append("parity skipped (--no-parity)")
+    if njmax is not None or nconmax is not None:
+        reasons.append(f"buffer sizes overridden (--njmax {njmax}, --nconmax {nconmax}); the gate uses so101.yaml")
+    if steps < GATE_MIN_STEPS:
+        reasons.append(f"--steps {steps} < {GATE_MIN_STEPS}")
+    results: dict[str, bool] = {}
+    if g is not None:
+        results["env_steps_per_s"] = g["env_steps_per_s"] >= GATE_STEPS_PER_S
+        results["vram_mb"] = g["process_vram_mb"] is not None and g["process_vram_mb"] <= GATE_VRAM_MB
+        results["overflow"] = all(r["overflow"] == "none" and r["finite"] for r in rows)
+    if parity is not None:
+        results["parity"] = parity["max_abs_dq_arm_rad"] <= GATE_PARITY_RAD
+    if reasons:
+        return "NOT EVALUATED", results, reasons
+    return ("PASS" if all(results.values()) else "FAIL"), results, reasons
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--nworld", default="256,1024,2048", help="comma-separated world counts")
@@ -209,24 +243,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"parity (CPU f64 vs Warp f32, 300 steps, sinusoid around rest): arm {parity['max_abs_dq_arm_rad']:.2e} rad, "
               f"die {parity['max_abs_dq_die']:.2e}")
 
-    gate: dict[str, object] = {}
     g = next((r for r in rows if r["nworld"] == GATE_N), None)
-    if g is not None:
-        gate = {
-            "env_steps_per_s": g["env_steps_per_s"] >= GATE_STEPS_PER_S,
-            "vram_mb": g["process_vram_mb"] is not None and g["process_vram_mb"] <= GATE_VRAM_MB,
-            "overflow": all(r["overflow"] == "none" and r["finite"] for r in rows),
-        }
-        if parity:
-            gate["parity"] = parity["max_abs_dq_arm_rad"] <= GATE_PARITY_RAD
+    status, gate, reasons = gate_status(rows, parity, steps=args.steps, njmax=args.njmax, nconmax=args.nconmax)
     overflow_all = "none" if all(r["overflow"] == "none" for r in rows) else "OVERFLOW"
-    print(f"env_steps_per_s at N={GATE_N}: {g['env_steps_per_s']:.0f}" if g else f"N={GATE_N} not run: no S0 gate")
+    print(f"env_steps_per_s at N={GATE_N}: {g['env_steps_per_s']:.0f}" if g else f"N={GATE_N} not run")
     if g:
         print(f"vram_mb at N={GATE_N}: {g['process_vram_mb']}")
     print(f"overflow: {overflow_all}")
-    passed = bool(gate) and all(gate.values())
-    if gate:
-        print("S0 gate:", "PASS" if passed else "FAIL", {k: ("ok" if v else "FAIL") for k, v in gate.items()})
+    if status == "NOT EVALUATED":
+        print("S0 gate: NOT EVALUATED (" + "; ".join(reasons) + ")")
+    else:
+        print("S0 gate:", status, {k: ("ok" if v else "FAIL") for k, v in gate.items()})
 
     out = args.out or ROOT / "runs" / "bench" / f"warp-{datetime.now(UTC):%Y%m%d-%H%M%S}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -244,14 +271,12 @@ def main(argv: list[str] | None = None) -> int:
         "rows": rows,
         "parity": parity,
         "gate": {"n": GATE_N, "env_steps_per_s_min": GATE_STEPS_PER_S, "vram_mb_max": GATE_VRAM_MB,
-                 "parity_rad_max": GATE_PARITY_RAD, "results": gate, "passed": passed},
+                 "parity_rad_max": GATE_PARITY_RAD, "min_steps": GATE_MIN_STEPS, "status": status,
+                 "not_evaluated_reasons": reasons, "results": gate, "passed": status == "PASS"},
     }
     out.write_text(json.dumps(report, indent=2))
     print(f"wrote {out}")
-    if not gate:
-        print(f"S0 gate: NOT EVALUATED (include N={GATE_N} in --nworld)")
-        return 2
-    return 0 if passed else 1
+    return {"PASS": 0, "FAIL": 1, "NOT EVALUATED": 2}[status]
 
 
 if __name__ == "__main__":

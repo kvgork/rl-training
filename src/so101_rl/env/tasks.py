@@ -1,35 +1,47 @@
 """Frozen task specifications: one reward and one success definition for sim and real (FS4 of
-``plans/sim-track-implementation-plan.md``; plan §10 2026-10-05 "Die success definition", D-REWARD).
+``plans/sim-track-implementation-plan.md``; plan §10 2026-10-05 "Die success definition", D-REWARD, and the
+2026-10-06 rows "Reward structure", "Die success height", "Die must be settled").
 
 - ``reward_*`` / ``success_*`` take the **tracker-reported** die position (held last-known while invisible) as
   ``achieved``, so sim and real compute the same function of the same inputs. The simulator's true die position is
   critic-only (``obs.PRIV_OBS``) and never enters these functions.
-- Die success needs the die **visible** (``visible=False`` is UNKNOWN, never SUCCESS, L11). The predicate is
-  per step; ``TaskSpec.success_debounce_steps`` consecutive true steps (:func:`debounce_np` /
-  :func:`debounce_torch`) make the episode ``terminated``. Die: 2 consecutive steps; reach: 1.
-- Reward per step: ``-dist(achieved, desired) / dense_scale + success_bonus * predicate`` (the instantaneous
-  predicate, so SB3 HER's vectorised ``compute_reward`` relabels it without a debounce state).
-- Reach predicate: ``|tip - goal| <= success_radius_m``. Die predicate: visible AND the centroid's xy within the
-  zone square around ``desired`` (``|dx|, |dy| <= zone.half_edge_m``) AND the centroid at most
-  ``zone.max_height_m - DIE_HALF_EDGE_M`` above ``desired``'s height. For the real goal (``zone.goal_xyz()``: the
-  zone centre at resting height) that means "on the table, at most one die edge up": a die held in the air above
-  the zone is not in the zone. Everything is relative to ``desired``, so HER-relabelled goals (an achieved die
-  position) are consistent: achieved == desired always satisfies the geometric part.
+- The configurable part (reward terms and weights, the die height bound and the settle distance) is the
+  ``tasks:`` section of ``so101.yaml`` (:func:`task_from_config`). ``REACH`` / ``DIE_TO_ZONE`` are built from the
+  shipped yaml at import; every :class:`TaskSpec` runs :func:`~so101_rl.env.reward.validate_reward_spec` when it is
+  constructed, so no task with a reward that can be positive can exist.
+- **Reward** (``env/reward.py``): a sum of named, weighted, non-positive terms, each a function of ONE step's
+  ``(achieved, desired, visible, info)`` (the instantaneous predicate, never the debounce or settle state), so SB3
+  HER's vectorised ``compute_reward`` relabels it. Default for both tasks:
+  ``-dist/0.30 * (1 - predicate) - 1 * (1 - predicate)``: 0 on success steps, <= -1 on every other step.
+- **Success predicate** (per step): reach ``|tip - goal| <= success_radius_m``. Die: visible AND the centroid's xy
+  within the zone square around ``desired`` (``|dx|, |dy| <= zone.half_edge_m``) AND the centroid at most
+  ``zone.max_height_m`` (16 mm) above ``desired`` (for the real goal ``zone.goal_xyz()`` = the zone centre at resting
+  height; 16 mm leaves room for D435 depth noise while a die held ~2 cm up fails). ``visible=False`` is UNKNOWN,
+  never SUCCESS (L11). Everything is relative to ``desired``, so HER-relabelled goals (an achieved die position)
+  are consistent: achieved == desired always satisfies the geometric part.
+- **Termination** (:func:`debounce_np` / :func:`debounce_torch`): ``success_debounce_steps`` consecutive predicate
+  steps (die 2, reach 1). The die task also needs the die **settled**: the tracker position moved at most
+  ``settle_m`` (3 mm) between consecutive counted steps, else the count restarts at 1. A slide through the zone
+  (0.05 m/s = 5 mm per 10 Hz step) or a nudge out of it never terminates.
 - SB3 HER: ``compute_reward(achieved, desired, info)`` must take the visibility of the STORED transition from
   ``info`` (:func:`visible_from_info`, key ``"tracker_visible"``); relabelling the goal never changes it, and it
-  never defaults to visible.
+  never defaults to visible. Terms that read ``info`` (``clamp``, ``action_l2``) take the stored transition's
+  ``info`` the same way.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
 
-from so101_rl.config.schema import WorkspaceBox
+from so101_rl.config.loader import load_tasks_config
+from so101_rl.config.schema import RewardSpec, TasksConfig, WorkspaceBox
 
 from .obs import DIE_OBS, REACH_OBS, PolicyObsLayout
+from .reward import evaluate_np, evaluate_torch, terms_np, terms_torch, validate_reward_spec
 
 if TYPE_CHECKING:
     import torch
@@ -74,12 +86,12 @@ class GoalBounds:
         return out[:n]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ZoneSpec:
     center_xy_m: tuple[float, float]
     half_edge_m: float = 0.030
     z_table_m: float = -0.02
-    max_height_m: float = 2 * DIE_HALF_EDGE_M  # centroid at most this far above the table counts as "in the zone"
+    max_height_m: float  # centroid at most this far above ``desired`` (the resting height) counts (config: 16 mm)
 
     def goal_xyz(self) -> np.ndarray:
         """``desired_goal`` of the die task: the zone centre at the height of a die resting on the table."""
@@ -104,45 +116,74 @@ class TaskSpec:
     gamma: float  # 0.97 / 0.98 (training hint, not an env property)
     success_radius_m: float  # reach: 0.015 (Euclidean); die: = zone half edge (square, L-inf in xy)
     success_debounce_steps: int  # reach 1; die 2 (consecutive steps with the predicate true)
-    success_bonus: float  # 1.0
-    dense_scale: float  # reward = -dist / dense_scale (+ bonus)
+    settle_m: float | None  # die: max tracker displacement between consecutive counted steps (0.003); reach: None
+    reward: RewardSpec  # config tasks.<name>.reward; validated on construction (env/reward.py)
     goal_bounds: GoalBounds
     zone: ZoneSpec | None
     die_start: DieStartSpec | None
     start_pose: Literal["home", "random_in_box"]
     reset_settle_steps: int = 0  # die task: physics steps after placing the die (0 = place at rest)
 
+    def __post_init__(self) -> None:
+        validate_reward_spec(self.reward)
+        if self.success_debounce_steps < 1:
+            raise ValueError(f"success_debounce_steps must be >= 1, got {self.success_debounce_steps}")
+        if self.settle_m is not None and (self.success_debounce_steps < 2 or not self.settle_m > 0):
+            raise ValueError("settle_m needs success_debounce_steps >= 2 and a positive distance")
 
-REACH: Final[TaskSpec] = TaskSpec(
-    name="reach",
-    obs=REACH_OBS,
-    episode_steps=50,
-    gamma=0.97,
-    success_radius_m=0.015,
-    success_debounce_steps=1,
-    success_bonus=1.0,
-    dense_scale=0.30,
-    goal_bounds=GoalBounds(box=WorkspaceBox()),  # schema defaults == so101.yaml box (test-enforced)
-    zone=None,
-    die_start=None,
-    start_pose="home",
-)
-_ZONE: Final[ZoneSpec] = ZoneSpec(center_xy_m=(0.22, 0.10), half_edge_m=0.030, z_table_m=-0.02)  # scene site `zone`
-DIE_TO_ZONE: Final[TaskSpec] = TaskSpec(
-    name="die_to_zone",
-    obs=DIE_OBS,
-    episode_steps=100,
-    gamma=0.98,
-    success_radius_m=_ZONE.half_edge_m,
-    success_debounce_steps=2,
-    success_bonus=1.0,
-    dense_scale=0.30,
-    goal_bounds=GoalBounds(box=WorkspaceBox()),
-    zone=_ZONE,
-    die_start=DieStartSpec(well_center_xy_m=(0.20, -0.05), sigma_xy_m=0.005, measured_on_hardware=False),  # NEEDS H9
-    start_pose="home",
-    reset_settle_steps=0,
-)
+
+_ZONE_CENTER_XY_M: Final[tuple[float, float]] = (0.22, 0.10)  # scene site `zone` (test-enforced)
+_ZONE_HALF_EDGE_M: Final[float] = 0.030
+
+
+def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
+    """Build the FS4 task ``name`` with the configurable part from ``tasks`` (``cfg.tasks`` or
+    ``load_tasks_config()``). Raises :class:`~so101_rl.env.reward.RewardSpecError` for an invalid reward."""
+    if name == "reach":
+        tc = tasks.reach
+        return TaskSpec(
+            name="reach",
+            obs=REACH_OBS,
+            episode_steps=50,
+            gamma=0.97,
+            success_radius_m=0.015,
+            success_debounce_steps=1,
+            settle_m=None,
+            reward=tc.reward,
+            goal_bounds=GoalBounds(box=WorkspaceBox()),  # schema defaults == so101.yaml box (test-enforced)
+            zone=None,
+            die_start=None,
+            start_pose="home",
+        )
+    if name == "die_to_zone":
+        tc = tasks.die_to_zone
+        if tc.max_height_m is None or tc.settle_mm is None:
+            raise ValueError("tasks.die_to_zone needs max_height_m and settle_mm")
+        zone = ZoneSpec(
+            center_xy_m=_ZONE_CENTER_XY_M, half_edge_m=_ZONE_HALF_EDGE_M, z_table_m=-0.02, max_height_m=tc.max_height_m
+        )
+        return TaskSpec(
+            name="die_to_zone",
+            obs=DIE_OBS,
+            episode_steps=100,
+            gamma=0.98,
+            success_radius_m=zone.half_edge_m,
+            success_debounce_steps=2,
+            settle_m=tc.settle_mm / 1000.0,
+            reward=tc.reward,
+            goal_bounds=GoalBounds(box=WorkspaceBox()),
+            zone=zone,
+            # NEEDS H9: placeholder start well
+            die_start=DieStartSpec(well_center_xy_m=(0.20, -0.05), sigma_xy_m=0.005, measured_on_hardware=False),
+            start_pose="home",
+            reset_settle_steps=0,
+        )
+    raise ValueError(f"unknown task {name!r}")
+
+
+_SHIPPED: Final[TasksConfig] = load_tasks_config()
+REACH: Final[TaskSpec] = task_from_config("reach", _SHIPPED)
+DIE_TO_ZONE: Final[TaskSpec] = task_from_config("die_to_zone", _SHIPPED)
 
 
 def _need_visible(spec: TaskSpec, visible: object) -> None:
@@ -165,19 +206,33 @@ def success_np(
     else:
         d = np.abs(achieved[..., :2] - desired[..., :2])
         ok = np.all(d <= spec.zone.half_edge_m, axis=-1)
-        ok = ok & (achieved[..., 2] - desired[..., 2] <= spec.zone.max_height_m - DIE_HALF_EDGE_M)
+        ok = ok & (achieved[..., 2] - desired[..., 2] <= spec.zone.max_height_m)
     if visible is not None:
         ok = ok & np.asarray(visible, bool)
     return ok
 
 
 def reward_np(
-    achieved: np.ndarray, desired: np.ndarray, spec: TaskSpec, *, visible: np.ndarray | None = None
+    achieved: np.ndarray,
+    desired: np.ndarray,
+    spec: TaskSpec,
+    *,
+    visible: np.ndarray | None = None,
+    info: object = None,
 ) -> np.ndarray:
-    """Vectorised reward, float32[...] (SB3 HER ``compute_reward``)."""
+    """Vectorised step reward, float32[...] (SB3 HER ``compute_reward``): ``spec.reward`` evaluated on the
+    distance and the instantaneous :func:`success_np` predicate. Always <= 0 (``validate_reward_spec``).
+    ``info``: needed only by the ``clamp`` / ``action_l2`` terms (one mapping or HER's sequence of mappings)."""
     dist = np.linalg.norm(np.asarray(achieved, np.float64) - np.asarray(desired, np.float64), axis=-1)
-    bonus = spec.success_bonus * success_np(achieved, desired, spec, visible=visible)
-    return (-dist / spec.dense_scale + bonus).astype(np.float32)
+    return evaluate_np(spec.reward, dist=dist, success=success_np(achieved, desired, spec, visible=visible), info=info)
+
+
+def reward_terms_np(
+    achieved: np.ndarray, desired: np.ndarray, spec: TaskSpec, *, visible: np.ndarray | None = None, info: object = None
+) -> dict[str, np.ndarray]:
+    """Per-term weighted values (float64[...]) whose sum is :func:`reward_np` (logging / dashboards)."""
+    dist = np.linalg.norm(np.asarray(achieved, np.float64) - np.asarray(desired, np.float64), axis=-1)
+    return terms_np(spec.reward, dist=dist, success=success_np(achieved, desired, spec, visible=visible), info=info)
 
 
 def visible_from_info(info: object, spec: TaskSpec) -> np.ndarray | None:
@@ -193,9 +248,36 @@ def visible_from_info(info: object, spec: TaskSpec) -> np.ndarray | None:
     return np.array([bool(i["tracker_visible"]) for i in info], dtype=bool)
 
 
-def debounce_np(predicate: np.ndarray, count: np.ndarray, spec: TaskSpec) -> tuple[np.ndarray, np.ndarray]:
-    """``(success, new_count)``: consecutive-step counter; success once it reaches ``success_debounce_steps``."""
-    new = np.where(np.asarray(predicate, bool), np.asarray(count) + 1, 0)
+def _need_positions(spec: TaskSpec, achieved: object, prev_achieved: object) -> None:
+    if spec.settle_m is not None and (achieved is None or prev_achieved is None):
+        raise ValueError(
+            f"task {spec.name!r} needs the die settled: pass achieved= and prev_achieved= (tracker positions)"
+        )
+
+
+def debounce_np(
+    predicate: np.ndarray,
+    count: np.ndarray,
+    spec: TaskSpec,
+    *,
+    achieved: np.ndarray | None = None,
+    prev_achieved: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(success, new_count)``: consecutive-step counter; success once it reaches ``success_debounce_steps``.
+
+    With ``spec.settle_m`` (die task) a step only extends the run if the tracker position moved at most
+    ``settle_m`` since the previous step (``|achieved - prev_achieved|``); otherwise it starts a new run at 1. So
+    "2 consecutive visible in-zone steps that moved <= 3 mm between them". Termination only; the reward stays
+    instantaneous.
+    """
+    _need_positions(spec, achieved, prev_achieved)
+    pred = np.asarray(predicate, bool)
+    count = np.asarray(count)
+    extend = count > 0
+    if spec.settle_m is not None:
+        moved = np.linalg.norm(np.asarray(achieved, np.float64) - np.asarray(prev_achieved, np.float64), axis=-1)
+        extend = extend & (moved <= spec.settle_m)
+    new = np.where(pred, np.where(extend, count + 1, 1), 0)
     return new >= spec.success_debounce_steps, new
 
 
@@ -214,26 +296,60 @@ def success_torch(
         ok = (a - d).norm(dim=-1) <= spec.success_radius_m
     else:
         ok = ((a[..., :2] - d[..., :2]).abs() <= spec.zone.half_edge_m).all(dim=-1)
-        ok = ok & (a[..., 2] - d[..., 2] <= spec.zone.max_height_m - DIE_HALF_EDGE_M)
+        ok = ok & (a[..., 2] - d[..., 2] <= spec.zone.max_height_m)
     if visible is not None:
         ok = ok & visible.to(torch.bool)
     return ok
 
 
 def reward_torch(
-    achieved: torch.Tensor, desired: torch.Tensor, spec: TaskSpec, *, visible: torch.Tensor | None = None
+    achieved: torch.Tensor,
+    desired: torch.Tensor,
+    spec: TaskSpec,
+    *,
+    visible: torch.Tensor | None = None,
+    info: Mapping[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Same reward as :func:`reward_np` for tensors (float32[...])."""
+    """Same reward as :func:`reward_np` for tensors (float32[...]); ``info`` is a mapping of tensors."""
     import torch
 
     dist = (achieved.to(torch.float64) - desired.to(torch.float64)).norm(dim=-1)
-    bonus = spec.success_bonus * success_torch(achieved, desired, spec, visible=visible).to(torch.float64)
-    return (-dist / spec.dense_scale + bonus).to(torch.float32)
+    pred = success_torch(achieved, desired, spec, visible=visible)
+    return evaluate_torch(spec.reward, dist=dist, success=pred, info=info)
 
 
-def debounce_torch(predicate: torch.Tensor, count: torch.Tensor, spec: TaskSpec) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tensor twin of :func:`debounce_np`."""
+def reward_terms_torch(
+    achieved: torch.Tensor,
+    desired: torch.Tensor,
+    spec: TaskSpec,
+    *,
+    visible: torch.Tensor | None = None,
+    info: Mapping[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Tensor twin of :func:`reward_terms_np`."""
     import torch
 
-    new = torch.where(predicate, count + 1, torch.zeros_like(count))
+    dist = (achieved.to(torch.float64) - desired.to(torch.float64)).norm(dim=-1)
+    pred = success_torch(achieved, desired, spec, visible=visible)
+    return terms_torch(spec.reward, dist=dist, success=pred, info=info)
+
+
+def debounce_torch(
+    predicate: torch.Tensor,
+    count: torch.Tensor,
+    spec: TaskSpec,
+    *,
+    achieved: torch.Tensor | None = None,
+    prev_achieved: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tensor twin of :func:`debounce_np` (same settle rule; no host sync)."""
+    import torch
+
+    _need_positions(spec, achieved, prev_achieved)
+    pred = predicate.to(torch.bool)
+    extend = count > 0
+    if spec.settle_m is not None:
+        moved = (achieved.to(torch.float64) - prev_achieved.to(torch.float64)).norm(dim=-1)
+        extend = extend & (moved <= spec.settle_m)
+    new = torch.where(pred, torch.where(extend, count + 1, torch.ones_like(count)), torch.zeros_like(count))
     return new >= spec.success_debounce_steps, new
