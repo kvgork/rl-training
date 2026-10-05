@@ -115,7 +115,8 @@ rl-trainer/
 ├── so101-self-learning-rl-plan.md
 ├── docs/ARCHITECTURE.md          # this file
 ├── plans/                        # implementation plans per phase
-├── scripts/                      # fetch_assets.py, extract_kinematics.py, vendor_tdmpc2.py (reproducible generators)
+├── scripts/                      # fetch_assets.py, extract_kinematics.py, vendor_tdmpc2.py (reproducible generators),
+│                                 # bench_warp.py (MuJoCo Warp throughput/VRAM/overflow/parity + the S0 gate)
 ├── assets/so101/                 # official TheRobotStudio MJCF (+ licence), jaw primitives, keyframes
 │   └── upstream/                 # fetched unmodified at a pinned commit (UPSTREAM.json holds sha + sha256 per file)
 ├── calib/                        # hand_eye.yaml, fiducial.yaml (committed artifacts)
@@ -135,8 +136,9 @@ rl-trainer/
 │   │                             # frames (Umeyama hand-eye), fiducial (ArUco camera-moved gate), object_table (shm),
 │   │                             # calibrate_hand_eye (driver)
 │   ├── sim/                      # model (load_model via MjSpec, primitive jaw geoms), mujoco_bus (the F2 Bus on MuJoCo,
-│   │                             # with action delay), gripper_map (0–100 % <-> rad <-> ticks), compare_real (sysid check);
-│   │                             # domain randomization comes later
+│   │                             # with action delay), gripper_map (0–100 % <-> rad <-> ticks), compare_real (sysid check),
+│   │                             # warp_model (WarpSim: MuJoCo Warp, N worlds on the GPU, torch views, failing overflow
+│   │                             # detector; FS2); domain randomization comes later
 │   ├── wm/                       # world models: state (Stage A), pixel fused encoder (parallel track)
 │   ├── rl/                       # SAC+HER baseline (SB3), TD-MPC2+HER wrapper, HER relabel, toy_env, smoke_tdmpc2
 │   ├── logging/                  # schema, episode_logger (HDF5, atomic .tmp -> rename, applied action),
@@ -240,6 +242,15 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - `reenergize` is tested end to end on FakeBus and on MujocoBus (`tests/test_reenergize_backends.py`).
 - The gripper uses its own linear map between the calibration `range_min`/`range_max` and the MJCF joint range.
 - `so101_rl.sim` re-exports lazily, so importing it does not load `mujoco`.
+
+**MuJoCo Warp (S0.3, FS2 of `plans/sim-track-implementation-plan.md`).**
+- `WarpSim(model, cfg.sim_warp, nworld, *, device="cuda:0", capture_graph=True)` holds one MJWarp `Model` + `Data` for N worlds. `qpos`, `qvel`, `ctrl`, `actuator_force` and `site_xpos` / `body_xpos` / `body_xquat` are zero-copy torch views (`wp.to_torch`). `step(nsteps)` replays one captured CUDA graph per distinct `nsteps`; Warp runs on its own stream, fenced both ways against torch's current stream with events (no host sync).
+- **Sizes come from the `sim_warp:` config section** (FS1, `SimWarpConfig`: `njmax` 256 per world, `nconmax_per_world` 32 with `naconmax = 32 × N` shared by all worlds, `nworld_default`, `overflow_check_every_steps`, `overflow_policy: fail`). The loader is strict: every key required, `njmax ≥ 64`, the others ≥ 1, and `overflow_policy` has no value other than `fail`.
+- **Overflow fails.** MJWarp only prints on overflow and silently drops rows/contacts. `check_overflow()` reads MJWarp's sticky per-world `Data.overflow` bitmask (folded into an accumulator before any reset clears it) plus `nefc` / `nacon` in one device→host copy and raises `ContactBufferOverflow` on any capacity bit. Solver iteration-limit bits are counted, not raised. `close()` runs the check too, so a run cannot end with an undetected overflow; the batched env (S1) calls it every `overflow_check_every_steps` policy steps.
+- `reset_worlds(mask, qpos, qvel, ctrl)` (full-size tensors, masked rows applied) then `mjw.forward`; `set_world_params(BatchedSimParams)` writes per-world kp/kv (gainprm/biasprm), damping/armature/frictionloss, forcerange, die mass (inertia scaled) and die/table friction into model arrays allocated with a world dimension (`put_model(batch_sizes=...)`), then `mjw.set_const`. Every FS7 field batches in MJWarp 3.14, including `geom_size` (die-size DR).
+- `contact_count(geoms_a, geoms_b) -> int32[N]`, `copy_world_to(world, MjData)` (rendering), `vram_bytes` (Warp mempool only).
+- `scripts/bench_warp.py` (`pixi run bench-warp`) measures env-steps/s, process VRAM, peak `nefc`/`nacon` and CPU-vs-Warp parity and exits 1 if the S0 gate fails (N=1024: ≥ 500k env-steps/s, ≤ 1.5 GB, no overflow at njmax 256 / nconmax 32, arm parity ≤ 1e-6 rad over 300 steps). Measured 2026-10-05: 731k env-steps/s and 786 MB at N=1024, parity 3.9e-7 rad, peak nefc 188/256.
+- `so101_rl.sim` stays lazy: importing it loads neither `mujoco`, `mujoco_warp` nor `warp` (test-enforced).
 
 **Perception (U5).**
 - The object table is one seqlock'd `OBJECT_TABLE_DTYPE` record in its own shm segment. Perception creates it, and the env attaches read-only.
@@ -453,4 +464,4 @@ Bump the version line at the top and add an entry below.
 | 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
 | 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
 | 0.11 | 2026-10-05 | U3 verification follow-ups. §6: host-side heartbeat partial-frame rule (delivered only when the frame is complete; stale tails over 80 ms dropped). New tests cover the strict re-energise heartbeat on a lost or latched echo, and the abort check just before torque-on. |
-| 0.12 | 2026-10-05 | Sim-first track SU0 (`plans/sim-track-implementation-plan.md`). §8: S0.1 version pin — `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` in `sim`, `pytorch 2.11.*` in every env (`pytorch-gpu 2.11.*` + `cuda-version 12.9.*` in `gpu`), `cma` in `train`, the sim-track pixi tasks incl. `test-gpu` / `ci-gpu`. §5 Sim: S0.2 scene timestep 1/510 s (17 substeps = one servo tick) and `jaw_col` margin 0. |
+| 0.12 | 2026-10-05 | Sim-first track SU0 (`plans/sim-track-implementation-plan.md`). §8: S0.1 version pin — `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` in `sim`, `pytorch 2.11.*` in every env (`pytorch-gpu 2.11.*` + `cuda-version 12.9.*` in `gpu`), `cma` in `train`, the sim-track pixi tasks incl. `test-gpu` / `ci-gpu`. §5 Sim: S0.2 scene timestep 1/510 s (17 substeps = one servo tick) and `jaw_col` margin 0. §4/§5: S0.3 `sim/warp_model.py` (`WarpSim`, failing overflow detector, per-world params), the `sim_warp:` config section (`SimWarpConfig`), `scripts/bench_warp.py` and the S0 gate. |

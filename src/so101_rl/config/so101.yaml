@@ -81,3 +81,10 @@ registers:
   protection_current: 250        # gripper default from lerobot; arm value measured in H6
   overload_torque: 25
   over_current_protection_time: 20   # UNVERIFIED default; H6 proves fold-back
+
+sim_warp:                         # FS1: MuJoCo Warp buffer sizes (S0 spike 2026-10-05, plans/reviews/...-mjwarp-feasibility-spike.md)
+  njmax: 256                      # constraint rows per world; MJWarp's default 64 overflows on this scene (nefc up to 174)
+  nconmax_per_world: 32           # contacts per world (CPU max ncon 18); naconmax = nconmax_per_world * nworld
+  nworld_default: 1024
+  overflow_check_every_steps: 10  # policy steps between overflow reads (one device->host sync each)
+  overflow_policy: fail           # the only value: an overflow raises ContactBufferOverflow

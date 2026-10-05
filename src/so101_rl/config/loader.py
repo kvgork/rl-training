@@ -21,6 +21,7 @@ from .schema import (
     RateConfig,
     RegisterConfig,
     SafeStateConfig,
+    SimWarpConfig,
     So101Config,
     ThermalConfig,
     WorkspaceBox,
@@ -85,8 +86,18 @@ TOP_KEYS = frozenset(
         "safe_state",
         "box",
         "registers",
+        "sim_warp",
     }
 )
+# FS1: MuJoCo Warp sizes. Lower bounds from the S0 spike (njmax 64 is MJWarp's own default and already overflows on
+# this scene, so nothing smaller is accepted); upper bounds only reject absurd values (VRAM).
+SIM_WARP_RANGES: dict[str, tuple[int, int]] = {
+    "njmax": (64, 4096),
+    "nconmax_per_world": (1, 1024),
+    "nworld_default": (1, 65536),
+    "overflow_check_every_steps": (1, 100000),
+}
+SIM_WARP_POLICIES = ("fail",)
 CALIB_KEYS = frozenset({"id", "drive_mode", "homing_offset", "range_min", "range_max"})
 
 
@@ -367,6 +378,14 @@ def load_config(
         **{k: _in_range(_int(g[k], f"registers.{k}"), *REGISTER_RANGES[k], f"registers.{k}") for k in REGISTER_RANGES}
     )
 
+    w = _keys(raw["sim_warp"], {*SIM_WARP_RANGES, "overflow_policy"}, "sim_warp")
+    if w["overflow_policy"] not in SIM_WARP_POLICIES:
+        raise ValueError(f"sim_warp.overflow_policy: must be one of {SIM_WARP_POLICIES}, got {w['overflow_policy']!r}")
+    sim_warp = SimWarpConfig(
+        **{k: _in_range(_int(w[k], f"sim_warp.{k}"), *SIM_WARP_RANGES[k], f"sim_warp.{k}") for k in SIM_WARP_RANGES},
+        overflow_policy=w["overflow_policy"],
+    )
+
     return So101Config(
         port=raw["port"],
         heartbeat_port=hb,
@@ -380,6 +399,7 @@ def load_config(
         box=box,
         registers=registers,
         kinematics_path=kinematics_path,
+        sim_warp=sim_warp,
     )
 
 

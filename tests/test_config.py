@@ -178,7 +178,7 @@ def test_removed_trip_c_rejected(tmp_path, calib):
 
 
 @pytest.mark.parametrize(
-    "section", ["joints", "action", "safe_state", "box", "thermal", "rates", "registers"]
+    "section", ["joints", "action", "safe_state", "box", "thermal", "rates", "registers", "sim_warp"]
 )
 def test_unknown_and_missing_key_in_every_section(tmp_path, calib, section):
     _rejects(tmp_path, calib, lambda r: r[section].update(bogus_key=1), "bogus_key")
@@ -323,3 +323,51 @@ def test_calibration_argument_is_validated_too(tmp_path, calib):
     bad["gripper"] = dataclasses.replace(calib["gripper"], drive_mode=7)
     with pytest.raises(ValueError, match="drive_mode"):
         load_config(calibration=bad)
+
+
+# ---- FS1 sim_warp (sim-first track S0.3) ------------------------------------------------------------
+
+
+def test_sim_warp_defaults(cfg):
+    from so101_rl.config import SimWarpConfig
+
+    w = cfg.sim_warp
+    assert isinstance(w, SimWarpConfig)
+    assert (w.njmax, w.nconmax_per_world, w.nworld_default, w.overflow_check_every_steps) == (256, 32, 1024, 10)
+    assert w.overflow_policy == "fail"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        w.njmax = 64  # type: ignore[misc]
+
+
+def test_sim_warp_section_strict(tmp_path, calib):
+    _rejects(tmp_path, calib, lambda r: r.pop("sim_warp"), "sim_warp")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].pop("njmax"), "njmax")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].pop("overflow_policy"), "overflow_policy")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update(nconmax=32), "nconmax")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update(overflow_policy="warn"), "overflow_policy")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update(overflow_policy="ignore"), "overflow_policy")
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("njmax", 63),  # below MJWarp's own default, which already overflows here
+        ("njmax", 0),
+        ("nconmax_per_world", 0),
+        ("nworld_default", 0),
+        ("overflow_check_every_steps", 0),
+        ("njmax", 256.5),
+        ("njmax", True),
+        ("nworld_default", "1024"),
+    ],
+)
+def test_sim_warp_range_and_type_checked(tmp_path, calib, key, bad):
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update({key: bad}), key)
+
+
+def test_sim_warp_lower_bounds_accepted(tmp_path, calib):
+    def mut(r):
+        r["sim_warp"].update(njmax=64, nconmax_per_world=1, nworld_default=1, overflow_check_every_steps=1)
+
+    w = load_config(_variant(tmp_path, mut), calibration=calib).sim_warp
+    assert (w.njmax, w.nconmax_per_world, w.nworld_default, w.overflow_check_every_steps) == (64, 1, 1, 1)

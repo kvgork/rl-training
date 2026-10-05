@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import numpy as np
 
@@ -149,6 +149,17 @@ class RegisterConfig:
     over_current_protection_time: int = 20  # UNVERIFIED default; H6 proves fold-back
 
 
+@dataclass(frozen=True)
+class SimWarpConfig:
+    """MuJoCo Warp buffer sizes (FS1, sim-first track). Measured in the S0 spike (2026-10-05)."""
+
+    njmax: int = 256  # constraint rows per world; the MJWarp default 64 overflows (nefc up to 174 seen)
+    nconmax_per_world: int = 32  # contacts per world (CPU max ncon 18); naconmax = nconmax_per_world * nworld
+    nworld_default: int = 1024
+    overflow_check_every_steps: int = 10  # policy steps between device-side overflow reads (one host sync each)
+    overflow_policy: Literal["fail"] = "fail"  # there is deliberately no "warn" value
+
+
 @dataclass(frozen=True, eq=False)
 class So101Config:
     port: str
@@ -163,3 +174,4 @@ class So101Config:
     box: WorkspaceBox
     registers: RegisterConfig
     kinematics_path: Path  # config/so101_kinematics.yaml
+    sim_warp: SimWarpConfig  # FS1 (sim-first track)
