@@ -178,7 +178,7 @@ def test_removed_trip_c_rejected(tmp_path, calib):
 
 
 @pytest.mark.parametrize(
-    "section", ["joints", "action", "safe_state", "box", "thermal", "rates", "registers"]
+    "section", ["joints", "action", "safe_state", "box", "thermal", "rates", "registers", "sim_warp", "tasks"]
 )
 def test_unknown_and_missing_key_in_every_section(tmp_path, calib, section):
     _rejects(tmp_path, calib, lambda r: r[section].update(bogus_key=1), "bogus_key")
@@ -323,3 +323,100 @@ def test_calibration_argument_is_validated_too(tmp_path, calib):
     bad["gripper"] = dataclasses.replace(calib["gripper"], drive_mode=7)
     with pytest.raises(ValueError, match="drive_mode"):
         load_config(calibration=bad)
+
+
+# ---- FS1 sim_warp (sim-first track S0.3) ------------------------------------------------------------
+
+
+def test_sim_warp_defaults(cfg):
+    from so101_rl.config import SimWarpConfig
+
+    w = cfg.sim_warp
+    assert isinstance(w, SimWarpConfig)
+    assert (w.njmax, w.nconmax_per_world, w.nworld_default, w.overflow_check_every_steps) == (256, 32, 1024, 10)
+    assert w.overflow_policy == "fail"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        w.njmax = 64  # type: ignore[misc]
+
+
+def test_sim_warp_section_strict(tmp_path, calib):
+    _rejects(tmp_path, calib, lambda r: r.pop("sim_warp"), "sim_warp")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].pop("njmax"), "njmax")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].pop("overflow_policy"), "overflow_policy")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update(nconmax=32), "nconmax")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update(overflow_policy="warn"), "overflow_policy")
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update(overflow_policy="ignore"), "overflow_policy")
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("njmax", 63),  # below MJWarp's own default, which already overflows here
+        ("njmax", 0),
+        ("nconmax_per_world", 0),
+        ("nworld_default", 0),
+        ("overflow_check_every_steps", 0),
+        ("njmax", 256.5),
+        ("njmax", True),
+        ("nworld_default", "1024"),
+    ],
+)
+def test_sim_warp_range_and_type_checked(tmp_path, calib, key, bad):
+    _rejects(tmp_path, calib, lambda r: r["sim_warp"].update({key: bad}), key)
+
+
+def test_sim_warp_lower_bounds_accepted(tmp_path, calib):
+    def mut(r):
+        r["sim_warp"].update(njmax=64, nconmax_per_world=1, nworld_default=1, overflow_check_every_steps=1)
+
+    w = load_config(_variant(tmp_path, mut), calibration=calib).sim_warp
+    assert (w.njmax, w.nconmax_per_world, w.nworld_default, w.overflow_check_every_steps) == (64, 1, 1, 1)
+
+
+# ---- FS4 tasks section (SU0 review fixes, plan §10 2026-10-06) -----------------------------------------------
+
+
+def test_tasks_defaults(cfg):
+    die = cfg.tasks.die_to_zone
+    assert die.max_height_m == 0.016 and die.settle_mm == 3.0
+    assert cfg.tasks.reach.max_height_m is None and cfg.tasks.reach.settle_mm is None
+    for t in (cfg.tasks.reach, die):
+        assert [x.name for x in t.reward.terms] == ["distance", "success", "time"]
+        assert t.reward.term("time").weight == 0.05
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda r: r["tasks"]["die_to_zone"]["reward"].update(bonus={"weight": 1.0}), "unknown reward term"),
+        (lambda r: r["tasks"]["reach"]["reward"]["success"].pop("weight"), "weight"),
+        (lambda r: r["tasks"]["reach"]["reward"]["success"].update(weight=-1.0), "weight"),
+        (lambda r: r["tasks"]["reach"]["reward"]["success"].update(scale_m=0.3), "scale_m"),
+        (lambda r: r["tasks"]["reach"]["reward"]["distance"].pop("zero_on_success"), "zero_on_success"),
+        (lambda r: r["tasks"]["reach"]["reward"]["distance"].update(zero_on_success="yes"), "zero_on_success"),
+        (lambda r: r["tasks"]["reach"]["reward"]["distance"].update(scale_m=0.0), "scale_m"),
+        (lambda r: r["tasks"]["reach"].update(reward={}), "reward"),
+        (lambda r: r["tasks"]["reach"].update(settle_mm=3.0), "settle_mm"),  # reach has no settle rule
+        (lambda r: r["tasks"]["die_to_zone"].pop("settle_mm"), "settle_mm"),
+        (lambda r: r["tasks"]["die_to_zone"].pop("max_height_m"), "max_height_m"),
+        (lambda r: r["tasks"]["die_to_zone"].update(max_height_m=0.025), "max_height_m"),  # 2.5 cm up must fail
+        (lambda r: r["tasks"]["die_to_zone"].update(settle_mm=0.0), "settle_mm"),
+        (lambda r: r["tasks"]["die_to_zone"].update(settle_mm=True), "settle_mm"),
+        (lambda r: r["tasks"].update(stack={}), "stack"),
+        (lambda r: r.pop("tasks"), "tasks"),
+    ],
+)
+def test_tasks_section_strict(tmp_path, calib, mutate, match):
+    _rejects(tmp_path, calib, mutate, match)
+
+
+def test_load_tasks_config_reads_only_the_section(tmp_path):
+    from so101_rl.config import load_tasks_config
+
+    p = tmp_path / "t.yaml"
+    raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text())
+    p.write_text(yaml.safe_dump({"tasks": raw["tasks"]}))
+    assert load_tasks_config(p) == load_tasks_config()
+    p.write_text(yaml.safe_dump({"other": 1}))
+    with pytest.raises(ValueError, match="tasks"):
+        load_tasks_config(p)

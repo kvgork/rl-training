@@ -124,3 +124,31 @@ def test_upstream_files_untouched_by_scene():
     """The scene must include upstream, not copy it (the sha test in test_assets guards the bytes)."""
     text = SCENE_XML.read_text()
     assert 'file="upstream/so101_new_calib.xml"' in text
+
+
+def test_jaw_col_margin_is_zero(sim):
+    """S0.2: MuJoCo Warp rejects non-zero margins on box pairs; CPU and GPU must simulate the same model."""
+    model, _ = sim
+    ids = jaw_collision_geom_ids(model)
+    assert len(ids) == 4
+    np.testing.assert_array_equal(model.geom_margin[ids], 0.0)
+
+
+def test_tick_is_integer_substeps(sim, cfg, calibration):
+    """D-TIMESTEP: steps_per_tick x timestep is exactly one servo tick (1/510 s x 17 = 1/30 s)."""
+    from so101_rl.sim.mujoco_bus import MujocoBus
+
+    model, _ = sim
+    steps_per_tick = round((1.0 / cfg.rates.servo_hz) / model.opt.timestep)
+    assert steps_per_tick == 17
+    assert abs(steps_per_tick * model.opt.timestep - 1.0 / cfg.rates.servo_hz) < 1e-9
+    bus = MujocoBus(model, mujoco.MjData(model), calibration, cfg)
+    assert bus.steps_per_tick == steps_per_tick
+
+
+def test_integrator_supported_by_mujoco_warp(sim):
+    """MuJoCo Warp does not support every integrator; the scene keeps MuJoCo's defaults (Euler, Newton, pyramidal)."""
+    model, _ = sim
+    assert model.opt.integrator == mujoco.mjtIntegrator.mjINT_EULER
+    assert model.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
+    assert model.opt.cone == mujoco.mjtCone.mjCONE_PYRAMIDAL

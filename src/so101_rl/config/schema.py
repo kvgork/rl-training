@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import numpy as np
 
@@ -149,6 +149,64 @@ class RegisterConfig:
     over_current_protection_time: int = 20  # UNVERIFIED default; H6 proves fold-back
 
 
+@dataclass(frozen=True)
+class SimWarpConfig:
+    """MuJoCo Warp buffer sizes (FS1, sim-first track). Measured in the S0 spike (2026-10-05)."""
+
+    njmax: int = 256  # constraint rows per world; the MJWarp default 64 overflows (peak nefc 188 measured)
+    nconmax_per_world: int = 32  # contacts per world (CPU max ncon 18); naconmax = nconmax_per_world * nworld
+    nworld_default: int = 1024
+    overflow_check_every_steps: int = 10  # policy steps between device-side overflow reads (one host sync each)
+    overflow_policy: Literal["fail"] = "fail"  # there is deliberately no "warn" value
+
+
+# FS4 reward terms (plan §10 2026-10-06 "Reward structure"): name -> the term's own parameter keys in so101.yaml
+# (``weight`` is common to all). The implementations live in ``env/reward.py`` (test-enforced: same names).
+REWARD_TERM_PARAMS: Final[dict[str, frozenset[str]]] = {
+    "distance": frozenset({"scale_m", "zero_on_success"}),
+    "success": frozenset(),
+    "clamp": frozenset(),
+    "action_l2": frozenset(),
+    "time": frozenset(),
+}
+TASK_NAMES: Final[tuple[str, ...]] = ("reach", "die_to_zone")
+
+
+@dataclass(frozen=True)
+class RewardTermSpec:
+    """One weighted reward term. ``scale_m`` / ``zero_on_success`` are used by ``distance`` only."""
+
+    name: str
+    weight: float  # >= 0; every term's value is <= 0, so a negative weight would pay a positive reward
+    scale_m: float | None = None
+    zero_on_success: bool = False
+
+
+@dataclass(frozen=True)
+class RewardSpec:
+    """Per-task reward: ``sum(weight * term)``. Validated by ``env.reward.validate_reward_spec``."""
+
+    terms: tuple[RewardTermSpec, ...]
+
+    def term(self, name: str) -> RewardTermSpec | None:
+        return next((t for t in self.terms if t.name == name), None)
+
+
+@dataclass(frozen=True)
+class TaskConfig:
+    """The configurable part of an FS4 task (``tasks.<name>`` in so101.yaml); the rest is frozen in env/tasks.py."""
+
+    reward: RewardSpec
+    max_height_m: float | None = None  # die: centroid at most this far above the goal (plan §10 2026-10-06)
+    settle_mm: float | None = None  # die: tracker displacement between the debounce steps (plan §10 2026-10-06)
+
+
+@dataclass(frozen=True)
+class TasksConfig:
+    reach: TaskConfig
+    die_to_zone: TaskConfig
+
+
 @dataclass(frozen=True, eq=False)
 class So101Config:
     port: str
@@ -163,3 +221,5 @@ class So101Config:
     box: WorkspaceBox
     registers: RegisterConfig
     kinematics_path: Path  # config/so101_kinematics.yaml
+    sim_warp: SimWarpConfig  # FS1 (sim-first track)
+    tasks: TasksConfig  # FS4 per-task reward and die-success parameters

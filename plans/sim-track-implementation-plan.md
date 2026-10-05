@@ -42,7 +42,7 @@
 - Zero-shot: ≥ 30 episodes per task, Wilson 95 % interval (30/30 → lower bound 88.6 %), fixed goal seeds interleaved sim/real, halt on any safety event or 3 consecutive failures. Gap metrics: success delta, final-error distribution, per-joint tracking-error distributions (KS/Wasserstein), clamp-active fraction per stage, replay-in-sim RMS, tracker UNKNOWN fraction, online delay estimate by cross-correlation. Freeze and version the obs/reward interface between sim and real.
 
 **lerobot-specialist** (S4/S5 learners):
-- Minimal self-written SAC (~300–400 lines) on the batched tensors rather than torchrl's SAC: the asymmetric critic, separate `terminated`/`truncated`, n-step across auto-reset and CUDA-graph capture all need custom code. Actor 3×256 (reach) / 3×512 (die), **SB3-compatible shape (ReLU, no LayerNorm) so the actor copies into SB3's `latent_pi`/`mu`/`log_std`**; twin critics 3×512 with LayerNorm on `concat(priv_obs, action)`. Batch 4096/8192, 8 gradient steps per vector step (sweep 4/8/16), GPU ring replay 2–4 M, fp32. γ 0.97 (50 steps) / 0.98 (100 steps); **bootstrap through truncation and store the pre-reset final obs** (the most common bug). n-step 3 for the sparse die reward. α auto-tuned from 0.01–0.05 with target entropy −3 (fallback −6), log-α clamped. Fixed analytic obs normalisation, rewards in [−1, 1] per step, success bonus ≤ 5, tanh-Gaussian with exact [−1, 1] bounds (scaling to ticks only in the env). Randomise the initial episode phase per env to decorrelate synchronous resets.
+- Minimal self-written SAC (~300–400 lines) on the batched tensors rather than torchrl's SAC: the asymmetric critic, separate `terminated`/`truncated`, n-step across auto-reset and CUDA-graph capture all need custom code. Actor 3×256 (reach) / 3×512 (die), **SB3-compatible shape (ReLU, no LayerNorm) so the actor copies into SB3's `latent_pi`/`mu`/`log_std`**; twin critics 3×512 with LayerNorm on `concat(priv_obs, action)`. Batch 4096/8192, 8 gradient steps per vector step (sweep 4/8/16), GPU ring replay 2–4 M, fp32. γ 0.97 (50 steps) / 0.98 (100 steps); **bootstrap through truncation and store the pre-reset final obs** (the most common bug). n-step 3 for the sparse die reward. α auto-tuned from 0.01–0.05 with target entropy −3 (fallback −6), log-α clamped. Fixed analytic obs normalisation, ~~rewards in [−1, 1] per step, success bonus ≤ 5~~ (superseded by FS4: non-positive modular reward, every step < 0, finishing best; no success bonus), tanh-Gaussian with exact [−1, 1] bounds (scaling to ticks only in the env). Randomise the initial episode phase per env to decorrelate synchronous resets.
 - Throughput: 745k mj-steps/s ÷ 51 ≈ 14k policy-steps/s raw; expect 5–10k env-steps/s with learning; reach 2–5 M steps (10–20 min), die 20–50 M (1–3 h) — to be measured in a spike. Bottlenecks: python/kernel-launch overhead in the update (torch.compile reduce-overhead or manual CUDA graphs), Warp graph coexisting with torch streams.
 - Gates: L1 = FK over ≥ 1e5 joint samples covers the goal distribution with margin, a scripted IK/Jacobian controller (quantised ticks, obs noise on) achieves the predicate in ≥ 95 % within the horizon, travel budget ≥ 2× needed; L2 = adversarial-state table (hover over zone, die moving, die held in the air, die slid out after success → hold K steps, wrong height, tracker-invisible), random/do-nothing false-accept rates (< 0.1 % / 0), a second independent predicate implementation, post-training gaming audit on rendered top/shortest episodes.
 - TD-MPC2 offline: TensorDict chunks `[episodes, T+1]` with obs/action/reward/terminated/truncated/episode; 1–5 M transitions mixing ~30 % random/noisy, 40 % mid-training, 30 % near-final; custom single-task loop using `TDMPC2.update()` (the vendored `OfflineTrainer` asserts mt30/mt80), goal in obs, no task embedding; warm-start the real run with the checkpoint, small `seed_steps`, 10–20 % sim data kept in the buffer, lower lr.
@@ -75,7 +75,7 @@ A unit may add behaviour but may not change a listed signature, dtype, layout ve
 ```python
 @dataclass(frozen=True)
 class SimWarpConfig:
-    njmax: int = 256                 # per world; spike: default 64 overflows (nefc up to 174)
+    njmax: int = 256                 # per world; spike: default 64 overflows (peak nefc 188 measured at S0.3)
     nconmax_per_world: int = 32      # spike: CPU max ncon 18
     nworld_default: int = 1024
     overflow_check_every_steps: int = 10   # policy steps between device-side counter reads (a sync each)
@@ -115,14 +115,14 @@ class WarpSim:
     def body_xpos(self, body: str) -> torch.Tensor            # [N, 3]
     def body_xquat(self, body: str) -> torch.Tensor           # [N, 4] wxyz
     def contact_count(self, geoms_a: Sequence[int], geoms_b: Sequence[int]) -> torch.Tensor   # int32[N]: contacts between the two geom sets this step
-    def set_world_params(self, params: "BatchedSimParams") -> None   # per-world dof_damping/armature/frictionloss, actuator_gainprm/biasprm, geom_friction, body_mass (FS7)
+    def set_world_params(self, params: "BatchedSimParams", *, validate: bool = True) -> None   # per-world dof_damping/armature/frictionloss, actuator_gainprm/biasprm, geom_friction, body_mass (FS7); validate rejects non-finite, kp/forcerange/die_mass <= 0, others < 0 before writing (host inputs: no device sync; GPU inputs: one sync); in-place writes reach already-captured graphs
     def copy_world_to(self, world: int, data: mujoco.MjData) -> None # for CPU rendering / debugging
     def close(self) -> None
     @property
     def vram_bytes(self) -> int
 ```
 
-`so101_rl.sim` keeps importing lazily: `import so101_rl.sim` must not import `mujoco_warp` or `warp`.
+`so101_rl.sim` keeps importing lazily: `import so101_rl.sim` must not import `mujoco_warp` or `warp`. As built (SU0 review, 2026-10-06): `stat.meaninertia` is made per-world by the wrapper (outside `batch_sizes`); `with WarpSim(...)` never masks an in-flight exception (the final overflow check becomes a note); runs are not bitwise deterministic (shared atomic contact pool).
 
 ### FS3. Policy observation layout — `src/so101_rl/env/obs.py` (supersedes F7's `observation` layout)
 
@@ -168,9 +168,46 @@ PRIV_OBS: Final[PrivObsLayout]
 
 Gymnasium `Dict` contract (F7) is kept: `observation` = this layout, `achieved_goal` = tip xyz (reach) or last-known die xyz (die), `desired_goal` = goal xyz (reach) or zone centre (die). A unit test feeds one state to the numpy and the torch builders and asserts equality to 1e-6.
 
-### FS4. Task specification — `src/so101_rl/env/tasks.py`
+### FS4. Task specification — `src/so101_rl/env/tasks.py`, `src/so101_rl/env/reward.py`, `tasks:` in `so101.yaml`
+
+Revised 2026-10-06 (SU0 review; plan §10 rows "Reward structure", "Die success height", "Die must be settled").
 
 ```python
+# config/schema.py (parsed strictly by config.loader.parse_tasks; So101Config.tasks; load_tasks_config() reads only this section)
+@dataclass(frozen=True)
+class RewardTermSpec: name: str; weight: float; scale_m: float | None = None; zero_on_success: bool = False
+@dataclass(frozen=True)
+class RewardSpec: terms: tuple[RewardTermSpec, ...]          # def term(name) -> RewardTermSpec | None
+@dataclass(frozen=True)
+class TaskConfig: reward: RewardSpec; max_height_m: float | None = None; settle_mm: float | None = None
+@dataclass(frozen=True)
+class TasksConfig: reach: TaskConfig; die_to_zone: TaskConfig
+```
+
+```yaml
+tasks:                     # strict: exactly these keys; term names from REWARD_TERM_PARAMS; weight in [0, 100],
+  reach:                   # scale_m in [0.001, 10], max_height_m in [0.001, 0.020], settle_mm in [0.1, 10]
+    reward:
+      distance: {weight: 1.0, scale_m: 0.30, zero_on_success: true}
+      success: {weight: 1.0}
+  die_to_zone:
+    max_height_m: 0.016    # centroid at most this far above the goal
+    settle_mm: 3.0         # tracker displacement between the 2 debounce steps
+    reward:
+      distance: {weight: 1.0, scale_m: 0.30, zero_on_success: true}
+      success: {weight: 1.0}
+```
+
+```python
+# env/reward.py — terms (unweighted, every one <= 0): distance = -dist/scale_m (0 on success steps if zero_on_success),
+# success = -(1 - predicate), clamp = -info["action_clamped"], action_l2 = -mean(info["applied_action"]**2)
+REWARD_TERMS: Mapping[str, RewardTerm]               # name -> (inf, sup <= 0, numpy fn, torch fn)
+class RewardSpecError(ValueError): ...
+def validate_reward_spec(spec: RewardSpec) -> RewardBounds   # max_step = 0, max_unsuccessful_step = -w_success
+def evaluate_np(spec, *, dist, success, info=None) -> np.ndarray          # float32; terms_np(...) -> dict per term
+def evaluate_torch(spec, *, dist, success, info=None) -> torch.Tensor     # terms_torch(...)
+
+# env/tasks.py
 @dataclass(frozen=True)
 class GoalBounds:            # base frame, metres
     radius_max_m: float = 0.30          # from the base
@@ -178,8 +215,8 @@ class GoalBounds:            # base frame, metres
     margin_m: float = 0.02
     z_min_m: float = 0.03               # kinematic floor; H-track may raise it
 
-@dataclass(frozen=True)
-class ZoneSpec: center_xy_m: tuple[float, float]; half_edge_m: float = 0.030; z_table_m: float = -0.02
+@dataclass(frozen=True, kw_only=True)
+class ZoneSpec: center_xy_m: tuple[float, float]; half_edge_m: float = 0.030; z_table_m: float = -0.02; max_height_m: float  # 0.016 (config)
 
 @dataclass(frozen=True)
 class TaskSpec:
@@ -189,22 +226,28 @@ class TaskSpec:
     gamma: float                        # 0.97 / 0.98 (training hint, not an env property)
     success_radius_m: float             # reach 0.015; die: centroid inside the zone square
     success_debounce_steps: int         # reach 1; die 2 (consecutive steps with the predicate true)
-    success_bonus: float                # 1.0
-    dense_scale: float                  # reach: reward = -dist/0.30; die: -dist(die, zone)/0.30
+    settle_m: float | None              # die 0.003 (config settle_mm / 1000): max tracker displacement between counted steps; reach None
+    reward: RewardSpec                  # config tasks.<name>.reward; __post_init__ runs validate_reward_spec
     goal_bounds: GoalBounds
     zone: ZoneSpec | None
     die_start: DieStartSpec | None      # well centre xy, sigma_xy_m, yaw uniform; measured by H9, placeholder until then
     start_pose: Literal["home", "random_in_box"]
     reset_settle_steps: int = 0         # die task: physics steps after placing the die (0 = place at rest)
 
-REACH: Final[TaskSpec]; DIE_TO_ZONE: Final[TaskSpec]
-def reward_np(achieved: np.ndarray, desired: np.ndarray, spec: TaskSpec, *, visible: np.ndarray | None = None) -> np.ndarray     # vectorised (SB3 HER)
-def reward_torch(achieved: torch.Tensor, desired: torch.Tensor, spec: TaskSpec, *, visible: torch.Tensor | None = None) -> torch.Tensor
+def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec
+REACH: Final[TaskSpec]; DIE_TO_ZONE: Final[TaskSpec]   # built from the shipped so101.yaml at import
+def reward_np(achieved: np.ndarray, desired: np.ndarray, spec: TaskSpec, *, visible: np.ndarray | None = None, info=None) -> np.ndarray     # vectorised (SB3 HER), <= 0
+def reward_torch(achieved: torch.Tensor, desired: torch.Tensor, spec: TaskSpec, *, visible: torch.Tensor | None = None, info: Mapping[str, Tensor] | None = None) -> torch.Tensor
+def reward_terms_np(...) -> dict[str, np.ndarray]; def reward_terms_torch(...) -> dict[str, torch.Tensor]   # per-term, for logging (FS11)
 def success_np(achieved, desired, spec, *, visible=None) -> np.ndarray      # bool; visible=False never succeeds (UNKNOWN, L11)
 def success_torch(achieved, desired, spec, *, visible=None) -> torch.Tensor
+def debounce_np(predicate, count, spec, *, achieved=None, prev_achieved=None) -> tuple[np.ndarray, np.ndarray]   # (success, new_count); die needs the positions
+def debounce_torch(predicate, count, spec, *, achieved=None, prev_achieved=None) -> tuple[torch.Tensor, torch.Tensor]
 ```
 
-`reward_*` use the **tracker-reported** die position (last-known when invisible), so sim and real rewards are the same function of the same inputs; the privileged truth is critic-only. `tests/test_tasks.py::test_np_torch_reward_identical` pins the two implementations.
+**Reward.** A sum of named, weighted terms, each a pure instantaneous function of one step's `(achieved, desired, visible, info)` — the instantaneous success predicate, never the debounce/settle state — so HER relabels it. Default (both tasks): `-dist/0.30 * (1 - pred) - 1 * (1 - pred) - 0.05`: −0.05 on success steps, ≤ −1.05 on every other step. The `time` term (constant −1 × weight 0.05, the only term not zeroed on success steps, instantaneous so HER-safe) makes **every** non-terminal step strictly negative, in-zone steps included. `validate_reward_spec` proves for any configured combination that **every step earns ≤ −w_time < 0** and unsuccessful steps ≤ −(w_success + w_time) (known terms once each, every term ≤ 0, weights finite ≥ 0, `success` and `time` weight > 0, `distance.scale_m` > 0); the old `+bonus × predicate` paid the policy not to finish (dip in and out of the zone, hide the die). **Success predicate:** reach `|tip − goal| ≤ 0.015`; die: visible AND xy in the zone square around `desired` AND centroid ≤ `max_height_m` (16 mm) above `desired` (D435 depth noise; a die held ~2 cm up fails). **Termination:** `success_debounce_steps` consecutive predicate steps; die also needs ≤ `settle_m` (3 mm) tracker displacement between them (a slide at 0.05 m/s = 5 mm/step or a nudge out never terminates). A die kept moving inside the zone forever earns −w_time per step, so it is strictly worse than finishing (the terminal state is 0): finishing is always best.
+
+`reward_*` use the **tracker-reported** die position (last-known when invisible), so sim and real rewards are the same function of the same inputs; the privileged truth is critic-only. `tests/test_tasks.py::test_np_torch_reward_identical` pins the two implementations; `tests/test_reward.py` pins the validator (incl. a hypothesis property test over random specs and states) and that finishing beats every gaming policy in discounted return.
 
 ### FS5. Batched servo chain — `src/so101_rl/sim/batched_servo.py`
 
@@ -505,7 +548,7 @@ Legend: **SW** = software, runs now on fake / CPU MuJoCo / MuJoCo Warp; **GPU** 
   1. `[tool.pixi.feature.sim.dependencies]`: `mujoco-python = "3.14.*"`, `mujoco-warp = "3.14.*"`, `warp-lang = ">=1.17"` (all conda-forge). Remove `mujoco-python = ">=3.3"`.
   2. Core `pytorch = "2.11.*"` (was `>=2.7,<2.12`); `torchvision = ">=0.26,<0.27"`; `numpy = "2.2.*"` unchanged. `[tool.pixi.feature.gpu.dependencies]`: `pytorch-gpu = "2.11.*"`, `cuda-version = "12.9.*"` (the spike's warp build is cuda129; **decision D-CUDA** — if the solver cannot pair torch 2.11 with 12.9, fall back to `12.8.*`/`12.6.*` and record it). Keep `[tool.pixi.system-requirements] cuda = "12"`.
   3. Add the `cma` PyPI dependency to the `train` feature (sysid). Do **not** add `optuna` unless S2.4 needs it (anti-hypertrophy).
-  4. New pixi tasks (modules may not exist yet; `pixi task list` must still work): `test-gpu = 'pytest -m "gpu and not hardware"'`, `ci-gpu = { depends-on = ["lint", "test", "test-gpu"] }`, `bench-warp = "python scripts/bench_warp.py"`, `sim-parity = 'pytest tests/test_batched_parity.py -m "gpu or not gpu"'`, `tray-check = "python -m so101_rl.sim.tray_check"`, `sysid-excite = "python -m so101_rl.sim.sysid.run_excitation"`, `sysid-fit = "python -m so101_rl.sim.sysid.fit"`, `sim-gates = "python -m so101_rl.rl.gates"`, `train-sim-sac = "python -m so101_rl.rl.train_sim_sac"`, `eval-sim = "python -m so101_rl.rl.eval_sim"`, `export-policy = "python -m so101_rl.rl.policy_export"`, `deploy-policy = "python -m so101_rl.rl.deploy_policy"`, `pretrain-tdmpc2 = "python -m so101_rl.rl.tdmpc2_offline"`, `gap-report = "python -m so101_rl.rl.gap_report"`. Keep every existing task.
+  4. New pixi tasks (as built after the SU0 review: only tasks whose module exists are defined — `test-gpu`, `ci-gpu`, `bench-warp`; the rest are listed as planned in a `pyproject.toml` comment and land with their module, guarded by `tests/test_pixi_tasks.py`; `sim-parity` will be plain `pytest tests/test_batched_parity.py`, the `-m "gpu or not gpu"` filter was a no-op): `test-gpu = 'pytest -m "gpu and not hardware"'`, `ci-gpu = { depends-on = ["lint", "test", "test-gpu"] }`, `bench-warp = "python scripts/bench_warp.py"`, `sim-parity = 'pytest tests/test_batched_parity.py -m "gpu or not gpu"'`, `tray-check = "python -m so101_rl.sim.tray_check"`, `sysid-excite = "python -m so101_rl.sim.sysid.run_excitation"`, `sysid-fit = "python -m so101_rl.sim.sysid.fit"`, `sim-gates = "python -m so101_rl.rl.gates"`, `train-sim-sac = "python -m so101_rl.rl.train_sim_sac"`, `eval-sim = "python -m so101_rl.rl.eval_sim"`, `export-policy = "python -m so101_rl.rl.policy_export"`, `deploy-policy = "python -m so101_rl.rl.deploy_policy"`, `pretrain-tdmpc2 = "python -m so101_rl.rl.tdmpc2_offline"`, `gap-report = "python -m so101_rl.rl.gap_report"`. Keep every existing task.
   5. `pixi install -e cpu && pixi install -e default && pixi install -e robot`. Record the solved versions per env in `README.md` (replace the 2026-09-30 table; keep the pin rationale incl. "lerobot 0.6.1 needs torch < 2.12, numpy < 2.3").
   6. `tests/test_env_sanity.py` gains: `test_mujoco_version_pinned` (`mujoco.__version__.startswith("3.14")` whenever `mujoco` imports), `test_mujoco_warp_importable` (`import mujoco_warp, warp` succeeds in any env that has the `sim` feature; on a host without CUDA `warp` must still import), `test_torch_version_pinned` (`2.11.`), `test_single_torch` unchanged.
 - **Tests:** the four above plus the whole existing suite in both envs.
@@ -534,7 +577,7 @@ Legend: **SW** = software, runs now on fake / CPU MuJoCo / MuJoCo Warp; **GPU** 
   3. `set_world_params` writes the per-world `*` fields (`dof_damping[N, nv]`, `dof_armature`, `dof_frictionloss`, `actuator_gainprm[N, nu, :]`, `actuator_biasprm`, `geom_friction[N, ngeom]`, `body_mass[N, nbody]`) — expanding the field to a leading world dimension if the model was created unbatched. **If 3.14 refuses per-world expansion of any of these fields, the task records which, and S2/S3 use the CPU/chunked fallbacks named in FS7/FS8.**
   4. `scripts/bench_warp.py --nworld 256,1024,2048 --steps 2000 --njmax 256 --nconmax 32 --out runs/bench/warp-<ts>.json`: random ctrl within `ctrlrange` resampled every 50 steps (as in the spike), reports env-steps/s, VRAM delta (`torch.cuda.max_memory_allocated` + Warp's), max `nefc` / `nacon` seen (sampled every step, not every 50th), and runs `check_overflow()` at the end.
 - **Tests (`@pytest.mark.gpu`):** `test_warp_model.py::test_sizes_from_config` (sizes equal the yaml), `::test_qpos_zero_copy` (`qpos.data_ptr()` equals the warp pointer; writing through torch is visible to warp), `::test_step_matches_cpu_300_steps` (sinusoid around rest: max |Δqpos| arm ≤ 1e-6 rad vs CPU, the spike's number with margin), `::test_overflow_detector_fails` (`njmax=16` → `ContactBufferOverflow` within 100 steps of random ctrl — the gate shown to fail), `::test_overflow_detector_quiet_at_256` (no raise over 2000 steps at N=256), `::test_set_world_params_per_world` (two worlds with kp 998 vs 300: step responses differ in the expected direction), `::test_close_checks_overflow`. CPU-marked: `test_config.py::test_sim_warp_section_strict` (missing key → error; `overflow_policy: warn` → error).
-- **Acceptance:** `pixi run pytest tests/test_warp_model.py -q` → all pass; `pixi run -e cpu pytest tests/test_config.py tests/test_config_single_source.py -q` → pass; `pixi run bench-warp --nworld 1024 --steps 2000` → prints `env_steps_per_s ≥ 500000`, `vram_mb ≤ 1500`, `overflow: none`, writes `runs/bench/warp-<ts>.json`. **S0 gate values** (plan §5 S0): throughput ≥ 500k env-steps/s at N=1024, VRAM ≤ 1.5 GB at 1024, parity ≤ 1e-6 rad over 300 steps, zero overflow at njmax 256 / nconmax 32.
+- **Acceptance:** `pixi run pytest tests/test_warp_model.py -q` → all pass; `pixi run -e cpu pytest tests/test_config.py tests/test_config_single_source.py -q` → pass; `pixi run bench-warp --nworld 1024 --steps 2000` → prints `env_steps_per_s ≥ 500000`, `vram_mb ≤ 1500`, `overflow: none`, writes `runs/bench/warp-<ts>.json`. Exit 0 = gate PASS, 1 = FAIL, 2 = NOT EVALUATED (N=1024 missing, `--no-parity`, `--njmax`/`--nconmax` overrides, or `--steps` < 2000; SU0 review). **S0 gate values** (plan §5 S0): throughput ≥ 500k env-steps/s at N=1024, VRAM ≤ 1.5 GB at 1024, parity ≤ 1e-6 rad over 300 steps, zero overflow at njmax 256 / nconmax 32.
 - **Est.:** 4 agent-h + 0.3 GPU-h.
 
 #### Task S0.4 (SW): Interface freeze — obs layout, task specs, goal bounds, ARCHITECTURE sync
@@ -657,6 +700,99 @@ Legend: **SW** = software, runs now on fake / CPU MuJoCo / MuJoCo Warp; **GPU** 
 
 ---
 
+### Unit SUV — Training visualisation: live viewer, rollout videos, live dashboard (wave 1; parallel with SU1, SU2, SR1)
+
+Added 2026-10-05 at the user's request: *"make sure it is possible to see the model training in the sim"*. The user chose all three of the live 3D viewer, rollout videos and a live dashboard. Real-arm replay is not included.
+
+**Frozen interface FS11 (`so101_rl.viz`).** `rl/train_sim_sac.py` (S4.3) and the S1 env debugging tools call only this interface:
+
+```python
+# viz/monitor.py
+@dataclass(frozen=True)
+class VizConfig:
+    live_viewer: bool = False           # --viewer
+    viewer_worlds: tuple[str, ...] = ("0", "best", "worst")   # world ids or selectors
+    viewer_hz: float = 30.0
+    video_every_min: float = 10.0       # 0 disables
+    video_worlds: int = 4
+    video_seconds: float = 10.0
+    tensorboard: bool = True
+class TrainingMonitor:                  # one per training run; never raises into the training loop
+    def __init__(self, cfg: VizConfig, sim: WarpSim, run_dir: Path, *, task: str, render_cfg: So101Config) -> None
+    def on_step(self, env_step: int, *, success: torch.Tensor, ep_return: torch.Tensor) -> None   # O(1), no host sync
+    def on_metrics(self, env_step: int, scalars: Mapping[str, float]) -> None                     # TensorBoard scalars
+    def maybe_record(self, env_step: int, policy: Callable[[torch.Tensor], torch.Tensor]) -> Path | None   # rollout video when due
+    def close(self) -> None
+```
+
+**Viz rules:**
+- **Training speed:** visualisation must never slow training by more than **5 %**, measured.
+- **Failure handling:** a crash in the viewer or the video writer is logged once, and the visualisation is disabled for the rest of the run, but training continues. This is the one place where swallowing an error is allowed. It applies only because the error is visualisation-only, and the swallowed error is reported in `metrics.csv` as `viz_disabled=1`.
+- **Dependencies:** `viz/` imports `sim/` and `env/` read-only, and `rl/` imports `viz/`. `safety/` never imports it.
+
+#### Task V.1 (SW + GPU): Live 3D viewer of selected parallel worlds
+- **Files:** `src/so101_rl/viz/__init__.py`, `src/so101_rl/viz/live_viewer.py`, `tests/test_live_viewer.py`
+- **Steps:**
+  - A **separate process**, so the GUI never holds the training process's GIL. It runs `mujoco.viewer.launch_passive` on a CPU `MjModel` built by the same `load_model()` and receives the qpos and qvel of the selected worlds over a shared-memory seqlock (reuse `servo/shm.py` `SeqlockBlock`) at `viewer_hz`.
+  - The training side copies only the selected worlds' rows, as one small device-to-host copy every `1/viewer_hz` s, and never waits on the viewer.
+  - World selectors:
+    - `0`: a fixed world;
+    - `best` / `worst`: by the current episode return, re-picked at each episode boundary;
+    - integers.
+  - On-screen overlay:
+    - the world id;
+    - the DR stage;
+    - the episode step;
+    - the success flag;
+    - the goal as a marker site, and the zone for die tasks;
+    - the tracker's last-seen die position as a ghost marker, so occlusion is visible.
+  - The viewer can be toggled with `pixi run viz-attach --run runs/...` against a training run that is already going, and closing the window never stops training.
+  - Headless (no `DISPLAY`): the viewer refuses with a clear message, and videos still work.
+- **Tests:** `test_viewer_payload_roundtrip` (shm), `test_selector_best_worst`, `test_viewer_absent_display_is_clean_error`, and `@gpu test_viewer_overhead_under_5pct`. The last one measures training steps/s with and without the publisher, with no window opened (publisher only).
+- **Acceptance:** `pixi run -e default viz-demo --nworld 1024` opens a window showing worlds 0, best and worst under a random policy on WarpSim, run manually on `DISPLAY=:1`. The automated tests pass.
+
+#### Task V.2 (SW + GPU): Rollout videos per checkpoint
+- **Files:** `src/so101_rl/viz/video.py`, `tests/test_video.py`
+- **Steps:**
+  - Record `video_worlds` worlds for `video_seconds` with the current deterministic policy every `video_every_min`, and at every checkpoint.
+  - **Two cameras:**
+    1. the **overhead D435 pose**, the same camera as the real arm, so sim and real views match;
+    2. a free 3/4 view.
+  - Render through MuJoCo Warp's batch renderer when available, otherwise through CPU `mujoco.Renderer` on copied states. The CPU fallback is always available.
+  - Overlay text: step, DR stage, return, success. Encode the frames to `runs/<run>/videos/<env_step>_<world>.mp4` with ffmpeg, which is already in the env.
+  - Supersedes S4.3's `rl/render.py`. The gaming-audit renders (8 random, 4 highest-return, 4 shortest episodes) use this module.
+- **Tests:** `test_video_written_cpu_renderer` (a stub env, CPU), `test_overlay_text_present`, `test_overhead_camera_matches_d435_extrinsics` (the camera pose equals the config's D435 pose).
+- **Acceptance:** `pixi run -e default viz-demo --record 10 --out runs/viz-demo/` writes at least 2 mp4s that play.
+
+#### Task V.3 (SW): Live TensorBoard dashboard
+- **Files:** `src/so101_rl/viz/monitor.py` (FS11), `tests/test_monitor.py`
+- **Steps:**
+  - `TrainingMonitor` writes TensorBoard scalars. Training curves:
+    - success rate, current and eval;
+    - mean return;
+    - episode length;
+    - DR stage.
+  - SAC internals:
+    - α;
+    - entropy;
+    - Q mean and max;
+    - critic loss;
+    - action saturation;
+    - clamp-active fractions;
+    - tracker visible fraction.
+  - System health:
+    - env-steps/s;
+    - grads/s;
+    - GPU temperature, memory and utilisation (NVML, which `warp-lang` already depends on);
+    - review triggers as text.
+  - It embeds the V.2 videos (`add_video`), and `metrics.csv` stays the source of truth.
+  - `pixi run dashboard --logdir runs/` starts TensorBoard on localhost.
+  - Add `tensorboard` (conda-forge) to the `train` feature.
+- **Tests:** `test_scalars_written`, `test_video_embedded`, and `test_monitor_never_raises_into_training`, which injects a writer failure and asserts training continues with `viz_disabled=1` logged.
+- **Acceptance:** `pixi run -e cpu pytest tests/test_monitor.py tests/test_video.py tests/test_live_viewer.py -q -m "not gpu"` passes. `pixi run dashboard` serves the demo run's scalars and videos.
+
+**Est.:** about 6 agent-hours in total, with `parallelizable-via-worktree: true`.
+
 ### Unit SU3 — S3: domain randomisation and curriculum (wave 2; parallel with SU4, SR2)
 
 #### Task S3.1 (SW + GPU): `DrSpec`, `DomainRandomizer`, stage yaml, env hooks
@@ -697,16 +833,16 @@ Legend: **SW** = software, runs now on fake / CPU MuJoCo / MuJoCo Warp; **GPU** 
 - **Steps:** `pixi run sim-gates --task {reach,die_to_zone} --out runs/gates/<task>-<ts>.json` runs and prints a PASS/FAIL table:
   - **L1 reach:** FK over 2e5 random in-limit joint vectors → nearest-FK distance ≤ 0.01 m for 100 % of 1e4 sampled goals and ≥ `success_radius` margin to the joint limits; travel budget `max_delta × episode_steps ≥ 2 ×` the largest goal-to-start joint distance; scripted controller (tick-quantised, obs noise stage 1) succeeds ≥ 95 % of 1024 worlds within 50 steps.
   - **L1 die:** start well and the whole zone reachable at graspable height (tip z ≤ table + 0.03 m within 0.01 m) and the pushing approach (tip at table + 0.012 m on the far side of the die) reachable; scripted push controller achieves the predicate ≥ 30 % (the Phase 4 scripted-seed bar) and the scripted grasp-and-place ≥ 30 %; die start distribution never inside the zone and never under the arm's home footprint.
-  - **L2 (both):** the adversarial-state table (tip hovering over the zone without the die; die moving through the zone at > 0.05 m/s; die held in the air above the zone; die slid out one step after success; die at zone edge ± 1 mm; die in the zone but tracker-invisible; wrong height) → `success_*` false in every case except the genuine ones; random-policy false-accept over 1e5 episode-steps < 0.1 % and do-nothing = 0; an independent second predicate implementation (plain numpy, written separately in `gates.py`) agrees with `tasks.success_np` on 1e5 random states.
+  - **L2 (both):** the adversarial-state table (tip hovering over the zone without the die; die moving through the zone at > 0.05 m/s; die held in the air above the zone (> 16 mm above the goal, e.g. 25 mm); die slid out one step after success; die at zone edge ± 1 mm; die in the zone but tracker-invisible; wrong height) → no success in every case except the genuine ones. Static states are judged by the instantaneous predicate `success_*`; the motion cases (moving through at > 0.05 m/s, nudged/slid out) by the episode-level success `debounce_*` with the settle rule (2 consecutive visible in-zone steps and ≤ 3 mm tracker displacement between them, plan §10 2026-10-06), since the per-step predicate cannot see motion; random-policy false-accept over 1e5 episode-steps < 0.1 % and do-nothing = 0; an independent second predicate implementation (plain numpy, written separately in `gates.py`) agrees with `tasks.success_np` on 1e5 random states.
   Each gate is also a pytest; each has a broken-input twin (e.g. a goal sampler radius of 0.40 m fails L1; a predicate without the visibility test fails L2).
 - **Tests:** `test_gates.py::test_l1_reach_passes`, `::test_l1_reach_fails_with_radius_040`, `::test_l1_die_passes`, `::test_l2_adversarial_table[case]`, `::test_l2_random_false_accept`, `::test_l2_independent_predicate_agrees`, `::test_l2_fails_without_visibility_rule`, `@gpu ::test_scripted_reach_ge_95pct`, `@gpu ::test_scripted_push_ge_30pct`.
 - **Acceptance:** `pixi run -e cpu pytest tests/test_gates.py -q -m "not gpu"` → pass; `pixi run sim-gates --task reach` → exit 0, all rows PASS; `pixi run sim-gates --task die_to_zone` → exit 0 (if the scripted push bar fails, the task is **not** trained: report to the user — L1).
 - **Est.:** 4 agent-h + 0.3 GPU-h.
 
 #### Task S4.3 (SW + GPU): Training loop, checkpoints, rollout logging, renders, sim eval + exit gate, policy export
-- **Files:** `src/so101_rl/rl/train_sim_sac.py`, `src/so101_rl/rl/rollout_logger.py`, `src/so101_rl/rl/render.py`, `src/so101_rl/rl/eval_sim.py`, `src/so101_rl/rl/policy_export.py`, `tests/test_train_sim_sac.py`, `tests/test_rollout_logger.py`, `tests/test_eval_sim.py`, `tests/test_policy_export.py`
+- **Files:** `src/so101_rl/rl/train_sim_sac.py`, `src/so101_rl/rl/rollout_logger.py`, `src/so101_rl/rl/eval_sim.py`, `src/so101_rl/rl/policy_export.py`, `tests/test_train_sim_sac.py`, `tests/test_rollout_logger.py`, `tests/test_eval_sim.py`, `tests/test_policy_export.py`
 - **Specialist:** lerobot-specialist; cuda-performance-engineer
-- **Dependencies:** S4.1, S4.2, SU1; SU3 optional at start (stage 0)
+- **Dependencies:** S4.1, S4.2, SU1, **SUV** (the training loop creates a `viz.TrainingMonitor` from `--viewer/--video-every/--tensorboard` flags and calls `on_step`, `on_metrics`, `maybe_record`; renders go through `viz/video.py`, which supersedes `rl/render.py`); SU3 optional at start (stage 0)
 - **Steps:**
   1. `pixi run train-sim-sac --task reach --nworld 1024 --budget-min 60 --dr-start-stage 0 --dr-max-stage 4 --out runs/sac-sim/<task>-<ts>/ [--sim-params calib/sim_params.yaml] [--seed] [--resume CKPT]`: `torch.cuda.set_per_process_memory_fraction(0.6)`; env + randomizer + curriculum; warm-up random actions; loop with `grad_steps_per_env_step` updates; every `eval_every` env-steps a deterministic eval on 1000 episodes at the **current** DR stage (`eval_sim.evaluate`), logging to `metrics.csv` (env-steps/s, grads/s, success, final error p50/p90, α, entropy, Q mean/max, critic loss, action saturation fraction, clamp-active fractions, tracker visible fraction, dr stage, VRAM); checkpoint `ckpt_<step>.pt` every eval and `ckpt_last.pt`; `RolloutLogger` writes rollouts (mix as per the specialist: a `policy_tag` per chunk: 0 random/warm-up, 1 mid-training, 2 final — the logger samples every k-th vector step so the total stays 1–5 M transitions); an OOM is **not** caught (fails loudly, L12); exits non-zero if `metrics.csv` has < 3 rows or no checkpoint exists.
   2. **Review triggers** (printed and written to `review.json`, never auto-switching the method — plan §5): UTD < 0.005 grads/transition; α < 1e-4 or entropy > target + 2 for 100k steps; |Q| > 2 · r_max/(1 − γ); critic loss rising over 3 evals; saturation > 50 %; reach success < 50 % after 1 GPU-h or no improvement over 3 evals; die success < 10 % after 4 GPU-h; curriculum stuck at a stage for > 2 GPU-h.
@@ -933,6 +1069,21 @@ execution_shape:
         - tests/test_env_backend.py
         - tests/test_goal_env.py
         - tests/test_goals.py
+    - id: SUV
+      name: training-visualisation
+      wave: 1
+      depends_on: [SU0]
+      parallelizable_via_worktree: true
+      tasks: [V.1, V.2, V.3]
+      owns_files:
+        - src/so101_rl/viz/__init__.py
+        - src/so101_rl/viz/live_viewer.py
+        - src/so101_rl/viz/video.py
+        - src/so101_rl/viz/monitor.py
+        - tests/test_live_viewer.py
+        - tests/test_video.py
+        - tests/test_monitor.py
+      # pyproject (tensorboard dep; viz-demo, viz-attach, dashboard tasks) and ARCHITECTURE (§3 viewer process, §4 viz/) are shared writes, applied after the join
     - id: SU3
       name: s3-domain-randomisation-curriculum
       wave: 2
@@ -960,7 +1111,6 @@ execution_shape:
         - src/so101_rl/rl/scripted.py
         - src/so101_rl/rl/train_sim_sac.py
         - src/so101_rl/rl/rollout_logger.py
-        - src/so101_rl/rl/render.py
         - src/so101_rl/rl/eval_sim.py
         - src/so101_rl/rl/policy_export.py
         - tests/test_replay_gpu.py
@@ -1042,7 +1192,7 @@ execution_shape:
         - runs/hw/sysid-*.json
   waves:
     - {wave: 0, units: [SU0]}
-    - {wave: 1, units: [SU1, SU2, SR1]}
+    - {wave: 1, units: [SU1, SU2, SR1, SUV]}
     - {wave: 2, units: [SU3, SU4, SR2]}
     - {wave: 3, units: [SU4-RUNS, SU5, SR3]}
   shared_writes:

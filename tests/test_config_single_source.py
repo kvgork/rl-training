@@ -8,7 +8,16 @@ import pytest
 
 SRC = Path(__file__).parent.parent / "src" / "so101_rl"
 EXCLUDED_DIRS = {"config", "_vendor"}
-NAMES = ("max_delta_ticks", "tracking_error_ticks", "trip_c", "resume_c", "stale_cmd_ms", "bound_s")
+NAMES = (
+    "max_delta_ticks",
+    "tracking_error_ticks",
+    "trip_c",
+    "resume_c",
+    "stale_cmd_ms",
+    "bound_s",
+    "njmax",
+    "nconmax_per_world",
+)
 # name [: annotation] (= | :) [ ( or [ ] number
 PATTERN = re.compile(
     r"""\b(?:"""
@@ -44,12 +53,23 @@ def test_no_limit_literals_outside_config():
         "resume_c=50",
         "bound_s: float = 5.0",
         "stale_cmd_ms = 150",
+        "njmax = 256",
+        "make_data(mjm, nworld=n, njmax=256)",
+        "nconmax_per_world: int = 32",
     ],
 )
 def test_pattern_detects_offenders(line):
     assert PATTERN.search(line)
 
 
-@pytest.mark.parametrize("line", ["trip_c = cfg.thermal.trip_c", "max_delta_ticks=cfg.action.max_delta_ticks", "bound = 5.0"])
+@pytest.mark.parametrize(
+    "line",
+    [
+        "trip_c = cfg.thermal.trip_c",
+        "max_delta_ticks=cfg.action.max_delta_ticks",
+        "bound = 5.0",
+        "make_data(mjm, njmax=cfg.njmax, nconmax=cfg.nconmax_per_world)",
+    ],
+)
 def test_pattern_ignores_config_reads(line):
     assert not PATTERN.search(line)

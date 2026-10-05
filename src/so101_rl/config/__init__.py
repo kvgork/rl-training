@@ -1,6 +1,14 @@
 """Single source of truth for limits, units, rates and registers (L4)."""
 
-from .loader import DEFAULT_CONFIG_PATH, dump_env, is_verified_on_hardware, load_calibration, load_config
+from .loader import (
+    DEFAULT_CONFIG_PATH,
+    dump_env,
+    is_verified_on_hardware,
+    load_calibration,
+    load_config,
+    load_tasks_config,
+    parse_tasks,
+)
 from .schema import (
     CENTER_TICK,
     JOINT_NAMES,
@@ -11,8 +19,13 @@ from .schema import (
     MotorCalibration,
     RateConfig,
     RegisterConfig,
+    RewardSpec,
+    RewardTermSpec,
     SafeStateConfig,
+    SimWarpConfig,
     So101Config,
+    TaskConfig,
+    TasksConfig,
     ThermalConfig,
     WorkspaceBox,
     rad_to_ticks,
@@ -30,14 +43,21 @@ __all__ = [
     "MotorCalibration",
     "RateConfig",
     "RegisterConfig",
+    "RewardSpec",
+    "RewardTermSpec",
     "SafeStateConfig",
+    "SimWarpConfig",
     "So101Config",
+    "TaskConfig",
+    "TasksConfig",
     "ThermalConfig",
     "WorkspaceBox",
     "dump_env",
     "is_verified_on_hardware",
     "load_calibration",
     "load_config",
+    "load_tasks_config",
+    "parse_tasks",
     "rad_to_ticks",
     "ticks_to_rad",
 ]

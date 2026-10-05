@@ -6,12 +6,18 @@
   <include file="upstream/so101_new_calib.xml"/>
   <!-- Later <compiler> wins: upstream's meshdir="assets" is relative to the MAIN file, ours lives one level up. -->
   <compiler angle="radian" meshdir="upstream/assets" autolimits="true"/>
+  <!-- D-TIMESTEP (plan §10 2026-10-05): dt = 1/510 s, so MujocoBus.steps_per_tick = round((1/30)/dt) = 17 substeps
+       are exactly one 1/30 s servo tick (upstream's default 0.002 s made a tick 34 ms, a 2 % time-scale error).
+       Upstream sets no <option>; everything else stays at MuJoCo's defaults (Euler, Newton, pyramidal cone). -->
+  <option timestep="0.00196078431372549"/>
 
   <default>
     <!-- Primitive jaw collision geoms (plan sec. 6: mesh-mesh grasp contact is unstable and slow).
-         contype 2 / conaffinity 2: collides with the die and the table, never with the (contype 1) arm meshes. -->
+         contype 2 / conaffinity 2: collides with the die and the table, never with the (contype 1) arm meshes.
+         margin 0 (was 0.0005): MuJoCo Warp 3.14 raises NotImplementedError for box-box / box-mesh pairs with a
+         non-zero margin, and CPU and GPU must run the same model (S0.2, spike 2026-10-05). -->
     <default class="jaw_col">
-      <geom type="box" contype="2" conaffinity="2" group="4" rgba="0.9 0.2 0.2 0.3" friction="1.2 0.01 0.001" condim="4" margin="0.0005"/>
+      <geom type="box" contype="2" conaffinity="2" group="4" rgba="0.9 0.2 0.2 0.3" friction="1.2 0.01 0.001" condim="4" margin="0"/>
     </default>
     <default class="die">
       <geom type="box" size="0.008 0.008 0.008" mass="0.004" contype="2" conaffinity="3" friction="1.0 0.01 0.001" condim="4" rgba="0.8 0.1 0.1 1"/>

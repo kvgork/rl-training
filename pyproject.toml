@@ -43,9 +43,9 @@ env = { PYTHONNOUSERSITE = "1" }   # keep ~/.local site-packages out of the env
 
 [tool.pixi.dependencies]
 python = "3.12.*"
-numpy = "2.2.*"
-pytorch = ">=2.7,<2.12"
-torchvision = ">=0.22,<0.27"
+numpy = "2.2.*"   # lerobot 0.6.1 needs numpy < 2.3
+pytorch = "2.11.*"   # one torch in every env; lerobot 0.6.1 needs torch < 2.12
+torchvision = ">=0.26,<0.27"
 torchcodec = "*"
 pyserial = ">=3.5"
 pyyaml = "*"
@@ -64,7 +64,10 @@ so101-rl = { path = ".", editable = true }
 lerobot = { version = "==0.6.1", extras = ["feetech", "grpcio-dep"] }
 
 [tool.pixi.feature.sim.dependencies]
-mujoco-python = ">=3.3"
+# One MuJoCo in every sim-capable env (plan §10 2026-10-05, D-PIN); mujoco-warp versions track mujoco.
+mujoco-python = "3.14.*"
+mujoco-warp = "3.14.*"
+warp-lang = ">=1.17,<2"
 
 [tool.pixi.feature.perception.dependencies]
 opencv = ">=4.9,<4.14"   # lerobot 0.6.1 needs opencv-python-headless<4.14
@@ -80,13 +83,14 @@ hydra-core = "*"
 omegaconf = "*"
 termcolor = "*"
 pandas = "*"
+cma = "*"   # CMA-ES for the sysid fit (S2)
 
 [tool.pixi.feature.gpu.dependencies]
-pytorch-gpu = "*"
-cuda-version = "12.8.*"   # re-pin to the driver's CUDA after H1
+pytorch-gpu = "2.11.*"
+cuda-version = "12.9.*"   # D-CUDA: matches the cuda129 warp-lang build (driver 610.57); fallback 12.8 / 12.6
 
 [tool.pixi.feature.cpu.dependencies]
-pytorch-cpu = "*"
+pytorch-cpu = "2.11.*"
 
 [tool.pixi.environments]
 default = ["sim", "perception", "train", "gpu"]
@@ -108,9 +112,15 @@ soak-fake = "python -m so101_rl.servo.soak --backend fake --calibration tests/da
 calib-check = "python -m so101_rl.safety.calib_check"
 hand-eye = "python -m so101_rl.perception.calibrate_hand_eye"
 compare-real = "python -m so101_rl.sim.compare_real"
-random-policy-sim = "python -m so101_rl.env.random_policy --backend sim"
-random-policy-real = "python -m so101_rl.env.random_policy --backend real"
-train-reach-sac = "python -m so101_rl.rl.train_sac_her"
-train-reach-tdmpc2 = "python -m so101_rl.rl.train_tdmpc2"
-train-wm-state = "python -m so101_rl.wm.train_state_wm"
-check-milestone = "python scripts/check_milestone_phase0.py"
+# Sim-first track (plans/sim-track-implementation-plan.md).
+test-gpu = 'pytest -m "gpu and not hardware"'
+ci-gpu = { depends-on = ["lint", "test", "test-gpu"] }
+bench-warp = "python scripts/bench_warp.py"
+# Planned tasks: each is added in the same commit that creates its module, so `pixi task list` never advertises a
+# broken task (tests/test_pixi_tasks.py). Phase 0 U8-U10 / SR1-SR3: random-policy-sim / random-policy-real
+# (so101_rl.env.random_policy --backend {sim,real}), train-reach-sac (rl.train_sac_her), train-reach-tdmpc2
+# (rl.train_tdmpc2), train-wm-state (wm.train_state_wm), check-milestone (scripts/check_milestone_phase0.py).
+# Sim track SU1-SU5: sim-parity (pytest tests/test_batched_parity.py: no -m filter, it runs the CPU and GPU layers),
+# tray-check (sim.tray_check), sysid-excite (sim.sysid.run_excitation), sysid-fit (sim.sysid.fit), sim-gates
+# (rl.gates), train-sim-sac (rl.train_sim_sac), eval-sim (rl.eval_sim), export-policy (rl.policy_export),
+# deploy-policy (rl.deploy_policy), pretrain-tdmpc2 (rl.tdmpc2_offline), gap-report (rl.gap_report).

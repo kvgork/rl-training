@@ -14,14 +14,21 @@ import yaml
 from .schema import (
     JOINT_NAMES,
     N_JOINTS,
+    REWARD_TERM_PARAMS,
+    TASK_NAMES,
     TICKS_PER_REV,
     ActionConfig,
     JointLimits,
     MotorCalibration,
     RateConfig,
     RegisterConfig,
+    RewardSpec,
+    RewardTermSpec,
     SafeStateConfig,
+    SimWarpConfig,
     So101Config,
+    TaskConfig,
+    TasksConfig,
     ThermalConfig,
     WorkspaceBox,
 )
@@ -85,9 +92,31 @@ TOP_KEYS = frozenset(
         "safe_state",
         "box",
         "registers",
+        "sim_warp",
+        "tasks",
     }
 )
+# FS1: MuJoCo Warp sizes. Lower bounds from the S0 spike (njmax 64 is MJWarp's own default and already overflows on
+# this scene, so nothing smaller is accepted); upper bounds only reject absurd values (VRAM).
+SIM_WARP_RANGES: dict[str, tuple[int, int]] = {
+    "njmax": (64, 4096),
+    "nconmax_per_world": (1, 1024),
+    "nworld_default": (1, 65536),
+    "overflow_check_every_steps": (1, 100000),
+}
+SIM_WARP_POLICIES = ("fail",)
 CALIB_KEYS = frozenset({"id", "drive_mode", "homing_offset", "range_min", "range_max"})
+# FS4 tasks (plan §10 2026-10-06). Keys per task; ranges reject typos and absurd values, the sign rules of the
+# reward are proven by env.reward.validate_reward_spec (run whenever a TaskSpec is built).
+TASK_KEYS: dict[str, frozenset[str]] = {
+    "reach": frozenset({"reward"}),
+    "die_to_zone": frozenset({"reward", "max_height_m", "settle_mm"}),
+}
+REWARD_WEIGHT_RANGE = (0.0, 100.0)  # >= 0: every term is <= 0, a negative weight would pay a positive reward
+REWARD_SCALE_RANGE_M = (1e-3, 10.0)
+# Die centroid above the goal: > 0 and below ~2 cm, where a die "held clearly in the air" must still fail.
+DIE_MAX_HEIGHT_RANGE_M = (1e-3, 0.020)
+DIE_SETTLE_RANGE_MM = (0.1, 10.0)
 
 
 def _keys(node: Any, expected: frozenset[str] | set[str], where: str) -> dict[str, Any]:
@@ -203,6 +232,59 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         raise TypeError(f"{path}: top level must be a mapping")
     _walk_finite(raw)
     return raw
+
+
+def _num_in(value: Any, lo: float, hi: float, key: str) -> float:
+    v = _num(value, key)
+    if not lo <= v <= hi:
+        raise ValueError(f"{key}: {v} outside the allowed range {lo}..{hi}")
+    return v
+
+
+def _parse_reward(node: Any, where: str) -> RewardSpec:
+    """``tasks.<name>.reward``: a mapping term name -> {weight, <term params>}. Strict: unknown term names, unknown
+    or missing parameter keys and out-of-range values are errors; at least one term."""
+    if not isinstance(node, dict) or not node:
+        raise ValueError(f"{where}: expected a non-empty mapping of reward terms, got {node!r}")
+    terms = []
+    for name, params in node.items():
+        if name not in REWARD_TERM_PARAMS:
+            raise ValueError(f"{where}: unknown reward term {name!r} (known: {sorted(REWARD_TERM_PARAMS)})")
+        p = _keys(params, {"weight", *REWARD_TERM_PARAMS[name]}, f"{where}.{name}")
+        kw: dict[str, Any] = {"weight": _num_in(p["weight"], *REWARD_WEIGHT_RANGE, f"{where}.{name}.weight")}
+        if "scale_m" in p:
+            kw["scale_m"] = _num_in(p["scale_m"], *REWARD_SCALE_RANGE_M, f"{where}.{name}.scale_m")
+        if "zero_on_success" in p:
+            if not isinstance(p["zero_on_success"], bool):
+                raise ValueError(f"{where}.{name}.zero_on_success: expected true or false")
+            kw["zero_on_success"] = p["zero_on_success"]
+        terms.append(RewardTermSpec(name=name, **kw))
+    return RewardSpec(terms=tuple(terms))
+
+
+def parse_tasks(node: Any, where: str = "tasks") -> TasksConfig:
+    """Strictly parse the ``tasks:`` section (FS4): ``reach`` and ``die_to_zone``, each with exactly its keys."""
+    t = _keys(node, set(TASK_NAMES), where)
+    out = {}
+    for name in TASK_NAMES:
+        tw = f"{where}.{name}"
+        e = _keys(t[name], TASK_KEYS[name], tw)
+        kw: dict[str, Any] = {"reward": _parse_reward(e["reward"], f"{tw}.reward")}
+        if "max_height_m" in e:
+            kw["max_height_m"] = _num_in(e["max_height_m"], *DIE_MAX_HEIGHT_RANGE_M, f"{tw}.max_height_m")
+        if "settle_mm" in e:
+            kw["settle_mm"] = _num_in(e["settle_mm"], *DIE_SETTLE_RANGE_MM, f"{tw}.settle_mm")
+        out[name] = TaskConfig(**kw)
+    return TasksConfig(**out)
+
+
+def load_tasks_config(path: Path | None = None) -> TasksConfig:
+    """Only the ``tasks:`` section (no calibration needed): ``env/tasks.py`` builds REACH / DIE_TO_ZONE from it."""
+    path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+    raw = _read_yaml(path)
+    if "tasks" not in raw:
+        raise ValueError(f"{path}: missing keys ['tasks']")
+    return parse_tasks(raw["tasks"])
 
 
 def load_config(
@@ -367,6 +449,14 @@ def load_config(
         **{k: _in_range(_int(g[k], f"registers.{k}"), *REGISTER_RANGES[k], f"registers.{k}") for k in REGISTER_RANGES}
     )
 
+    w = _keys(raw["sim_warp"], {*SIM_WARP_RANGES, "overflow_policy"}, "sim_warp")
+    if w["overflow_policy"] not in SIM_WARP_POLICIES:
+        raise ValueError(f"sim_warp.overflow_policy: must be one of {SIM_WARP_POLICIES}, got {w['overflow_policy']!r}")
+    sim_warp = SimWarpConfig(
+        **{k: _in_range(_int(w[k], f"sim_warp.{k}"), *SIM_WARP_RANGES[k], f"sim_warp.{k}") for k in SIM_WARP_RANGES},
+        overflow_policy=w["overflow_policy"],
+    )
+
     return So101Config(
         port=raw["port"],
         heartbeat_port=hb,
@@ -380,6 +470,8 @@ def load_config(
         box=box,
         registers=registers,
         kinematics_path=kinematics_path,
+        sim_warp=sim_warp,
+        tasks=parse_tasks(raw["tasks"]),
     )
 
 

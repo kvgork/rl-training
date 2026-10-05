@@ -1,11 +1,13 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.11 (2026-10-05). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.14 (2026-10-06). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
 >
-> **Still interface-only:** the env (U8), and the RL and world-model code (U9).
+> - *Sim-first track SU0 (S0, 2026-10-05; `plans/sim-track-implementation-plan.md`):* one MuJoCo 3.14 / torch 2.11 in every env, MuJoCo Warp (`sim/warp_model.py`, failing overflow detector, S0 gate passed), and the frozen FS3 observation layout (`env/obs.py`) and FS4 task specs (`env/tasks.py`, modular non-positive reward in `env/reward.py` after the SU0 review, 2026-10-06).
+>
+> **Still interface-only:** the env itself (SR1/SU1: `So101GoalEnv`, `BatchedGoalEnv`), and the RL and world-model code (U9 → SU4/SR2).
 > **Source of truth for decisions:** `so101-self-learning-rl-plan.md` §10 (decision log). This doc describes *how* the system is built; the plan describes *what* and *why*.
 > **Keeping it current:** every change that adds, removes or renames a module, a process, or a cross-process interface updates this file in the same commit. See §10 at the bottom of this file.
 
@@ -115,7 +117,8 @@ rl-trainer/
 ├── so101-self-learning-rl-plan.md
 ├── docs/ARCHITECTURE.md          # this file
 ├── plans/                        # implementation plans per phase
-├── scripts/                      # fetch_assets.py, extract_kinematics.py, vendor_tdmpc2.py (reproducible generators)
+├── scripts/                      # fetch_assets.py, extract_kinematics.py, vendor_tdmpc2.py (reproducible generators),
+│                                 # bench_warp.py (MuJoCo Warp throughput/VRAM/overflow/parity + the S0 gate)
 ├── assets/so101/                 # official TheRobotStudio MJCF (+ licence), jaw primitives, keyframes
 │   └── upstream/                 # fetched unmodified at a pinned commit (UPSTREAM.json holds sha + sha256 per file)
 ├── calib/                        # hand_eye.yaml, fiducial.yaml (committed artifacts)
@@ -130,13 +133,17 @@ rl-trainer/
 │   │                             # heartbeat.py: MCU link + FakeMcu; timing; shm (seqlock + single-instance lock)
 │   ├── safety/                   # clamp, fk (pure-numpy FK + box), transit (rest<->home transit-zone planner), config_check (safe-state geometry/time-bound validation), thermal, stuck, safe_state, reenergize,
 │   │                             # calib_check, state_machine, pipeline. Never imports rl, wm or env.
-│   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface)
+│   ├── env/                      # goal-conditioned Gym env (sim + real backends, same interface); built: obs (FS3 frozen
+│   │                             # policy/critic layout, numpy + torch builders), tasks (FS4 REACH / DIE_TO_ZONE: the
+│   │                             # one success / settle-debounce definition for sim and real, built from the `tasks:`
+│   │                             # config section), reward (FS4 modular reward terms, validator: every step reward < 0)
 │   ├── perception/               # camera (D435 by serial, FakeCamera), die_tracker (HSV + depth, None when occluded),
 │   │                             # frames (Umeyama hand-eye), fiducial (ArUco camera-moved gate), object_table (shm),
 │   │                             # calibrate_hand_eye (driver)
 │   ├── sim/                      # model (load_model via MjSpec, primitive jaw geoms), mujoco_bus (the F2 Bus on MuJoCo,
-│   │                             # with action delay), gripper_map (0–100 % <-> rad <-> ticks), compare_real (sysid check);
-│   │                             # domain randomization comes later
+│   │                             # with action delay), gripper_map (0–100 % <-> rad <-> ticks), compare_real (sysid check),
+│   │                             # warp_model (WarpSim: MuJoCo Warp, N worlds on the GPU, torch views, failing overflow
+│   │                             # detector; FS2); domain randomization comes later
 │   ├── wm/                       # world models: state (Stage A), pixel fused encoder (parallel track)
 │   ├── rl/                       # SAC+HER baseline (SB3), TD-MPC2+HER wrapper, HER relabel, toy_env, smoke_tdmpc2
 │   ├── logging/                  # schema, episode_logger (HDF5, atomic .tmp -> rename, applied action),
@@ -150,10 +157,12 @@ rl-trainer/
 ```
 rl, wm ──► env ──► servo(shm client) , perception(shm client)
 env ──► sim            safety ◄── servo
+env/batched_env ──► sim (WarpSim, batched servo chain)
+sim ──► safety.types, safety.fk   (constants only: TripCause, KinematicChain; D-DEPS)
 all ──► config, logging
 ```
 
-`safety` has no dependency on `rl`, `wm` or `env`. That is what "policy-independent" means in the code.
+`safety` has no dependency on `rl`, `wm` or `env`. That is what "policy-independent" means in the code. Sim-first additions (plan §10 2026-10-05, D-DEPS): `rl → env`; `rl/` and `env/` never import the `safety/` clamps (the batched sim re-implements the chain in `sim/batched_servo.py`, pinned to `safety/pipeline.py` by the parity test); `env/obs.py`, `env/tasks.py` and `env/reward.py` import only `config` and each other (test-enforced).
 
 ## 5. Key interfaces (Stage A)
 
@@ -229,6 +238,8 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 
 **Sim (U4).**
 - `load_model()` compiles `so101_rl_scene.xml` through `MjSpec`. It adds primitive jaw box geoms and a `gripper_tip` site, and disables collisions on the jaw meshes.
+- **Timestep (S0.2, D-TIMESTEP):** the scene sets `timestep = 1/510 s`, so `MujocoBus.steps_per_tick` = 17 substeps are exactly one 1/30 s servo tick and one policy step exactly 100 ms (with upstream's 0.002 s a tick was 34 ms). CPU MuJoCo and MuJoCo Warp use the same substep count.
+- **`jaw_col` margin = 0 (S0.2):** MuJoCo Warp rejects non-zero margins on box pairs; both engines run the same model.
 - `MujocoBus` implements `Bus` using the real calibration.
   - **Registers:** `Present_Position`, `Goal_Position`, `Torque_Enable`, `Present_Temperature` and `Present_Voltage` are live. Every other register is stored and read back.
   - **Limits and signs:** `write_goal` clips to the Min/Max_Position_Limit registers, and the reported velocity follows the `drive_mode` sign.
@@ -238,6 +249,20 @@ The exact signatures are frozen in `plans/phase0-implementation-plan.md` ("Froze
 - `reenergize` is tested end to end on FakeBus and on MujocoBus (`tests/test_reenergize_backends.py`).
 - The gripper uses its own linear map between the calibration `range_min`/`range_max` and the MJCF joint range.
 - `so101_rl.sim` re-exports lazily, so importing it does not load `mujoco`.
+
+**MuJoCo Warp (S0.3, FS2 of `plans/sim-track-implementation-plan.md`).**
+- `WarpSim(model, cfg.sim_warp, nworld, *, device="cuda:0", capture_graph=True)` holds one MJWarp `Model` + `Data` for N worlds. `qpos`, `qvel`, `ctrl`, `actuator_force` and `site_xpos` / `body_xpos` / `body_xquat` are zero-copy torch views (`wp.to_torch`). `step(nsteps)` replays one captured CUDA graph per distinct `nsteps`; Warp runs on its own stream, fenced both ways against torch's current stream with events (no host sync).
+- **Sizes come from the `sim_warp:` config section** (FS1, `SimWarpConfig`: `njmax` 256 per world, `nconmax_per_world` 32 with `naconmax = 32 × N` shared by all worlds, `nworld_default`, `overflow_check_every_steps`, `overflow_policy: fail`). The loader is strict: every key required, `njmax ≥ 64`, the others ≥ 1, and `overflow_policy` has no value other than `fail`.
+- **Overflow fails.** MJWarp only prints on overflow and silently drops rows/contacts. `check_overflow()` reads MJWarp's sticky per-world `Data.overflow` bitmask (folded into an accumulator before any reset clears it) plus `nefc` / `nacon` in one device→host copy and raises `ContactBufferOverflow` on any capacity bit. Solver iteration-limit bits are counted, not raised. `close()` runs the check too, so a run cannot end with an undetected overflow; the batched env (S1) calls it every `overflow_check_every_steps` policy steps.
+- `reset_worlds(mask, qpos, qvel, ctrl)` (full-size tensors, masked rows applied) then `mjw.forward`; `set_world_params(BatchedSimParams, *, validate=True)` writes per-world kp/kv (gainprm/biasprm), damping/armature/frictionloss, forcerange, die mass (inertia scaled) and die/table friction into model arrays allocated with a world dimension (`put_model(batch_sizes=...)`), then `mjw.set_const`. Every FS7 field batches in MJWarp 3.14, including `geom_size` (die-size DR). `stat.meaninertia` is outside `batch_sizes` (it lives in `Model.stat`) but every kernel indexes it per world, so the wrapper replaces it with an `[N]` array before any capture. Writes are in place, so a captured step graph sees parameters changed after the capture (test-pinned). `validate` rejects non-finite values, `kp`/`forcerange`/`die_mass` ≤ 0 and negative others before writing: host inputs (the samplers' output) cost no device sync, GPU inputs one sync for all fields; `validate=False` for callers that validated at the sampler.
+- Leaving `with WarpSim(...)` with an exception never masks it: a failing final overflow check is added to the original exception as a note. Not bitwise deterministic: the shared contact pool is filled with atomics (two identical 256-world runs differed by up to 0.041 rad after 1020 steps); short smooth runs agree to float32 rounding.
+- `contact_count(geoms_a, geoms_b) -> int32[N]` (geom-set masks cached per pair), `copy_world_to(world, MjData)` (rendering), `vram_bytes` (Warp mempool only).
+- `scripts/bench_warp.py` (`pixi run bench-warp`) measures env-steps/s, process VRAM, peak `nefc`/`nacon` and CPU-vs-Warp parity. Exit 0 = S0 gate PASS, 1 = FAIL (N=1024: ≥ 500k env-steps/s, ≤ 1.5 GB, no overflow at njmax 256 / nconmax 32, arm parity ≤ 1e-6 rad over 300 steps), 2 = NOT EVALUATED (N=1024 not run, `--no-parity`, `--njmax`/`--nconmax` overrides, or `--steps` < 2000). Measured 2026-10-05: 731k env-steps/s and 786 MB at N=1024, parity 3.9e-7 rad, peak nefc 188/256.
+- `so101_rl.sim` stays lazy: importing it loads neither `mujoco`, `mujoco_warp` nor `warp` (test-enforced).
+
+**Sim-first interfaces (FS-series, `plans/sim-track-implementation-plan.md`).** FS1 (`SimWarpConfig`, the `sim_warp:` section) and FS2 (`WarpSim`) are built (S0.3, above). FS3 and FS4 are frozen in code (S0.4):
+- **FS3 observation** (`env/obs.py`, `OBS_LAYOUT_VERSION = 1`, supersedes F7's 15-D layout): `q_norm` 6 = (present − 2047)/2048, `dq_norm` 6 = Present_Speed [ticks/s] / servo_hz / `max_ticks_per_tick` clipped ±2, `last_applied` 6 = `applied_delta_ticks / max_delta_ticks` clipped ±1, `tip_xyz` 3 (FK of present); die tasks add `die_xyz` 3 (last-known, held), `die_visible` 1, `die_age` 1 = min(frames since seen, 30)/30. Reach 21, die 26; policy input + 3 goal = 24 / 29. `build_policy_obs_np` / `build_policy_obs_torch` agree to 1e-6 (test). `PRIV_OBS` (61, critic only, sim only) is a layout.
+- **FS4 tasks** (`env/tasks.py`, `env/reward.py`; plan §10 2026-10-06): `REACH` (50 steps, γ 0.97, success |tip − goal| ≤ 15 mm, debounce 1) and `DIE_TO_ZONE` (100 steps, γ 0.98, debounce 2 + settle, zone (0.22, 0.10) ± 30 mm from the scene site, die start well (0.20, −0.05) σ 5 mm, `measured_on_hardware: false` until H9). The configurable part is the strict `tasks:` section of `so101.yaml` (`config.parse_tasks` → `TasksConfig`; `task_from_config(name, cfg.tasks)`; the module constants come from the shipped yaml). **Reward** = Σ weight × term over named, non-positive terms, each a pure function of one step's (achieved, desired, visible, info): `distance` (−dist/`scale_m`, optionally 0 on success steps), `success` (−1 until the instantaneous predicate holds), `clamp` (−`info["action_clamped"]`), `action_l2` (−mean(`info["applied_action"]`²)), `time` (constant −1, not zeroed on in-zone steps). Default for both tasks: −dist/0.30 − 1 off success, 0 on success, minus 0.05 (`time`) on every step. `validate_reward_spec` (run by every `TaskSpec` constructor) proves every step reward ≤ −w_time < 0 and unsuccessful steps ≤ −(w_success + w_time) (known terms, weights ≥ 0, every term ≤ 0, `success` and `time` weight > 0), so finishing beats dipping in and out of the zone, hiding the die, or keeping it moving inside the zone forever (tests: discounted returns over 3000 steps, and a hypothesis property test). `reward_*` / `reward_terms_*` in numpy and torch agree. The die predicate uses the **tracker-reported** position and needs `visible` (missing `visible` is an error; invisible is UNKNOWN, never SUCCESS), the centroid's xy inside the zone square around `desired` and the centroid at most `max_height_m` = 16 mm above `desired` (relative to `desired`, so HER-relabelled goals stay consistent; 25 mm up fails). Termination (`debounce_*`): 2 consecutive predicate steps **and** ≤ `settle_mm` = 3 mm tracker displacement between them (a slide at 0.05 m/s or a nudge out never terminates); termination only, the reward stays instantaneous. SB3 HER's `compute_reward` takes the stored transition's visibility from `info["tracker_visible"]` (`visible_from_info`; never defaults to visible) and passes the stored `info` for the info terms. `GoalBounds` = `cfg.box` shrunk by 20 mm, z ≥ 30 mm, radius ≤ 0.30 m (shared by the numpy and torch goal samplers).
 
 **Perception (U5).**
 - The object table is one seqlock'd `OBJECT_TABLE_DTYPE` record in its own shm segment. Perception creates it, and the env attaches read-only.
@@ -366,7 +391,7 @@ These are ordered from the outermost layer to the innermost.
 
 ## 7. Data and learning flow (Stage A)
 
-**Sim-first** (plan §10, 2026-10-05; plan §5 "Sim-first track"). Status: *planned*, not yet implemented.
+**Sim-first** (plan §10, 2026-10-05; plan §5 "Sim-first track"). Status: **S0 built** (2026-10-05): version pin, MuJoCo Warp backend with the S0 gate passed (N=1024: ~0.73–0.80 M env-steps/s, 786 MB, no overflow at `sim_warp` njmax 256 / nconmax 32, CPU-vs-Warp arm parity 3.9e-7 rad over 300 steps), FS3/FS4 interface freeze. S1–S5 are planned. Grasp-level contact parity (Layer C) is still open.
 
 ```
  SIM (RTX 3080, MuJoCo Warp, 1024–2048 envs)                REAL ARM (ServoCore)
@@ -393,21 +418,22 @@ These are ordered from the outermost layer to the innermost.
 | Pixi feature | Contents | Used by |
 |---|---|---|
 | core (default deps) | python 3.12, numpy 2.2, conda `pytorch` + torchvision (variant chosen by `gpu`/`cpu`), lerobot[feetech,grpcio-dep] 0.6.1 (PyPI), gymnasium, h5py, pyyaml, pytest, hypothesis, ruff | servo, safety, env |
-| `sim` | mujoco-python (conda-forge). **Planned:** `mujoco-warp` and `warp-lang`, with **one MuJoCo version pinned across `cpu` and `default`**. On 2026-10-05 `cpu` had mujoco 3.13 while `default` had 3.3.2. | sim, tests, GPU pre-training (`default` env) |
+| `sim` | `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` (conda-forge): **one MuJoCo version in `cpu` and `default`** (S0.1, 2026-10-05; resolved 3.14.0 / 3.14.0 / 1.17.0 cuda129) | sim, tests, GPU pre-training (`default` env) |
 | `perception` | opencv (conda-forge), pyrealsense2 (PyPI) | perception |
-| `train` | torchrl, tensordict, stable-baselines3, hydra-core, omegaconf, termcolor, pandas (PyPI) | rl, wm |
-| `gpu` | `pytorch-gpu`, `cuda-version` 12.8 (re-pin to the driver's CUDA after H1) | training on the RTX 3080 |
-| `cpu` | `pytorch-cpu` | CI, driver-less hosts, all Phase 0 acceptance |
+| `train` | torchrl, tensordict, stable-baselines3, hydra-core, omegaconf, termcolor, pandas, cma (CMA-ES for sysid) (PyPI) | rl, wm, sim/sysid |
+| `gpu` | `pytorch-gpu 2.11.*`, `cuda-version 12.9.*` (D-CUDA; matches the cuda129 warp build; fallback 12.8 / 12.6) | training and GPU tests on the RTX 3080 |
+| `cpu` | `pytorch-cpu 2.11.*` | CI, driver-less hosts, all Phase 0 acceptance |
 
 | Environment | Features | Purpose |
 |---|---|---|
-| `default` | sim, perception, train, gpu | Training host (locked, but not installable while the NVIDIA driver is down) |
+| `default` | sim, perception, train, gpu | Training host and GPU tests (`pixi run test-gpu`); the driver works since H1 |
 | `cpu` | sim, perception, train, cpu | Tests and smoke runs everywhere |
 | `robot` | perception, cpu | Servo host process: no GPU stack beyond what lerobot imports |
 
-- **Channels:** only conda-forge for torch and CUDA, and PyPI for lerobot, pyrealsense2 and the train stack. There is exactly one torch, the conda `pytorch` (`tests/test_env_sanity.py` enforces it).
+- **Channels:** only conda-forge for torch, CUDA, MuJoCo and Warp, and PyPI for lerobot, pyrealsense2 and the train stack. There is exactly one torch, the conda `pytorch` 2.11 in every env, and one MuJoCo, 3.14 in every sim-capable env (`tests/test_env_sanity.py` enforces both).
+- **Version pins (S0.1):** `pytorch 2.11.*` and `numpy 2.2.*` everywhere, because lerobot 0.6.1 needs torch < 2.12 and numpy < 2.3; `torchvision >=0.26,<0.27`.
 - **Solver pins** (so pixi's PyPI resolver accepts lerobot 0.6.1 on top of the conda solve): `setuptools<82`, `packaging<26`, `opencv<4.14`, `gymnasium<1.3`; `[tool.pixi.system-requirements] cuda = "12"` lets the `default` environment lock without a driver; `PYTHONNOUSERSITE=1` is set on activation so `~/.local` packages never leak in. Solved versions are recorded in `README.md`.
-- **Tasks:** every entry point is a `pixi run` task: `test`, `test-hw`, `lint`, `ci`, `smoke-tdmpc2`, `fetch-assets`, `extract-kinematics`, `servo`, `servo-fake`, `soak`, `soak-fake`, `calib-check`, `hand-eye` (runs `perception.calibrate_hand_eye`), `compare-real`, `random-policy-sim`, `random-policy-real`, `train-reach-sac`, `train-reach-tdmpc2`, `train-wm-state`, `check-milestone`. Tasks whose module a later unit creates fail until that unit lands. `servo-fake` and `soak-fake` pass `--calibration tests/data/so101_follower.calib.json` (the repository copy of the arm's calibration), so the fake runs are reproducible on any host.
+- **Tasks:** every entry point is a `pixi run` task: `test`, `test-hw`, `lint`, `ci`, `smoke-tdmpc2`, `fetch-assets`, `extract-kinematics`, `servo`, `servo-fake`, `soak`, `soak-fake`, `calib-check`, `hand-eye` (runs `perception.calibrate_hand_eye`), `compare-real`; sim-first track (S0.1): `test-gpu` (`pytest -m "gpu and not hardware"`), `ci-gpu` (lint + test + test-gpu), `bench-warp`. Planned tasks (`random-policy-sim`/`-real`, `train-reach-sac`, `train-reach-tdmpc2`, `train-wm-state`, `check-milestone`, `sim-parity`, `tray-check`, `sysid-excite`, `sysid-fit`, `sim-gates`, `train-sim-sac`, `eval-sim`, `export-policy`, `deploy-policy`, `pretrain-tdmpc2`, `gap-report`) are listed in a `pyproject.toml` comment and are added in the same commit as their module; `tests/test_pixi_tasks.py` fails if a task's module, script or test path is missing. `servo-fake` and `soak-fake` pass `--calibration tests/data/so101_follower.calib.json` (the repository copy of the arm's calibration), so the fake runs are reproducible on any host.
 
 The vendored TD-MPC2 tree is generated by `scripts/vendor_tdmpc2.py`. The upstream tarball cache is verified against the recorded `tarball_sha256` on every read, and `scripts/vendor_tdmpc2.manifest.json` records the sha256 of every vendored file so hand-edits fail an offline test.
 
@@ -450,3 +476,6 @@ Bump the version line at the top and add an entry below.
 | 0.9 | 2026-10-02 | Plan §10 decision "Stop during re-energise". §3: a stop during the boot re-energise ramp hands over to the safe-state sequence; a second stop signal cuts torque immediately (`ServoRunner.stop_signals` / `immediate`, summary fields); `--fake-start {home,rest}`. §5: `reenergize(hand_over_on_abort=)` and `ReenergizeAborted.torque_on`, the core's hand-over, `ServoCore.start(immediate_stop=)` and `ImmediateStop`. §6: the safe-state escalation and the re-energise abort exception. |
 | 0.10 | 2026-10-05 | Plan §10 sim-first decisions (2026-10-05). §7: the target sim-first data flow with MuJoCo Warp, the servo-parity rule, and sysid as gate S2. §8: the `sim` feature gains mujoco-warp and warp-lang, with one MuJoCo version pinned across envs. §9: the new decision. This is target design only; nothing is implemented yet. |
 | 0.11 | 2026-10-05 | U3 verification follow-ups. §6: host-side heartbeat partial-frame rule (delivered only when the frame is complete; stale tails over 80 ms dropped). New tests cover the strict re-energise heartbeat on a lost or latched echo, and the abort check just before torque-on. |
+| 0.12 | 2026-10-05 | Sim-first track SU0 (`plans/sim-track-implementation-plan.md`). §8: S0.1 version pin — `mujoco-python 3.14.*`, `mujoco-warp 3.14.*`, `warp-lang >=1.17,<2` in `sim`, `pytorch 2.11.*` in every env (`pytorch-gpu 2.11.*` + `cuda-version 12.9.*` in `gpu`), `cma` in `train`, the sim-track pixi tasks incl. `test-gpu` / `ci-gpu`. §5 Sim: S0.2 scene timestep 1/510 s (17 substeps = one servo tick) and `jaw_col` margin 0. §4/§5: S0.3 `sim/warp_model.py` (`WarpSim`, failing overflow detector, per-world params), the `sim_warp:` config section (`SimWarpConfig`), `scripts/bench_warp.py` and the S0 gate. Header: SU0 status. §4: `env/obs.py`, `env/tasks.py`; dependency arrows per D-DEPS (`sim → safety.types/fk` constants only, `env/batched_env → sim`, `rl → env`). §5: FS1–FS4 pointers and behaviour. §7: status "S0 built" with the measured gate values. |
+| 0.13 | 2026-10-06 | SU0 review fixes (plan §10 2026-10-06 rows). §4: `env/reward.py` (modular reward). §5 FS4: the reward is a weighted sum of named non-positive terms from the new strict `tasks:` config section (`TasksConfig`, `RewardSpec`), `validate_reward_spec` on every `TaskSpec` (no step reward > 0; finishing strictly best), `TaskSpec.reward` / `settle_m` replace `success_bonus` / `dense_scale`, die height bound 16 mm above the goal, settled-die debounce (≤ 3 mm between the 2 steps), `debounce_*(…, achieved=, prev_achieved=)`, `reward_*(…, info=)`. §5 Sim: per-world `stat.meaninertia`, `set_world_params(validate=)`, graph replay picks up changed params, `__exit__` never masks an exception, determinism note, bench gate NOT EVALUATED (exit 2). §8: pixi tasks for modules that do not exist yet removed (listed as planned), guarded by `tests/test_pixi_tasks.py`. |
+| 0.14 | 2026-10-06 | FS4 reward: new `time` term (constant −1 per step, default weight 0.05 for both tasks, not zeroed on in-zone steps, instantaneous so HER-safe). `validate_reward_spec` requires `time.weight > 0`; `RewardBounds.max_step` = −w_time, `max_unsuccessful_step` = −(w_success + w_time). Every non-terminal step is now strictly negative, so a die kept moving inside the zone forever no longer ties with finishing. |
