@@ -30,9 +30,9 @@ def test_constants():
     assert DIE_TO_ZONE.zone.max_height_m == pytest.approx(0.016)
     assert DIE_TO_ZONE.settle_m == pytest.approx(0.003)
     for spec in (REACH, DIE_TO_ZONE):
-        d, s = spec.reward.term("distance"), spec.reward.term("success")
-        assert (d.weight, d.scale_m, d.zero_on_success, s.weight) == (1.0, 0.30, True, 1.0)
-        assert [t.name for t in spec.reward.terms] == ["distance", "success"]
+        d, s, tm = spec.reward.term("distance"), spec.reward.term("success"), spec.reward.term("time")
+        assert (d.weight, d.scale_m, d.zero_on_success, s.weight, tm.weight) == (1.0, 0.30, True, 1.0, 0.05)
+        assert [t.name for t in spec.reward.terms] == ["distance", "success", "time"]
     assert DIE_TO_ZONE.die_start.well_center_xy_m == (0.20, -0.05) and DIE_TO_ZONE.die_start.sigma_xy_m == 0.005
     assert DIE_TO_ZONE.die_start.measured_on_hardware is False  # NEEDS H9
 
@@ -77,14 +77,14 @@ def test_np_torch_reward_identical(spec):
 
 
 def test_reward_definition():
-    """Default reward: -dist/0.30 - 1 while the predicate is false, exactly 0 on success steps (never positive)."""
+    """Default reward: -dist/0.30 - 1 while the predicate is false, plus time -0.05 on EVERY step (success included)."""
     d = np.array([0.2, 0.0, 0.1])
-    assert reward_np(d + [0.03, 0, 0], d, REACH) == pytest.approx(-0.1 - 1.0)
-    assert reward_np(d + [0.01, 0, 0], d, REACH) == pytest.approx(0.0)  # inside the 15 mm radius
+    assert reward_np(d + [0.03, 0, 0], d, REACH) == pytest.approx(-0.1 - 1.0 - 0.05)
+    assert reward_np(d + [0.01, 0, 0], d, REACH) == pytest.approx(-0.05)  # inside the 15 mm radius
     goal = DIE_TO_ZONE.zone.goal_xyz()
-    assert reward_np(goal, goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(0.0)
-    assert reward_np(goal + [0.02, 0, 0], goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(0.0)  # in zone
-    assert reward_np(goal + [0.031, 0, 0], goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(-0.031 / 0.3 - 1)
+    assert reward_np(goal, goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(-0.05)
+    assert reward_np(goal + [0.02, 0, 0], goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(-0.05)  # in zone
+    assert reward_np(goal + [0.031, 0, 0], goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(-0.031 / 0.3 - 1 - 0.05)
     # vectorised over a batch (SB3 HER calls compute_reward on [batch, 3])
     assert reward_np(np.tile(d, (7, 1)), np.tile(d, (7, 1)), REACH).shape == (7,)
 
@@ -96,7 +96,7 @@ def test_success_requires_visible():
     assert not success_np(goal, goal, DIE_TO_ZONE, visible=np.False_)
     assert not success_torch(torch.as_tensor(goal), torch.as_tensor(goal), DIE_TO_ZONE, visible=torch.tensor(False))
     # an invisible step is an unsuccessful step: the success term is -1 (dense part from the held position)
-    assert reward_np(goal, goal, DIE_TO_ZONE, visible=np.False_) == pytest.approx(-1.0)
+    assert reward_np(goal, goal, DIE_TO_ZONE, visible=np.False_) == pytest.approx(-1.05)
     with pytest.raises(ValueError, match="visible"):
         success_np(goal, goal, DIE_TO_ZONE)  # forgetting visibility is an error, not "visible"
     with pytest.raises(ValueError, match="visible"):
@@ -160,7 +160,7 @@ def test_her_relabelled_die_goal_is_consistent():
     np.testing.assert_array_equal(vis, [True, False])
     np.testing.assert_array_equal(success_np(lifted, lifted, DIE_TO_ZONE, visible=vis), [True, False])
     r = reward_np(lifted, lifted, DIE_TO_ZONE, visible=vis)
-    np.testing.assert_allclose(r, [0.0, -1.0])
+    np.testing.assert_allclose(r, [-0.05, -1.05])
     assert visible_from_info(infos, REACH) is None
     with pytest.raises(KeyError):
         visible_from_info([{}], DIE_TO_ZONE)  # a missing flag is never "visible"
@@ -169,9 +169,9 @@ def test_her_relabelled_die_goal_is_consistent():
 def test_die_reward_is_3d_distance():
     goal = DIE_TO_ZONE.zone.goal_xyz()
     a = goal + np.array([0.06, 0.08, 0.0])  # 0.1 m away, outside the zone
-    assert reward_np(a, goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(-0.1 / 0.3 - 1.0)
+    assert reward_np(a, goal, DIE_TO_ZONE, visible=np.True_) == pytest.approx(-0.1 / 0.3 - 1.05)
     assert float(reward_torch(torch.as_tensor(a), torch.as_tensor(goal), DIE_TO_ZONE, visible=torch.tensor(True))) == (
-        pytest.approx(-0.1 / 0.3 - 1.0))
+        pytest.approx(-0.1 / 0.3 - 1.05))
 
 
 def test_debounce():

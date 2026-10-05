@@ -381,7 +381,8 @@ def test_tasks_defaults(cfg):
     assert die.max_height_m == 0.016 and die.settle_mm == 3.0
     assert cfg.tasks.reach.max_height_m is None and cfg.tasks.reach.settle_mm is None
     for t in (cfg.tasks.reach, die):
-        assert [x.name for x in t.reward.terms] == ["distance", "success"]
+        assert [x.name for x in t.reward.terms] == ["distance", "success", "time"]
+        assert t.reward.term("time").weight == 0.05
 
 
 @pytest.mark.parametrize(

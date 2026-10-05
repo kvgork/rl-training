@@ -167,6 +167,7 @@ REWARD_TERM_PARAMS: Final[dict[str, frozenset[str]]] = {
     "success": frozenset(),
     "clamp": frozenset(),
     "action_l2": frozenset(),
+    "time": frozenset(),
 }
 TASK_NAMES: Final[tuple[str, ...]] = ("reach", "die_to_zone")
 

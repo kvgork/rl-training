@@ -1,9 +1,9 @@
 """Modular non-positive reward (env/reward.py; plan §10 2026-10-06 "Reward structure", SU0 review BLOCKING).
 
 The original ``-dist/scale + bonus * predicate`` paid up to +1 per step, so dipping in and out of the zone or
-hiding the die every other step out-earned finishing. These tests pin the fix: every step reward is <= 0 for any
-configuration the validator accepts, unsuccessful steps are <= -w_success, and the old gaming policies earn
-strictly less discounted return than a settled finish.
+hiding the die every other step out-earned finishing. These tests pin the fix: every step reward is <= -w_time < 0 for any
+configuration the validator accepts, unsuccessful steps are <= -(w_success + w_time), and every gaming policy
+(including keeping the die moving inside the zone forever) earns strictly less discounted return than a finish.
 """
 
 import dataclasses
@@ -33,8 +33,12 @@ from so101_rl.env.tasks import (
 
 
 def _spec(**weights) -> RewardSpec:
+    """A spec from name=weight; ``time`` defaults to the shipped 0.05 (pass ``time=None`` to omit it)."""
+    weights = {"time": 0.05, **weights}
     terms = []
     for name, w in weights.items():
+        if w is None:
+            continue
         if name == "distance":
             terms.append(RewardTermSpec("distance", w, scale_m=0.3, zero_on_success=True))
         else:
@@ -46,14 +50,14 @@ def _spec(**weights) -> RewardSpec:
 
 
 def test_registry_matches_config_term_table():
-    assert set(REWARD_TERMS) == set(REWARD_TERM_PARAMS) >= {"distance", "success", "clamp", "action_l2"}
+    assert set(REWARD_TERMS) == set(REWARD_TERM_PARAMS) >= {"distance", "success", "clamp", "action_l2", "time"}
     assert all(t.sup <= 0.0 for t in REWARD_TERMS.values())
 
 
 @pytest.mark.parametrize("spec", [REACH, DIE_TO_ZONE], ids=lambda s: s.name)
 def test_shipped_rewards_validate(spec):
     b = validate_reward_spec(spec.reward)
-    assert b.max_step == 0.0 and b.max_unsuccessful_step == -1.0
+    assert b.max_step == -0.05 and b.max_unsuccessful_step == -1.05
 
 
 @pytest.mark.parametrize(
@@ -62,6 +66,9 @@ def test_shipped_rewards_validate(spec):
         (RewardSpec(()), "no terms"),
         (_spec(distance=1.0), "success"),  # no success term: an unsuccessful step could earn 0
         (_spec(distance=1.0, success=0.0), "success"),
+        (_spec(distance=1.0, success=1.0, time=0.0), "time"),  # a tie with finishing: wiggle in the zone forever
+        (_spec(distance=1.0, success=1.0, time=None), "time"),
+        (_spec(distance=1.0, success=1.0, time=-0.05), "weight"),
         (_spec(distance=1.0, success=-1.0), "weight"),  # the old "+bonus" in disguise
         (_spec(distance=-0.5, success=1.0), "weight"),
         (_spec(success=1.0, clamp=float("nan")), "weight"),
@@ -89,6 +96,8 @@ def test_task_spec_construction_runs_the_validator():
         dataclasses.replace(DIE_TO_ZONE, reward=_spec(distance=1.0, success=-1.0))
     with pytest.raises(RewardSpecError):
         dataclasses.replace(REACH, reward=_spec(distance=1.0))
+    with pytest.raises(RewardSpecError, match="time"):
+        dataclasses.replace(REACH, reward=_spec(distance=1.0, success=1.0, time=0.0))
     with pytest.raises(ValueError, match="settle"):
         dataclasses.replace(REACH, settle_m=0.003)  # settle needs >= 2 debounce steps
 
@@ -109,10 +118,11 @@ def test_terms_sum_to_the_reward_np_and_torch():
     a = np.array([goal, goal + [0.05, 0, 0], goal + [0, 0, 0.03]])
     vis = np.array([True, True, True])
     terms = reward_terms_np(a, np.tile(goal, (3, 1)), DIE_TO_ZONE, visible=vis)
-    assert set(terms) == {"distance", "success"}
+    assert set(terms) == {"distance", "success", "time"}
     np.testing.assert_allclose(sum(terms.values()), reward_np(a, np.tile(goal, (3, 1)), DIE_TO_ZONE, visible=vis),
                                atol=1e-6)
     np.testing.assert_allclose(terms["success"], [0.0, -1.0, -1.0])
+    np.testing.assert_allclose(terms["time"], [-0.05] * 3)  # on the success step too
     tt = reward_terms_torch(torch.as_tensor(a), torch.as_tensor(goal).expand(3, 3), DIE_TO_ZONE,
                             visible=torch.as_tensor(vis))
     for k in terms:
@@ -126,7 +136,7 @@ def test_info_terms_read_the_stored_transition_and_never_default():
     infos = [{"action_clamped": True, "applied_action": np.ones(6)},
              {"action_clamped": False, "applied_action": np.zeros(6)}]
     r = reward_np(a, a, spec, info=infos)  # HER: a sequence of the stored infos
-    np.testing.assert_allclose(r, [-0.5 - 0.2, 0.0])
+    np.testing.assert_allclose(r, [-0.5 - 0.2 - 0.05, -0.05])
     rt = reward_torch(torch.as_tensor(a), torch.as_tensor(a), spec,
                       info={"action_clamped": torch.tensor([True, False]),
                             "applied_action": torch.stack([torch.ones(6), torch.zeros(6)])})
@@ -137,7 +147,7 @@ def test_info_terms_read_the_stored_transition_and_never_default():
         reward_np(a, a, spec)
     # a weight-0 term is skipped and needs no info
     zero = dataclasses.replace(REACH, reward=_spec(distance=1.0, success=1.0, clamp=0.0))
-    assert reward_np(g, g, zero) == 0.0
+    assert reward_np(g, g, zero) == pytest.approx(-0.05)  # only the time term
 
 
 # ---------------------------------------------------------------- property: never positive, for any valid spec
@@ -145,7 +155,7 @@ def test_info_terms_read_the_stored_transition_and_never_default():
 
 @st.composite
 def valid_specs(draw):
-    terms = [RewardTermSpec("success", draw(st.floats(1e-3, 10.0)))]
+    terms = [RewardTermSpec("success", draw(st.floats(1e-3, 10.0))), RewardTermSpec("time", draw(st.floats(1e-3, 10.0)))]
     if draw(st.booleans()):
         terms.append(RewardTermSpec("distance", draw(st.floats(0.0, 10.0)), scale_m=draw(st.floats(1e-3, 5.0)),
                                     zero_on_success=draw(st.booleans())))
@@ -159,8 +169,8 @@ def valid_specs(draw):
 @settings(max_examples=150, deadline=None)
 @given(rspec=valid_specs(), seed=st.integers(0, 2**32 - 1), die=st.booleans())
 def test_property_no_step_reward_is_positive(rspec, seed, die):
-    """For any spec the validator accepts and any states: reward <= 0, and <= -w_success on unsuccessful steps
-    (numpy and torch agree)."""
+    """For any spec the validator accepts and any states: reward <= -w_time < 0, and <= -(w_success + w_time) on
+    unsuccessful steps (numpy and torch agree)."""
     b = validate_reward_spec(rspec)
     task = dataclasses.replace(DIE_TO_ZONE if die else REACH, reward=rspec)
     rng = np.random.default_rng(seed)
@@ -173,7 +183,10 @@ def test_property_no_step_reward_is_positive(rspec, seed, die):
     info = {"action_clamped": rng.random(n) < 0.3, "applied_action": rng.uniform(-1, 1, size=(n, 6))}
     r = reward_np(achieved, desired, task, visible=visible, info=info)
     ok = success_np(achieved, desired, task, visible=visible)
-    assert np.all(r <= 0.0)
+    w_time = rspec.term("time").weight
+    assert b.max_step == -w_time < 0.0
+    assert np.all(r <= -w_time + 1e-6)  # float32 reward
+    assert np.all(r < 0.0)
     assert np.all(r[~ok] <= b.max_unsuccessful_step + 1e-6)
     rt = reward_torch(torch.as_tensor(achieved), torch.as_tensor(desired), task,
                       visible=None if visible is None else torch.as_tensor(visible),
@@ -230,11 +243,10 @@ def test_finishing_beats_every_gaming_policy(gamma):
         g, done = _episode_return(DIE_TO_ZONE, track, vis, gamma, horizon)
         returns[name] = g
         assert done == (name == "finish"), name  # none of the gaming policies ever terminates
-    for name in ("alternate", "hide", "slide"):
-        assert returns["finish"] > returns[name], returns
-    # Known limit of an instantaneous reward (the user's rule: settle only affects termination): a die kept moving
-    # inside the zone earns 0 per step, the same as the terminal state. It ties with finishing; it never beats it.
-    assert returns["wiggle"] <= returns["finish"] + 1e-12
+    # STRICTLY less for every gaming policy, "wiggle" (keep moving inside the zone forever) included: the `time`
+    # term is -w_time on in-zone steps too, so there is no tie with finishing.
+    for name in ("alternate", "hide", "slide", "wiggle"):
+        assert returns["finish"] > returns[name], (name, returns)
 
 
 @settings(max_examples=40, deadline=None)
@@ -245,7 +257,7 @@ def test_finishing_beats_gaming_for_any_valid_spec(rspec):
     pol = _policies(task)
     fin, done = _episode_return(task, *pol["finish"], 0.98, 400, info=info)
     assert done
-    for name in ("alternate", "hide", "slide"):
+    for name in ("alternate", "hide", "slide", "wiggle"):
         g, d = _episode_return(task, *pol[name], 0.98, 400, info=info)
         assert not d and fin > g, (name, fin, g)
 

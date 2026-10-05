@@ -17,14 +17,18 @@ name            range            value
 ``success``     [-1, 0]          ``-(1 - predicate)``: -1 until the (instantaneous) predicate holds
 ``clamp``       [-1, 0]          ``-info["action_clamped"]``: the safety chain clamped this step's action
 ``action_l2``   (-inf, 0]        ``-mean(info["applied_action"] ** 2)`` over the last axis (6 joints, [-1, 1])
+``time``        {-1}             constant ``-1`` on every step, including in-zone steps (never zeroed on success)
 ==============  ===============  ==========================================================================
 
-Default (both tasks): ``-dist/0.30 * (1 - pred) - 1 * (1 - pred)``: 0 on success steps, <= -1 otherwise.
+Default (both tasks): ``-dist/0.30 * (1 - pred) - 1 * (1 - pred) - 0.05``: -0.05 on success steps, <= -1.05
+otherwise.
 
 Why non-positive (the SU0 review): the original ``-dist/scale + bonus * predicate`` paid up to +1 per step, so a
 policy earned more by NOT finishing (dip in and out of the zone, or hide the die every other step to keep the
-episode alive) than by finishing. With every non-terminal step <= 0 and every unsuccessful step <= -w_success < 0,
-the terminal state (value 0) is the best place to be and the fastest settled finish is optimal.
+episode alive) than by finishing. The ``time`` term closes the last tie: a die kept moving INSIDE the zone (the
+success predicate holds, the settle debounce never does) would earn 0 per step, the same as the terminal state.
+With ``time`` every non-terminal step is <= -w_time < 0, so the terminal state (value 0) is strictly the best place
+to be and the fastest settled finish is optimal.
 :func:`validate_reward_spec` proves that for any configured combination; ``TaskSpec`` runs it on construction.
 
 ``info`` (numpy): a mapping, or a sequence of mappings (HER passes the stored transitions' infos); ``info``
@@ -105,6 +109,12 @@ def _distance_t(t: RewardTermSpec, s: StepT) -> torch.Tensor:
     return torch.where(s.success, torch.zeros_like(v), v) if t.zero_on_success else v
 
 
+def _time_t(t: RewardTermSpec, s: StepT) -> torch.Tensor:
+    import torch
+
+    return torch.full_like(s.dist, -1.0)
+
+
 @dataclass(frozen=True)
 class RewardTerm:
     """A term's implementations and the range of its unweighted value (``sup <= 0`` is what the validator uses)."""
@@ -141,6 +151,7 @@ REWARD_TERMS: Final[Mapping[str, RewardTerm]] = {
             lambda t, s: -np.mean(np.square(_info_np(s.info, "applied_action")), axis=-1),
             lambda t, s: -_info_t(s.info, "applied_action").square().mean(dim=-1),
         ),
+        RewardTerm("time", -1.0, -1.0, lambda t, s: np.full(np.shape(s.dist), -1.0), _time_t),
     )
 }
 if set(REWARD_TERMS) != set(REWARD_TERM_PARAMS):  # the loader's known-term table and the implementations
@@ -149,15 +160,15 @@ if set(REWARD_TERMS) != set(REWARD_TERM_PARAMS):  # the loader's known-term tabl
 
 @dataclass(frozen=True)
 class RewardBounds:
-    """What :func:`validate_reward_spec` proved: every step reward <= ``max_step`` (= 0) and every step whose
-    success predicate is false <= ``max_unsuccessful_step`` (< 0)."""
+    """What :func:`validate_reward_spec` proved: every step reward <= ``max_step`` (= -w_time < 0) and every step
+    whose success predicate is false <= ``max_unsuccessful_step`` (= -(w_success + w_time))."""
 
     max_step: float
     max_unsuccessful_step: float
 
 
 def validate_reward_spec(spec: RewardSpec) -> RewardBounds:
-    """Prove that no step of ``spec`` earns a positive reward and that unsuccessful steps are strictly negative.
+    """Prove that every step of ``spec`` earns a strictly negative reward and unsuccessful steps even less.
 
     Construction rules (each checked here, so the proof holds for ANY configured combination):
 
@@ -166,10 +177,11 @@ def validate_reward_spec(spec: RewardSpec) -> RewardBounds:
     3. every weight is finite and >= 0, so ``sum(w_i * term_i) <= sum(w_i * sup_i) <= 0``;
     4. ``success`` is present with weight > 0: a step without the predicate earns <= -w_success < 0, a strict gap
        to the terminal state (0), so finishing beats dipping in and out of the zone or hiding the die;
-    5. ``distance`` has ``scale_m > 0``.
+    5. ``distance`` has ``scale_m > 0``;
+    6. ``time`` is present with weight > 0 (it is the only term not zero on success steps): every step, in-zone
+       steps included, earns <= -w_time < 0, so a policy that never terminates is strictly worse than finishing.
 
-    Since the success predicate needs the die visible and the debounce terminates the episode, "non-terminal" steps
-    are a subset of all steps: the bound covers them. Returns the proved bounds; raises :class:`RewardSpecError`.
+    "Non-terminal" steps are a subset of all steps: the bound covers them. Returns the proved bounds; raises :class:`RewardSpecError`.
     """
     names = [t.name for t in spec.terms]
     if not names:
@@ -195,9 +207,16 @@ def validate_reward_spec(spec: RewardSpec) -> RewardBounds:
             "reward needs the 'success' term with weight > 0: otherwise an unsuccessful step can earn 0 and "
             "never finishing is as good as finishing"
         )
-    if max_step > 0.0:  # unreachable with the rules above; kept as the stated invariant
-        raise RewardSpecError(f"reward can be positive: max step reward {max_step}")
-    return RewardBounds(max_step=max_step, max_unsuccessful_step=-s.weight)
+    tm = spec.term("time")
+    if tm is None or not tm.weight > 0.0:
+        raise RewardSpecError(
+            "reward needs the 'time' term with weight > 0: otherwise a die kept moving inside the zone earns 0 per "
+            "step, a tie with finishing"
+        )
+    max_step = min(max_step, -tm.weight)  # == -w_time: every other registered term has sup 0
+    if max_step >= 0.0:  # unreachable with the rules above; kept as the stated invariant
+        raise RewardSpecError(f"reward can be non-negative on a non-terminal step: max step reward {max_step}")
+    return RewardBounds(max_step=max_step, max_unsuccessful_step=-(s.weight + tm.weight))
 
 
 def _active(spec: RewardSpec) -> Sequence[RewardTermSpec]:

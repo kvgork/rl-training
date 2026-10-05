@@ -96,13 +96,17 @@ tasks:                            # FS4 per-task reward + die success (plan §10
   #   success:   -1 unless the instantaneous success predicate holds (0 then)
   #   clamp:     -1 on steps where the safety chain clamped the action (info["action_clamped"])
   #   action_l2: -mean(applied_action^2), applied_action in [-1, 1] (info["applied_action"])
+  #   time:      constant -1 per step, NOT zeroed on in-zone steps; weight must be > 0 so every non-terminal step
+  #              is strictly < 0 and finishing beats keeping the die moving inside the zone forever
   reach:
     reward:
       distance: {weight: 1.0, scale_m: 0.30, zero_on_success: true}
       success: {weight: 1.0}
+      time: {weight: 0.05}
   die_to_zone:
     max_height_m: 0.016           # die centroid at most this far above the goal (D435 depth noise); 2 cm up fails
     settle_mm: 3.0                # success: 2 consecutive visible in-zone steps moving <= this between them
     reward:
       distance: {weight: 1.0, scale_m: 0.30, zero_on_success: true}
       success: {weight: 1.0}
+      time: {weight: 0.05}
