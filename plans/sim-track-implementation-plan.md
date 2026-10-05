@@ -657,6 +657,99 @@ Legend: **SW** = software, runs now on fake / CPU MuJoCo / MuJoCo Warp; **GPU** 
 
 ---
 
+### Unit SUV — Training visualisation: live viewer, rollout videos, live dashboard (wave 1; parallel with SU1, SU2, SR1)
+
+Added 2026-10-05 at the user's request: *"make sure it is possible to see the model training in the sim"*. The user chose all three of the live 3D viewer, rollout videos and a live dashboard. Real-arm replay is not included.
+
+**Frozen interface FS11 (`so101_rl.viz`).** `rl/train_sim_sac.py` (S4.3) and the S1 env debugging tools call only this interface:
+
+```python
+# viz/monitor.py
+@dataclass(frozen=True)
+class VizConfig:
+    live_viewer: bool = False           # --viewer
+    viewer_worlds: tuple[str, ...] = ("0", "best", "worst")   # world ids or selectors
+    viewer_hz: float = 30.0
+    video_every_min: float = 10.0       # 0 disables
+    video_worlds: int = 4
+    video_seconds: float = 10.0
+    tensorboard: bool = True
+class TrainingMonitor:                  # one per training run; never raises into the training loop
+    def __init__(self, cfg: VizConfig, sim: WarpSim, run_dir: Path, *, task: str, render_cfg: So101Config) -> None
+    def on_step(self, env_step: int, *, success: torch.Tensor, ep_return: torch.Tensor) -> None   # O(1), no host sync
+    def on_metrics(self, env_step: int, scalars: Mapping[str, float]) -> None                     # TensorBoard scalars
+    def maybe_record(self, env_step: int, policy: Callable[[torch.Tensor], torch.Tensor]) -> Path | None   # rollout video when due
+    def close(self) -> None
+```
+
+**Viz rules:**
+- **Training speed:** visualisation must never slow training by more than **5 %**, measured.
+- **Failure handling:** a crash in the viewer or the video writer is logged once, and the visualisation is disabled for the rest of the run, but training continues. This is the one place where swallowing an error is allowed. It applies only because the error is visualisation-only, and the swallowed error is reported in `metrics.csv` as `viz_disabled=1`.
+- **Dependencies:** `viz/` imports `sim/` and `env/` read-only, and `rl/` imports `viz/`. `safety/` never imports it.
+
+#### Task V.1 (SW + GPU): Live 3D viewer of selected parallel worlds
+- **Files:** `src/so101_rl/viz/__init__.py`, `src/so101_rl/viz/live_viewer.py`, `tests/test_live_viewer.py`
+- **Steps:**
+  - A **separate process**, so the GUI never holds the training process's GIL. It runs `mujoco.viewer.launch_passive` on a CPU `MjModel` built by the same `load_model()` and receives the qpos and qvel of the selected worlds over a shared-memory seqlock (reuse `servo/shm.py` `SeqlockBlock`) at `viewer_hz`.
+  - The training side copies only the selected worlds' rows, as one small device-to-host copy every `1/viewer_hz` s, and never waits on the viewer.
+  - World selectors:
+    - `0`: a fixed world;
+    - `best` / `worst`: by the current episode return, re-picked at each episode boundary;
+    - integers.
+  - On-screen overlay:
+    - the world id;
+    - the DR stage;
+    - the episode step;
+    - the success flag;
+    - the goal as a marker site, and the zone for die tasks;
+    - the tracker's last-seen die position as a ghost marker, so occlusion is visible.
+  - The viewer can be toggled with `pixi run viz-attach --run runs/...` against a training run that is already going, and closing the window never stops training.
+  - Headless (no `DISPLAY`): the viewer refuses with a clear message, and videos still work.
+- **Tests:** `test_viewer_payload_roundtrip` (shm), `test_selector_best_worst`, `test_viewer_absent_display_is_clean_error`, and `@gpu test_viewer_overhead_under_5pct`. The last one measures training steps/s with and without the publisher, with no window opened (publisher only).
+- **Acceptance:** `pixi run -e default viz-demo --nworld 1024` opens a window showing worlds 0, best and worst under a random policy on WarpSim, run manually on `DISPLAY=:1`. The automated tests pass.
+
+#### Task V.2 (SW + GPU): Rollout videos per checkpoint
+- **Files:** `src/so101_rl/viz/video.py`, `tests/test_video.py`
+- **Steps:**
+  - Record `video_worlds` worlds for `video_seconds` with the current deterministic policy every `video_every_min`, and at every checkpoint.
+  - **Two cameras:**
+    1. the **overhead D435 pose**, the same camera as the real arm, so sim and real views match;
+    2. a free 3/4 view.
+  - Render through MuJoCo Warp's batch renderer when available, otherwise through CPU `mujoco.Renderer` on copied states. The CPU fallback is always available.
+  - Overlay text: step, DR stage, return, success. Encode the frames to `runs/<run>/videos/<env_step>_<world>.mp4` with ffmpeg, which is already in the env.
+  - Supersedes S4.3's `rl/render.py`. The gaming-audit renders (8 random, 4 highest-return, 4 shortest episodes) use this module.
+- **Tests:** `test_video_written_cpu_renderer` (a stub env, CPU), `test_overlay_text_present`, `test_overhead_camera_matches_d435_extrinsics` (the camera pose equals the config's D435 pose).
+- **Acceptance:** `pixi run -e default viz-demo --record 10 --out runs/viz-demo/` writes at least 2 mp4s that play.
+
+#### Task V.3 (SW): Live TensorBoard dashboard
+- **Files:** `src/so101_rl/viz/monitor.py` (FS11), `tests/test_monitor.py`
+- **Steps:**
+  - `TrainingMonitor` writes TensorBoard scalars. Training curves:
+    - success rate, current and eval;
+    - mean return;
+    - episode length;
+    - DR stage.
+  - SAC internals:
+    - α;
+    - entropy;
+    - Q mean and max;
+    - critic loss;
+    - action saturation;
+    - clamp-active fractions;
+    - tracker visible fraction.
+  - System health:
+    - env-steps/s;
+    - grads/s;
+    - GPU temperature, memory and utilisation (NVML, which `warp-lang` already depends on);
+    - review triggers as text.
+  - It embeds the V.2 videos (`add_video`), and `metrics.csv` stays the source of truth.
+  - `pixi run dashboard --logdir runs/` starts TensorBoard on localhost.
+  - Add `tensorboard` (conda-forge) to the `train` feature.
+- **Tests:** `test_scalars_written`, `test_video_embedded`, and `test_monitor_never_raises_into_training`, which injects a writer failure and asserts training continues with `viz_disabled=1` logged.
+- **Acceptance:** `pixi run -e cpu pytest tests/test_monitor.py tests/test_video.py tests/test_live_viewer.py -q -m "not gpu"` passes. `pixi run dashboard` serves the demo run's scalars and videos.
+
+**Est.:** about 6 agent-hours in total, with `parallelizable-via-worktree: true`.
+
 ### Unit SU3 — S3: domain randomisation and curriculum (wave 2; parallel with SU4, SR2)
 
 #### Task S3.1 (SW + GPU): `DrSpec`, `DomainRandomizer`, stage yaml, env hooks
@@ -704,9 +797,9 @@ Legend: **SW** = software, runs now on fake / CPU MuJoCo / MuJoCo Warp; **GPU** 
 - **Est.:** 4 agent-h + 0.3 GPU-h.
 
 #### Task S4.3 (SW + GPU): Training loop, checkpoints, rollout logging, renders, sim eval + exit gate, policy export
-- **Files:** `src/so101_rl/rl/train_sim_sac.py`, `src/so101_rl/rl/rollout_logger.py`, `src/so101_rl/rl/render.py`, `src/so101_rl/rl/eval_sim.py`, `src/so101_rl/rl/policy_export.py`, `tests/test_train_sim_sac.py`, `tests/test_rollout_logger.py`, `tests/test_eval_sim.py`, `tests/test_policy_export.py`
+- **Files:** `src/so101_rl/rl/train_sim_sac.py`, `src/so101_rl/rl/rollout_logger.py`, `src/so101_rl/rl/eval_sim.py`, `src/so101_rl/rl/policy_export.py`, `tests/test_train_sim_sac.py`, `tests/test_rollout_logger.py`, `tests/test_eval_sim.py`, `tests/test_policy_export.py`
 - **Specialist:** lerobot-specialist; cuda-performance-engineer
-- **Dependencies:** S4.1, S4.2, SU1; SU3 optional at start (stage 0)
+- **Dependencies:** S4.1, S4.2, SU1, **SUV** (the training loop creates a `viz.TrainingMonitor` from `--viewer/--video-every/--tensorboard` flags and calls `on_step`, `on_metrics`, `maybe_record`; renders go through `viz/video.py`, which supersedes `rl/render.py`); SU3 optional at start (stage 0)
 - **Steps:**
   1. `pixi run train-sim-sac --task reach --nworld 1024 --budget-min 60 --dr-start-stage 0 --dr-max-stage 4 --out runs/sac-sim/<task>-<ts>/ [--sim-params calib/sim_params.yaml] [--seed] [--resume CKPT]`: `torch.cuda.set_per_process_memory_fraction(0.6)`; env + randomizer + curriculum; warm-up random actions; loop with `grad_steps_per_env_step` updates; every `eval_every` env-steps a deterministic eval on 1000 episodes at the **current** DR stage (`eval_sim.evaluate`), logging to `metrics.csv` (env-steps/s, grads/s, success, final error p50/p90, α, entropy, Q mean/max, critic loss, action saturation fraction, clamp-active fractions, tracker visible fraction, dr stage, VRAM); checkpoint `ckpt_<step>.pt` every eval and `ckpt_last.pt`; `RolloutLogger` writes rollouts (mix as per the specialist: a `policy_tag` per chunk: 0 random/warm-up, 1 mid-training, 2 final — the logger samples every k-th vector step so the total stays 1–5 M transitions); an OOM is **not** caught (fails loudly, L12); exits non-zero if `metrics.csv` has < 3 rows or no checkpoint exists.
   2. **Review triggers** (printed and written to `review.json`, never auto-switching the method — plan §5): UTD < 0.005 grads/transition; α < 1e-4 or entropy > target + 2 for 100k steps; |Q| > 2 · r_max/(1 − γ); critic loss rising over 3 evals; saturation > 50 %; reach success < 50 % after 1 GPU-h or no improvement over 3 evals; die success < 10 % after 4 GPU-h; curriculum stuck at a stage for > 2 GPU-h.
@@ -933,6 +1026,21 @@ execution_shape:
         - tests/test_env_backend.py
         - tests/test_goal_env.py
         - tests/test_goals.py
+    - id: SUV
+      name: training-visualisation
+      wave: 1
+      depends_on: [SU0]
+      parallelizable_via_worktree: true
+      tasks: [V.1, V.2, V.3]
+      owns_files:
+        - src/so101_rl/viz/__init__.py
+        - src/so101_rl/viz/live_viewer.py
+        - src/so101_rl/viz/video.py
+        - src/so101_rl/viz/monitor.py
+        - tests/test_live_viewer.py
+        - tests/test_video.py
+        - tests/test_monitor.py
+      # pyproject (tensorboard dep; viz-demo, viz-attach, dashboard tasks) and ARCHITECTURE (§3 viewer process, §4 viz/) are shared writes, applied after the join
     - id: SU3
       name: s3-domain-randomisation-curriculum
       wave: 2
@@ -960,7 +1068,6 @@ execution_shape:
         - src/so101_rl/rl/scripted.py
         - src/so101_rl/rl/train_sim_sac.py
         - src/so101_rl/rl/rollout_logger.py
-        - src/so101_rl/rl/render.py
         - src/so101_rl/rl/eval_sim.py
         - src/so101_rl/rl/policy_export.py
         - tests/test_replay_gpu.py
@@ -1042,7 +1149,7 @@ execution_shape:
         - runs/hw/sysid-*.json
   waves:
     - {wave: 0, units: [SU0]}
-    - {wave: 1, units: [SU1, SU2, SR1]}
+    - {wave: 1, units: [SU1, SU2, SR1, SUV]}
     - {wave: 2, units: [SU3, SU4, SR2]}
     - {wave: 3, units: [SU4-RUNS, SU5, SR3]}
   shared_writes:
