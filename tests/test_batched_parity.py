@@ -619,13 +619,6 @@ GRASP_DIE_OFFSET_M = 0.006
 DIE_REST_Z = -0.012
 
 
-def _grasp_cfg(cfg):
-    """The shipped box floor (z = 0.010, 3 cm above the table) keeps every jaw at least ~1 cm above a resting
-    die's top face, so no grasp (or push) of a die on the table is possible through the chain. Layer C runs with
-    the floor lowered to z = -0.03 on BOTH rigs (a test-local config; reported as an open item)."""
-    return dataclasses.replace(cfg, box=dataclasses.replace(cfg.box, z=(-0.03, cfg.box.z[1])))
-
-
 def _grasp_state(model, cal) -> tuple[np.ndarray, np.ndarray]:
     from so101_rl.sim.gripper_map import gripper_ticks_to_rad
 
@@ -665,7 +658,9 @@ def _die_tip_dist(model, qpos: np.ndarray) -> float:
 
 
 def _layer_c(cfg, cal, *, cpu_die_mass_scale: float = 1.0) -> dict:
-    gcfg = _grasp_cfg(cfg)
+    # the SHIPPED config: since plan §10 2026-10-06 the box floor is table + 5 mm (-0.015), so the grasp pose
+    # (FK tip z ~ -0.011) is inside the box (the test-local floor override of S1.3 is gone)
+    gcfg = cfg
     rig = CpuRig(gcfg, cal, die_mass_scale=cpu_die_mass_scale)
     q, ctrl = _grasp_state(rig.model, cal)
     rig.reset("home", qpos=q, ctrl=ctrl)

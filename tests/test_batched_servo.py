@@ -22,8 +22,9 @@ T = TripCause
 CPU = torch.device("cpu")
 # tip at (0.284, 0, 0.198): inside the box (tests/test_pipeline.py)
 POSE = np.array([2047, 1395, 2699, 2047, 2047, 2047], dtype=np.int64)
-# shoulder_lift 1930: tip z ~ 0.016, +45 ticks of lift leaves the box floor (tests/test_pipeline.py)
-LOW_POSE = np.array([2047, 1930, 2699, 2047, 2047, 2047], dtype=np.int64)
+# shoulder_lift 2010: tip z ~ -0.009, 6 mm above the box floor (table + 5 mm = -0.015, plan §10 2026-10-06);
+# +45 ticks of lift leaves the box (was 1930 / z ~ 0.016 with the old 0.010 floor)
+LOW_POSE = np.array([2047, 2010, 2699, 2047, 2047, 2047], dtype=np.int64)
 
 
 @pytest.fixture

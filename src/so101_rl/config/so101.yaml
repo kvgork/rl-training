@@ -52,7 +52,7 @@ safe_state:
   ramp_ticks_per_tick: 8
   # NEEDS H5 (both poses).
   # rest: the gravity-stable pose measured on the arm on 2026-09-30, torque off. Tip (0.208, -0.001, -0.012) m:
-  #       below the box floor (it rests on the table) but above the table floor (table_z_m + table_clearance_m).
+  #       inside the box since the floor moved to table + 5 mm (plan §10 2026-10-06), above the table floor.
   # home: in-box PLACEHOLDER from the wave-1 review, tip (0.200, 0.000, 0.150) m, FK-checked by the loader.
   home_ticks: [2047, 960, 2700, 2748, 2047, 2047]
   rest_ticks: [2050, 2200, 2301, 2745, 2040, 2065]
@@ -67,7 +67,7 @@ safe_state:
 box:                              # metres, base frame (from LIT DEFAULT_BOX)
   x: [0.08, 0.34]
   y: [-0.22, 0.22]
-  z: [0.010, 0.28]
+  z: [-0.015, 0.28]               # floor = table + 5 mm (plan §10 2026-10-06): the jaws can reach a die on the table
   present_tolerance_m: 0.005      # BOX_PRESENT trips only this far outside the box (review S3); targets: exact box
 
 registers:

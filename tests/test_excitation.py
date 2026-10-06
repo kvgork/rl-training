@@ -66,8 +66,10 @@ def test_plan_out_of_box_rejected(setup):
     assert not chk.ok and chk.first_violation is not None
     assert "leaves the box" in chk.reasons[0]
     # a plan that only pushes the tip down through the box floor
-    down = ExcitationPlan((Segment("ramp", (1,), 1.0, 900.0, {"rate_ticks": 30.0, "centre_ticks": (0,)}),), 10.0, 0)
-    assert not check_plan_in_box(down, cfg, cal, chain, home).ok
+    # (1300 ticks: the floor is table + 5 mm since plan §10 2026-10-06; the old 900 ended 2 cm above it)
+    down = ExcitationPlan((Segment("ramp", (1,), 1.0, 1300.0, {"rate_ticks": 30.0, "centre_ticks": (0,)}),), 10.0, 0)
+    chk_down = check_plan_in_box(down, cfg, cal, chain, home)
+    assert not chk_down.ok and chk_down.first_violation is not None
 
 
 def test_multisine_band_below_nyquist(setup):

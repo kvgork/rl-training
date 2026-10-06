@@ -19,7 +19,8 @@ from so101_rl.servo.timing import FakeClock
 T = TripCause
 # tip at (0.284, 0, 0.198): comfortably inside the default box
 POSE = np.array([2047, 1395, 2699, 2047, 2047, 2047], dtype=np.int32)
-# shoulder_lift 1930 puts the tip at z ~ 0.016 (box floor is 0.010): +45 ticks of lift leaves the box
+# shoulder_lift 1930 puts the tip at z ~ 0.015, 3 cm above the box floor (-0.015 = table + 5 mm since plan §10
+# 2026-10-06; it was 0.010): repeated +45-tick lifts reach the floor within 2 commands
 LOW_POSE = np.array([2047, 1930, 2699, 2047, 2047, 2047], dtype=np.int32)
 
 

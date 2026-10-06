@@ -113,8 +113,9 @@ class SafeStateConfig:
         "shoulder_lift",
         "shoulder_pan",
     )
-    # Transit zone (review B1): the rest pose is outside the box, so the ramps between rest and home are checked
-    # against the table instead. Tip z must stay >= table_z_m + table_clearance_m; below
+    # Transit zone (review B1): the ramps between rest and home are checked against the table (the rest pose sat
+    # below the old 0.010 m box floor; since 2026-10-06 the floor is table + 5 mm and rest is inside the box, but
+    # the table check is independent of the box and stays). Tip z must stay >= table_z_m + table_clearance_m; below
     # table_z_m + table_clearance_m + transit_zone_m, joints that lower the tip wait for the lifting joints.
     table_z_m: float = -0.02
     table_clearance_m: float = 0.005
@@ -127,7 +128,7 @@ class SafeStateConfig:
 class WorkspaceBox:
     x: tuple[float, float] = (0.08, 0.34)
     y: tuple[float, float] = (-0.22, 0.22)
-    z: tuple[float, float] = (0.010, 0.28)
+    z: tuple[float, float] = (-0.015, 0.28)  # floor = table + 5 mm (plan §10 2026-10-06)
     # BOX_PRESENT trips only when the PRESENT tip is more than this outside the box (review S3: 1 mm of sag at
     # the floor must not end the run). Commanded targets are still clamped to the exact box.
     present_tolerance_m: float = 0.005

@@ -58,7 +58,10 @@ def test_shipped_rest_is_the_measured_pose_above_the_table(cfg, fk):
     assert cfg.safe_state.rest_ticks.tolist() == [2050, 2200, 2301, 2745, 2040, 2065]
     xyz = tip(fk, cfg.safe_state.rest_ticks)
     np.testing.assert_allclose(xyz, [0.208, -0.001, -0.012], atol=0.002)
-    assert not fk.in_box(xyz, cfg.box)  # rest is below the box floor: it lies on the table
+    # plan §10 2026-10-06: the box floor is table + 5 mm (-0.015), so the rest pose lying on the table is now
+    # INSIDE the box (it was 2 cm below the old 0.010 floor)
+    assert cfg.box.z[0] == pytest.approx(cfg.safe_state.table_z_m + 0.005) == pytest.approx(-0.015)
+    assert fk.in_box(xyz, cfg.box)
     assert xyz[2] >= cfg.safe_state.table_z_m + cfg.safe_state.table_clearance_m
 
 
@@ -122,6 +125,7 @@ def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
     def mut(raw):
         raw["safe_state"]["rest_ticks"] = [2050, 2264, 2481, 2993, 2040, 2065]
         raw["safe_state"]["table_z_m"] = 0.0025
+        raw["box"]["z"] = [0.010, 0.28]  # the loader needs table_z_m < box.z[0] (shipped floor: -0.015)
 
     probs = _problems(tmp_path, calibration, mut)
     assert len(probs) == 1
@@ -131,11 +135,17 @@ def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
 
 def test_transit_dip_is_rejected(tmp_path, calibration):
     """Raise the table 5 mm above the rest tip: the replay starts below the floor (plain transit would sit there /
-    dip), and says so with the dip message, not only the rest-floor one."""
-    probs = _problems(tmp_path, calibration, lambda r: r["safe_state"].update(table_z_m=-0.012))
+    dip), and says so with the dip message, not only the rest-floor one. (The box floor is raised with it: the
+    loader requires table_z_m < box.z[0], and the shipped floor -0.015 is below this table.)"""
+
+    def mut(raw):
+        raw["safe_state"]["table_z_m"] = -0.012
+        raw["box"]["z"] = [-0.007, 0.28]
+
+    probs = _problems(tmp_path, calibration, mut)
     assert any("rest -> home transit dips" in p for p in probs)
     assert any("FK(rest_ticks) z" in p for p in probs)  # the rest-floor check fires too, but is a different message
-    _rejects(tmp_path, calibration, lambda r: r["safe_state"].update(table_z_m=-0.012), "transit dips")
+    _rejects(tmp_path, calibration, mut, "transit dips")
 
 
 # Synthetic pair for which the plain per-joint ramp rest -> home crosses a floor that the rest pose is above.
@@ -235,10 +245,15 @@ def test_explicit_chain_bypasses_the_cache(cfg, calibration):
 
 
 # ---- table_z_m sanity range, in the (pure) loader --------------------------------------------------------------
-@pytest.mark.parametrize("bad", [-0.25, 0.010, 0.05])
+@pytest.mark.parametrize("bad", [-0.25, -0.015, 0.010, 0.05])  # -0.015: equal to the shipped box floor
 def test_table_z_is_range_checked_by_the_loader(tmp_path, calibration, bad):
     with pytest.raises(ValueError, match="table_z_m"):
         load_config(_variant(tmp_path, lambda r: r["safe_state"].update(table_z_m=bad)), calibration=calibration)
+
+
+def test_table_just_below_the_box_floor_is_accepted(tmp_path, calibration):
+    cfg = load_config(_variant(tmp_path, lambda r: r["safe_state"].update(table_z_m=-0.0151)), calibration=calibration)
+    assert cfg.safe_state.table_z_m < cfg.box.z[0] == -0.015
 
 
 # ---- dependency direction: config is a leaf ----------------------------------------------------------------------
