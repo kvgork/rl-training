@@ -9,14 +9,20 @@ import pytest
 import yaml
 
 from so101_rl.config import JOINT_NAMES
+from so101_rl.sim.compare_real import MAX_RMS_PCT
 from so101_rl.sim.model import load_model
 from so101_rl.sim.sysid.params import (
+    FRICTIONLOSS_RANGE,
+    SERVO_GROUP_FIELDS,
     SIM_PARAMS_VERSION,
     BatchedSimParams,
+    DrRanges,
+    ServoGroup,
     SimParams,
     SimParamsMeta,
     apply_deadband,
     mjcf_sha256,
+    read_sim_params_file,
     read_sim_params_yaml,
 )
 
@@ -60,7 +66,7 @@ def test_yaml_roundtrip_and_version_check(prior, tmp_path):
     p = prior.scaled(kp=0.8)
     p = replace(p, delay_ticks=2, deadband_ticks=np.array([0, 1, 2, 0, 0, 3]))
     path = tmp_path / "sp.yaml"
-    held = dict.fromkeys(JOINT_NAMES, 1.5)
+    held = dict.fromkeys(JOINT_NAMES, 0.8)
     p.to_yaml(path, meta=_meta(held))
     q, meta = read_sim_params_yaml(path)
     assert q.close_to(p) and meta.heldout_rms_pct == held and meta.version == 1
@@ -69,9 +75,23 @@ def test_yaml_roundtrip_and_version_check(prior, tmp_path):
     doc = yaml.safe_load(path.read_text())
     doc["version"] = SIM_PARAMS_VERSION + 1
     path.write_text(yaml.safe_dump(doc))
-    with pytest.raises(ValueError, match="schema version 2"):
+    with pytest.raises(ValueError, match=f"schema version {SIM_PARAMS_VERSION + 1}"):
         SimParams.from_yaml(path, allow_unverified=True)
 
+
+def test_schema_1_files_are_refused_with_a_regenerate_hint(prior, tmp_path):
+    """Schema 2 (2026-10-06) adds servo_group, dr and meta.unidentified; a schema-1 file is not read silently."""
+    assert SIM_PARAMS_VERSION == 2
+    path = tmp_path / "sp.yaml"
+    prior.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 0.5)))
+    doc = yaml.safe_load(path.read_text())
+    doc["version"] = 1
+    for k in ("servo_group", "dr"):
+        doc.pop(k)
+    doc["meta"].pop("unidentified")
+    path.write_text(yaml.safe_dump(doc))
+    with pytest.raises(ValueError, match="schema version 1 .*--write-prior"):
+        read_sim_params_yaml(path, allow_unverified=True)
 
 @pytest.mark.parametrize(
     "mutate, match",
@@ -83,7 +103,16 @@ def test_yaml_roundtrip_and_version_check(prior, tmp_path):
         (lambda d: d["params"].update(delay_ticks=7), "delay_ticks"),
         (lambda d: d["params"].update(deadband_ticks=[0.5] * 6), "integers"),
         (lambda d: d["meta"].pop("spread"), "missing keys"),
+        (lambda d: d["meta"].pop("unidentified"), "missing keys"),
         (lambda d: d.update(other=1), "top-level"),
+        (lambda d: d.pop("servo_group"), "top-level"),
+        (lambda d: d.pop("dr"), "top-level"),
+        (lambda d: d["servo_group"].update(scale=[1.1] * 6), "ratio group"),  # no longer reproduces kp, kv, armature
+        (lambda d: d["servo_group"]["prior"].pop("armature"), "keys"),
+        (lambda d: d["servo_group"].update(scale=[0.0] * 6), "scale"),
+        (lambda d: d["dr"].update(servo_group_rel=1.0), "servo_group_rel"),
+        (lambda d: d["dr"].update(frictionloss_range=[0.2, 0.1]), "frictionloss_range"),
+        (lambda d: d["dr"].update(frictionloss_source=" "), "source"),
     ],
 )
 def test_yaml_is_strict(prior, tmp_path, mutate, match):
@@ -102,15 +131,19 @@ def test_unverified_refused_by_default(prior, tmp_path):
     with pytest.raises(ValueError, match="unverified"):
         SimParams.from_yaml(path)
     assert SimParams.from_yaml(path, allow_unverified=True).close_to(prior)
-    # above the 5 % gate on one joint, or a joint missing: also unverified
-    prior.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 1.0) | {"elbow_flex": 5.2}))
+    # above the 1 % gate (plan §10 2026-10-06; was 5 %) on one joint, or a joint missing: also unverified
+    assert MAX_RMS_PCT == 1.0
+    prior.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 0.5) | {"elbow_flex": 1.01}))
     with pytest.raises(ValueError, match="elbow_flex"):
         SimParams.from_yaml(path)
-    prior.to_yaml(path, meta=_meta({n: 1.0 for n in JOINT_NAMES[:5]}))
+    prior.to_yaml(path, meta=_meta({n: 0.5 for n in JOINT_NAMES[:5]}))
     with pytest.raises(ValueError, match="gripper"):
         SimParams.from_yaml(path)
-    prior.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 5.0)))
+    prior.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 1.0)))
     assert SimParams.from_yaml(path).close_to(prior)  # exactly at the gate passes
+    prior.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 4.9)))
+    with pytest.raises(ValueError, match="unverified"):  # what the old 5 % gate accepted is refused now
+        SimParams.from_yaml(path)
 
 
 def test_shipped_v0_is_the_mjcf_prior(prior):
@@ -121,6 +154,38 @@ def test_shipped_v0_is_the_mjcf_prior(prior):
     assert p.close_to(prior)
     assert meta.version == 0 and meta.heldout_rms_pct is None and meta.backend == "mjcf-prior"
     assert len(meta.mjcf_sha256) == 64 and len(mjcf_sha256()) == 64
+    assert meta.mjcf_sha256 == mjcf_sha256()  # regenerated for the current scene
+    f = read_sim_params_file(SHIPPED, allow_unverified=True)
+    np.testing.assert_array_equal(f.servo_group.scale, np.ones(6))  # the prior is the group's reference
+    for k in SERVO_GROUP_FIELDS:
+        np.testing.assert_array_equal(f.servo_group.prior[k], getattr(prior, k))
+    assert f.dr == DrRanges() and f.dr.servo_group_rel == 0.40 and f.dr.frictionloss_range == FRICTIONLOSS_RANGE
+    assert "frictionloss" in meta.unidentified  # never read as a precise value
+
+
+def test_servo_group_roundtrip_and_semantics(prior, tmp_path):
+    """kp, kv, armature = prior x scale per joint (one ratio group, plan §10 2026-10-06); the ratios are the
+    prior's; the yaml records the group and the DR ranges."""
+    s = np.array([0.6, 0.7, 0.8, 1.25, 1.4, 0.75])
+    g = ServoGroup.identity(prior)
+    fitted = replace(g.apply(prior, s), delay_ticks=3)
+    np.testing.assert_allclose(fitted.kv / fitted.kp, prior.kv / prior.kp)
+    np.testing.assert_allclose(fitted.armature / fitted.kp, prior.armature / prior.kp)
+    np.testing.assert_array_equal(fitted.frictionloss, prior.frictionloss)
+    grp = ServoGroup.from_fit(fitted, prior)
+    np.testing.assert_allclose(grp.scale, s)
+    path = tmp_path / "sp.yaml"
+    dr = DrRanges(servo_group_rel=0.4, frictionloss_range=(0.0, 0.21), frictionloss_source="test")
+    fitted.to_yaml(path, meta=_meta(dict.fromkeys(JOINT_NAMES, 0.3)), servo_group=grp, dr=dr)
+    f = read_sim_params_file(path)
+    assert f.params.close_to(fitted) and f.dr == dr
+    np.testing.assert_allclose(f.servo_group.scale, s)
+    lo, hi = f.dr.servo_group_bounds(f.servo_group.scale)
+    np.testing.assert_allclose(lo, 0.6 * s) and np.testing.assert_allclose(hi, 1.4 * s)
+    with pytest.raises(ValueError, match="ratio group"):  # kp alone changed: not a group member any more
+        ServoGroup.from_fit(fitted.scaled(kp=1.1), prior)
+    with pytest.raises(ValueError, match="ratio group"):
+        fitted.to_yaml(path, meta=_meta(None), servo_group=g)  # identity around the prior does not reproduce it
 
 
 def test_gainprm_biasprm_mapping(prior):

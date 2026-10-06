@@ -1,17 +1,24 @@
-"""CMA-ES fit of the simulator parameters to an excitation run (FS7, sim-first track S2.3; pixi task ``sysid-fit``).
+"""Sysid fit of the simulator parameters to an excitation run (FS7, sim-first track S2.3; pixi task ``sysid-fit``).
 
 ``python -m so101_rl.sim.sysid.fit --run runs/sysid/<ts> --backend {warp,cpu} --out calib/sim_params.yaml
 [--heldout-kinds chirp,random] [--popsize N] [--generations G] [--fit kp,kv,...] [--fixed damping,...]``
 
-Decision D-SYSID: fit ``kp, kv, frictionloss, armature, delay_ticks``; hold ``damping`` and ``forcerange`` at the
-prior unless the held-out gate fails. Parameters in ``fixed`` win over ``fit``.
+Parametrisation (plan §10 2026-10-06, "Servo parameter identification", replacing D-SYSID's per-parameter fit): the
+default fit is ``servo_group`` -- ONE scale per joint applied to kp, kv and armature jointly (their ratios stay the
+prior's; through the clamp chain they act almost only as ratios) -- plus the integer ``delay_ticks``. ``frictionloss``
+is NOT fitted (invisible under ±1-tick noise): it stays at the prior and is always reported in ``unidentified``;
+``damping`` and ``forcerange`` stay at the prior. The written yaml records the group (``servo_group.prior`` /
+``scale``) and the DR ranges (group ±40 %, frictionloss over its full plausible range; ``params.DrRanges``). Any
+other field set can still be fitted explicitly (``--fit kp,damping``); ``servo_group`` and its members are mutually
+exclusive. Parameters in ``fixed`` win over ``fit``.
 
 Search:
 
 * ``delay_ticks`` is an outer integer grid (0..6). Every delay runs its own CMA-ES concurrently (one batch of worlds
   per delay); after a quarter of the generations only the two best delays continue.
 * The continuous parameters are searched in **log space relative to the prior** (``x = ln(value / prior)``, mean 0 =
-  the prior, ``sigma0`` 0.3, box bounds ``±bound``). The per-joint parameters form one CMA-ES block per joint
+  the prior, ``sigma0`` 0.3, box bounds ``±bound``). A 1-D block (the default: the ratio group alone, per joint) uses
+  a deterministic shrinking grid (``_ShrinkingGrid1D``) instead of CMA-ES, which does not support 1-D problems. The per-joint parameters form one CMA-ES block per joint
   (4-D for the default fit, not one 24-D problem), each driven by that joint's error; scalar parameters (die mass,
   frictions) form one global block driven by the total objective. All blocks share the same simulated worlds: world
   ``i`` runs candidate ``i`` of every block. Joint coupling (gravity, inertia) is second order on the solo-dominated
@@ -26,7 +33,8 @@ Search:
 The held-out RMS (the compare-real definition: quantised, replayed OPEN LOOP from each segment's first row, pooled
 over the held-out segments: excitation kinds in ``--heldout-kinds`` plus a
 seeded 20 % time window of every other segment) is the gate: ``sysid-fit`` writes ``--out`` only when every joint is
-at most ``MAX_RMS_PCT`` (5 %); otherwise ``<run>/sim_params.unverified.yaml`` and exit 1. A
+at most ``MAX_RMS_PCT`` (1 % since plan §10 2026-10-06; it was 5 %, blind to a 3-tick delay); otherwise
+``<run>/sim_params.unverified.yaml`` and exit 1. A
 ``<run>/fit_report.json`` (and ``history.csv``) is written either way.
 
 Backends: ``warp`` (MuJoCo Warp, one candidate per world, ``WarpSim.set_world_params``) and ``cpu`` (a spawn pool of
@@ -67,6 +75,9 @@ from so101_rl.sim.sysid.params import (
     MAX_DELAY_TICKS,
     PER_JOINT_FIELDS,
     SCALAR_FIELDS,
+    SERVO_GROUP_FIELDS,
+    DrRanges,
+    ServoGroup,
     SimParams,
     SimParamsMeta,
     mjcf_sha256,
@@ -79,8 +90,11 @@ from so101_rl.sim.sysid.replay import (
     replay_segment_cpu,
 )
 
-DEFAULT_FIT: Final[tuple[str, ...]] = ("kp", "kv", "frictionloss", "armature", "delay_ticks")
-DEFAULT_FIXED: Final[tuple[str, ...]] = ("damping", "forcerange")
+SERVO_GROUP: Final[str] = "servo_group"  # pseudo-field: kp, kv, armature x one per-joint scale
+DEFAULT_FIT: Final[tuple[str, ...]] = (SERVO_GROUP, "delay_ticks")
+DEFAULT_FIXED: Final[tuple[str, ...]] = ("damping", "forcerange", "frictionloss")
+# fixed at the prior because the data cannot identify them: always reported unidentified when not fitted
+UNIDENTIFIABLE_FIXED: Final[tuple[str, ...]] = ("frictionloss",)
 UNIDENTIFIED_SPREAD: Final[float] = 0.5
 QUANT_DEADZONE_TICKS: Final[float] = 0.5  # the log is rounded to whole ticks
 PROFILE_STEP: Final[float] = 0.15  # finite-difference step in log space for profile_spread
@@ -106,10 +120,17 @@ class FitResult:
     objective: float = math.nan  # training objective of the returned params
     cma_spread: dict[str, float] = field(default_factory=dict)  # final CMA-ES std per parameter (log space)
     profile_spread: dict[str, float] = field(default_factory=dict)  # local-curvature spread (see profile_spread)
+    servo_group: ServoGroup | None = None  # set when the ratio group was fitted (scale relative to the prior)
+
+    @property
+    def group_scale(self) -> np.ndarray | None:
+        """The fitted per-joint ratio-group scale (kp, kv, armature relative to the prior), or None."""
+        return None if self.servo_group is None else self.servo_group.scale
 
     def summary(self) -> dict[str, Any]:
         d = asdict(self)
         d["params"] = self.params.to_dict()
+        d["servo_group"] = None if self.servo_group is None else self.servo_group.to_dict()
         d["delay_scores"] = {str(k): v for k, v in self.delay_scores.items()}
         return d
 
@@ -249,6 +270,39 @@ class _WarpEvaluator:
 
 
 # --------------------------------------------------------------------------------------------- the fit
+class _ShrinkingGrid1D:
+    """Deterministic 1-D bounded search with the ``ask`` / ``tell`` / ``result`` surface the fit uses from cma.
+
+    ``ask`` returns ``popsize`` points evenly spread over ``centre ± width`` (clipped to ``±bound``); ``tell`` moves
+    the centre to the best point seen so far and shrinks the width by ``SHRINK``. Starts at the prior (0) with the
+    whole box. ``result.stds`` = the current half width (the profile spread reports flat valleys, see
+    :func:`profile_spread`)."""
+
+    SHRINK: Final[float] = 0.6
+
+    def __init__(self, popsize: int, bound: float) -> None:
+        self.pop, self.bound = int(popsize), float(bound)
+        self.centre, self.width = 0.0, float(bound)
+        self.best_x, self.best_f = 0.0, math.inf
+
+    def ask(self) -> list[np.ndarray]:
+        xs = np.clip(self.centre + self.width * np.linspace(-1.0, 1.0, self.pop), -self.bound, self.bound)
+        return [np.array([x]) for x in xs]
+
+    def tell(self, xs: Sequence[np.ndarray], fs: Sequence[float]) -> None:
+        i = int(np.argmin(fs))
+        if fs[i] < self.best_f:
+            self.best_f, self.best_x = float(fs[i]), float(xs[i][0])
+        self.centre = self.best_x
+        self.width = max(self.width * self.SHRINK, 1e-6)
+
+    @property
+    def result(self) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(xfavorite=np.array([self.centre]), stds=np.array([self.width]))
+
+
 def _import_cma():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # cma warns about a missing matplotlib on import
@@ -257,14 +311,31 @@ def _import_cma():
 
 
 def _resolve_fields(fit: Sequence[str], fixed: Sequence[str]) -> tuple[list[str], list[str], bool]:
-    known = set(PER_JOINT_FIELDS) | set(SCALAR_FIELDS) | {"delay_ticks", "deadband_ticks"}
+    known = set(PER_JOINT_FIELDS) | set(SCALAR_FIELDS) | {"delay_ticks", "deadband_ticks", SERVO_GROUP}
     bad = [f for f in (*fit, *fixed) if f not in known]
     if bad:
         raise ValueError(f"unknown parameter(s) {bad}; known: {sorted(known)}")
     eff = [f for f in dict.fromkeys(fit) if f not in set(fixed)]
     if "deadband_ticks" in eff:
         raise ValueError("deadband_ticks is not fitted (D-BACKLASH: it is a DR range, not a point estimate)")
-    return ([f for f in eff if f in PER_JOINT_FIELDS], [f for f in eff if f in SCALAR_FIELDS], "delay_ticks" in eff)
+    if SERVO_GROUP in eff and set(eff) & set(SERVO_GROUP_FIELDS):
+        raise ValueError(f"{SERVO_GROUP} scales {', '.join(SERVO_GROUP_FIELDS)} jointly: do not fit them separately too")
+    pj = [f for f in eff if f in PER_JOINT_FIELDS or f == SERVO_GROUP]
+    return (pj, [f for f in eff if f in SCALAR_FIELDS], "delay_ticks" in eff)
+
+
+def _members(f: str) -> tuple[str, ...]:
+    return SERVO_GROUP_FIELDS if f == SERVO_GROUP else (f,)
+
+
+def scale_fields(base: SimParams, pj: Sequence[str], x: np.ndarray, *, upd: dict[str, Any] | None = None) -> SimParams:
+    """``base`` with the per-joint fields ``pj`` multiplied by ``exp(x[:, i])`` (``x`` = [6, len(pj)], log space);
+    :data:`SERVO_GROUP` multiplies kp, kv and armature by the same factor."""
+    out: dict[str, Any] = dict(upd or {})
+    for i, f in enumerate(pj):
+        for m in _members(f):
+            out[m] = getattr(base, m) * np.exp(x[:, i])
+    return replace(base, **out)
 
 
 def fit_sim_params(
@@ -300,8 +371,9 @@ def fit_sim_params(
     if popsize < 2 and (pj or sc):
         raise ValueError("popsize must be >= 2")
     for f in pj:
-        if (getattr(prior, f) <= 0).any():
-            raise ValueError(f"prior {f} must be > 0 everywhere to fit it in log space")
+        for m in _members(f):
+            if (getattr(prior, m) <= 0).any():
+                raise ValueError(f"prior {m} must be > 0 everywhere to fit it in log space")
     for f in sc:
         if getattr(prior, f) <= 0:
             raise ValueError(f"prior {f} must be > 0 to fit it in log space")
@@ -321,11 +393,9 @@ def fit_sim_params(
 
     def make(d: int, xj: np.ndarray | None, xg: np.ndarray | None) -> SimParams:
         upd: dict[str, Any] = {"delay_ticks": int(d)}
-        for i, f in enumerate(pj):
-            upd[f] = getattr(prior, f) * np.exp(xj[:, i])  # xj: [6, len(pj)]
         for i, f in enumerate(sc):
             upd[f] = float(getattr(prior, f) * math.exp(xg[i]))
-        return replace(prior, **upd)
+        return scale_fields(prior, pj, xj, upd=upd) if pj else replace(prior, **upd)  # xj: [6, len(pj)]
 
     history: list[tuple[int, float]] = []
     best: dict[int, tuple[float, SimParams]] = {}
@@ -337,12 +407,18 @@ def fit_sim_params(
                     "tolfunhist": 1e-12, "tolstagnation": 10**9}
             for d in delays:
                 es[d] = {}
+                # cma does not support 1-D problems (it warns, and in flat valleys raises from its maxstd fix-up):
+                # a 1-D block -- the ratio group alone, per joint -- uses the bounded shrinking grid instead
+                def block(dim: int, sd: int) -> Any:
+                    if dim == 1:
+                        return _ShrinkingGrid1D(pop, bound)
+                    return cma.CMAEvolutionStrategy(np.zeros(dim), sigma0, {**opts, "seed": sd})
+
                 if pj:
                     for j in range(N_JOINTS):
-                        es[d][j] = cma.CMAEvolutionStrategy(np.zeros(len(pj)), sigma0,
-                                                            {**opts, "seed": seed * 1000 + d * 10 + j + 1})
+                        es[d][j] = block(len(pj), seed * 1000 + d * 10 + j + 1)
                 if sc:
-                    es[d]["g"] = cma.CMAEvolutionStrategy(np.zeros(len(sc)), sigma0, {**opts, "seed": seed * 1000 + d * 10 + 9})
+                    es[d]["g"] = block(len(sc), seed * 1000 + d * 10 + 9)
             active = list(delays)
             elim_at = max(3, generations // 4)
             for g in range(generations):
@@ -401,6 +477,8 @@ def fit_sim_params(
             for i, f in enumerate(sc):
                 spread[f] = cma_spread[f] = float(es[d_final]["g"].result.stds[i])
         unidentified = sorted(k for k, v in spread.items() if v > UNIDENTIFIED_SPREAD and ("." in k or k in sc))
+        fitted = {m for f in pj for m in _members(f)} | set(sc)
+        unidentified += [f for f in UNIDENTIFIABLE_FIXED if f not in fitted]  # fixed at the prior, never precise
         evals = ev.evals
     finally:
         ev.close()
@@ -418,6 +496,7 @@ def fit_sim_params(
         objective=j_final,
         cma_spread=cma_spread,
         profile_spread=profile,
+        servo_group=ServoGroup.from_fit(params, prior) if SERVO_GROUP in pj else None,
     )
     if log_dir is not None:
         write_fit_log(Path(log_dir), res)
@@ -450,7 +529,7 @@ def profile_spread(ev: Any, params: SimParams, pj: Sequence[str], *, h: float = 
             x[:, i] = si * h
             x[:, k] = sk * h
             pats.append(x)
-    cands = [replace(params, **{f: getattr(params, f) * np.exp(x[:, i]) for i, f in enumerate(pj)}) for x in pats]
+    cands = [scale_fields(params, pj, x) for x in pats]
     g = ev.evaluate(cands, "train").mean(axis=1) ** 2  # [n, 6]
     n_eff = max(1.0, sum(len(sg) - 1 for sg in ev.sets["train"]) / PROFILE_CORR_TICKS)
     out: dict[str, float] = {}
@@ -487,7 +566,9 @@ def meta_for(res: FitResult, *, release: int, run: Path, git_sha: str | None = N
             git_sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             git_sha = "unknown"
-    notes = [f"unidentified (spread > {UNIDENTIFIED_SPREAD}): {', '.join(res.unidentified)}"] if res.unidentified else []
+    notes = [f"unidentified (spread > {UNIDENTIFIED_SPREAD} or fixed at the prior): {', '.join(res.unidentified)}"] if res.unidentified else []
+    if res.servo_group is not None:
+        notes.append("kp, kv, armature fitted as one ratio group per joint (servo_group.scale x prior)")
     return SimParamsMeta(
         version=release,
         date=dt.datetime.now(dt.UTC).date().isoformat(),
@@ -499,7 +580,15 @@ def meta_for(res: FitResult, *, release: int, run: Path, git_sha: str | None = N
         spread=res.spread,
         backend=res.backend,
         notes=tuple(notes),
+        unidentified=tuple(res.unidentified),
     )
+
+
+def write_result(res: FitResult, path: Path, *, meta: SimParamsMeta) -> None:
+    """The yaml of a fit: params, meta, the ratio group (identity around ``res.params`` when not group-fitted) and
+    the DR ranges (plan §10 2026-10-06 defaults: group ±40 %, frictionloss over its plausible range)."""
+    group = res.servo_group if res.servo_group is not None else ServoGroup.identity(res.params)
+    res.params.to_yaml(path, meta=meta, servo_group=group, dr=DrRanges())
 
 
 # --------------------------------------------------------------------------------------------- CLI
@@ -514,8 +603,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--backend", choices=("warp", "cpu"), default="warp")
     ap.add_argument("--heldout-kinds", type=_csv, default=DEFAULT_HELDOUT_KINDS)
     ap.add_argument("--heldout-fraction", type=float, default=0.2)
-    ap.add_argument("--fit", type=_csv, default=DEFAULT_FIT)
-    ap.add_argument("--fixed", type=_csv, default=DEFAULT_FIXED)
+    ap.add_argument("--fit", type=_csv, default=DEFAULT_FIT,
+                    help=f"fields to fit (default: {','.join(DEFAULT_FIT)}: kp, kv, armature as one ratio group + delay)")
+    ap.add_argument("--fixed", type=_csv, default=DEFAULT_FIXED,
+                    help=f"fields held at the prior (default: {','.join(DEFAULT_FIXED)}; frictionloss is unidentified)")
     ap.add_argument("--popsize", type=int, default=None, help="default: 256 (warp) / 32 (cpu)")
     ap.add_argument("--generations", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
@@ -523,7 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prior", type=Path, default=None, help="prior sim_params yaml (default: the MJCF values)")
     ap.add_argument("--release", type=int, default=1, help="meta.version of the written file (HS3: 1)")
     ap.add_argument("--calibration", type=Path, default=None, help="LeRobot calibration JSON (default: from config)")
-    ap.add_argument("--max-pct", type=float, default=None, help="held-out gate (default: compare_real.MAX_RMS_PCT)")
+    ap.add_argument("--max-pct", type=float, default=None, help="held-out gate (default: compare_real.MAX_RMS_PCT = 1)")
     return ap
 
 
@@ -554,15 +645,18 @@ def main(argv: list[str] | None = None) -> int:
     for n in JOINT_NAMES:
         print(f"{n:<15}{res.train_rms_pct[n]:>10.3f}{res.heldout_rms_pct[n]:>12.3f}")
     print(f"delay_ticks {res.params.delay_ticks}  (scores {res.delay_scores})  evals {res.evals}  {res.wall_s:.1f} s")
+    if res.group_scale is not None:
+        print("servo group scale (kp, kv, armature x prior): "
+              + ", ".join(f"{n} {v:.3f}" for n, v in zip(JOINT_NAMES, res.group_scale, strict=True)))
     if res.unidentified:
         print(f"unidentified (spread > {UNIDENTIFIED_SPREAD}): {', '.join(res.unidentified)}")
     bad = [n for n in JOINT_NAMES if not res.heldout_rms_pct[n] <= gate]
     if bad:
         path = args.run / "sim_params.unverified.yaml"
-        res.params.to_yaml(path, meta=meta)
+        write_result(res, path, meta=meta)
         print(f"FAIL: held-out RMS above {gate:g} % on {', '.join(bad)}; wrote {path}", file=sys.stderr)
         return 1
-    res.params.to_yaml(args.out, meta=meta)
+    write_result(res, args.out, meta=meta)
     print(f"PASS: wrote {args.out}")
     return 0
 

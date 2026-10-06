@@ -37,7 +37,7 @@ from so101_rl.sim.mujoco_bus import MujocoBus
 if TYPE_CHECKING:
     from so101_rl.sim.sysid.params import SimParams
 
-MAX_RMS_PCT = 5.0  # sysid milestone gate: per-joint RMS error as % of the joint's calibrated range
+MAX_RMS_PCT = 1.0  # sysid gate (plan §10 2026-10-06; was 5): per-joint held-out RMS error, % of calibrated range
 
 
 def rms_joint_error_pct(

@@ -3,6 +3,10 @@
 The "real" data comes from the in-process ServoCore + MujocoBus rig (``run_excitation.run_synthetic``) with known
 parameters, so every claim is checked against the truth.
 
+Parametrisation (plan §10 2026-10-06): the default fit is ONE scale per joint on kp, kv and armature jointly (the
+servo ratio group) plus the integer delay; frictionloss stays at the prior and is reported unidentified. The held-out
+gate is ``MAX_RMS_PCT`` = 1 % (was 5 %).
+
 Physics findings pinned here (measured 2026-10-06, reported to the plan):
 
 * The MJCF STS3215 servo is a stiff position servo (kp 998) with a hard force limit (3.35 N m): its linear band is
@@ -13,8 +17,7 @@ Physics findings pinned here (measured 2026-10-06, reported to the plan):
   randomises it widely), that the delay is exact, and that the fitted model explains held-out data as well as the
   ground truth does.
 * A 3-tick (100 ms) delay can move the open-loop held-out RMS by at most about 45 ticks (one command's worth): about
-  1.5 % of range, so the 5 % gate is blind to it. The "delay fixed at 0" twin therefore shows the gate failing at a
-  1 % gate value and pins that the 5 % gate passes it.
+  1.5 % of range, so the old 5 % gate was blind to it; the 1 % gate fails it (the "delay fixed at 0" twin).
 """
 
 from __future__ import annotations
@@ -27,17 +30,23 @@ import numpy as np
 import pytest
 
 from so101_rl.config import JOINT_NAMES
+from so101_rl.sim.compare_real import MAX_RMS_PCT
 from so101_rl.sim.model import load_model
 from so101_rl.sim.sysid.dataset import ExcitationDataset
 from so101_rl.sim.sysid.excitation import ALL, AMPLITUDE_TICKS, ExcitationPlan, Segment, fit40_plan
 from so101_rl.sim.sysid.fit import fit_sim_params, objective, objective_rms_pct
-from so101_rl.sim.sysid.params import SimParams
+from so101_rl.sim.sysid.params import SERVO_GROUP_FIELDS, ServoGroup, SimParams
 from so101_rl.sim.sysid.replay import TickMap, pooled_rms_pct, replay_segment_cpu
 from so101_rl.sim.sysid.run_excitation import run_synthetic
 
 HELDOUT_KINDS = {"chirp", "random"}
 DATA = Path(__file__).parent / "data"
-TOL = {"kp": 0.10, "kv": 0.10, "frictionloss": 0.25, "armature": 0.25}
+# truth: the servo ratio group scaled per joint (kp, kv, armature together), 3-tick delay; frictionloss x2 (not fitted:
+# it must not matter for the held-out error, and it is reported unidentified)
+S_TRUTH = np.array([0.6, 0.7, 0.8, 1.25, 1.4, 0.75])
+# the fitted group scale must lie within 15 % of the truth (measured 2026-10-06: worst 9.5 %, shoulder_pan), well
+# inside the ±40 % DR band that is randomised around it
+GROUP_TOL = math.log(1.15)
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +56,7 @@ def prior():
 
 @pytest.fixture(scope="module")
 def truth(prior):
-    return replace(prior.scaled(kp=0.7, kv=1.4, frictionloss=2.0, armature=1.0), delay_ticks=3)
+    return replace(ServoGroup.identity(prior).apply(prior, S_TRUTH).scaled(frictionloss=2.0), delay_ticks=3)
 
 
 @pytest.fixture(scope="module")
@@ -92,53 +101,59 @@ def _open_loop_heldout(params, held, cal, cfg):
 @pytest.mark.slow
 @pytest.mark.timeout(600)
 def test_synthetic_recovery_cpu(truth_run, prior, truth):
+    """Default fit (ratio group + delay): the delay exactly, the group scale per joint within 15 % of the truth (or
+    reported unidentified with a spread that covers it), held-out under the 1 % gate and at the
+    truth's noise floor; frictionloss untouched at the prior and flagged unidentified."""
     cal, cfg, _, train, held = truth_run
     res = fit_sim_params(train, held, prior=prior, backend="cpu", popsize=8, generations=25, seed=0,
                          calibration=cal, cfg=cfg)
     p = res.params
-    ratios = {f: getattr(p, f) / getattr(truth, f) for f in TOL}
-    print("\nrecovered / truth per joint:", {f: np.round(r, 3).tolist() for f, r in ratios.items()})
+    s = res.group_scale
+    assert s is not None
+    print("\ngroup scale fitted / truth:", np.round(s, 3).tolist(), "/", S_TRUTH.tolist())
     print("spread:", {k: round(v, 2) for k, v in res.spread.items() if "." in k})
     print("held-out %:", {k: round(v, 3) for k, v in res.heldout_rms_pct.items()}, "evals", res.evals,
           f"{res.wall_s:.1f} s", "delay scores", {k: round(v, 3) for k, v in res.delay_scores.items()})
 
     assert p.delay_ticks == 3  # exact
-    assert max(res.heldout_rms_pct.values()) < 1.0
+    assert max(res.heldout_rms_pct.values()) <= MAX_RMS_PCT == 1.0
+    # kp, kv, armature moved as ONE group: the prior's ratios are kept exactly
+    for f in SERVO_GROUP_FIELDS:
+        np.testing.assert_allclose(getattr(p, f) / getattr(prior, f), s, rtol=1e-12)
+    # the group scale is recovered within 15 %, or flagged with a covering spread
+    err = np.abs(np.log(s / S_TRUTH))
+    silent = [f"{n}: x{s[j] / S_TRUTH[j]:.2f} of truth, spread {res.spread[f'servo_group.{n}']:.2f}"
+              for j, n in enumerate(JOINT_NAMES) if err[j] > GROUP_TOL and err[j] > res.spread[f"servo_group.{n}"]]
+    assert not silent, silent
     # the fit explains held-out data as well as the ground truth (noise floor) and far better than the prior
     floor = _open_loop_heldout(truth, held, cal, cfg)
     prior_err = _open_loop_heldout(prior, held, cal, cfg)
     fit_err = np.array([res.heldout_rms_pct[n] for n in JOINT_NAMES])
     assert (fit_err <= 1.25 * floor + 0.005).all(), (fit_err, floor)
     assert prior_err.max() > 10 * fit_err.max()
-    # every parameter is within tolerance OR reported unidentified with a spread that covers the truth
-    silent = []
-    for f, tol in TOL.items():
-        for j, n in enumerate(JOINT_NAMES):
-            err = abs(math.log(ratios[f][j]))
-            if err > tol and err > res.spread[f"{f}.{n}"]:
-                silent.append(f"{f}.{n}: x{ratios[f][j]:.2f} of truth, spread {res.spread[f'{f}.{n}']:.2f}")
-    assert not silent, silent
-    # damping / forcerange are held at the prior (D-SYSID)
+    # frictionloss, damping, forcerange are held at the prior; frictionloss is reported unidentified
+    np.testing.assert_array_equal(p.frictionloss, prior.frictionloss)
     np.testing.assert_array_equal(p.damping, prior.damping)
     np.testing.assert_array_equal(p.forcerange, prior.forcerange)
+    assert "frictionloss" in res.unidentified
 
 
 @pytest.mark.slow
 @pytest.mark.timeout(600)
 def test_fit_with_delay_fixed_zero_fails_gate(truth_run, prior, truth):
     """The twin: same data, delay held at 0 -> the held-out error is an order of magnitude above the correct fit's
-    and fails a 1 % gate. The 5 % gate is blind to a 3-tick delay through the clamp chain (pinned, see module doc)."""
+    and FAILS the 1 % gate (MAX_RMS_PCT). The old 5 % gate was blind to a 3-tick delay through the clamp chain."""
     cal, cfg, _, train, held = truth_run
-    res = fit_sim_params(train, held, prior=prior, fixed=("damping", "forcerange", "delay_ticks"), backend="cpu",
-                         popsize=8, generations=10, seed=0, calibration=cal, cfg=cfg)
+    res = fit_sim_params(train, held, prior=prior, fixed=("damping", "forcerange", "frictionloss", "delay_ticks"),
+                         backend="cpu", popsize=8, generations=10, seed=0, calibration=cal, cfg=cfg)
     assert res.params.delay_ticks == 0
     worst = max(res.heldout_rms_pct.values())
     good = _open_loop_heldout(replace(res.params, delay_ticks=3), held, cal, cfg)
     print("\ndelay-0 held-out %:", {k: round(v, 3) for k, v in res.heldout_rms_pct.items()})
-    assert worst > 1.0  # fails a 1 % gate
+    assert worst > MAX_RMS_PCT == 1.0  # fails the gate
     assert worst > 5 * _open_loop_heldout(truth, held, cal, cfg).max()  # vs the noise floor of the truth
     assert good.max() < worst
-    assert worst < 5.0  # pinned finding: MAX_RMS_PCT = 5 % does not see a 100 ms delay at 45 ticks/command
+    assert worst < 5.0  # pinned finding: the old 5 % gate did not see a 100 ms delay at 45 ticks/command
 
 
 @pytest.mark.slow
@@ -153,14 +168,13 @@ def test_unidentifiable_pair_flagged(sines_run, prior):
     assert any(k.startswith("damping.") for k in pair.unidentified)
     alone = fit_sim_params(train, held, prior=prior, fit=("kp",), fixed=("delay_ticks",), backend="cpu",
                            popsize=8, generations=15, seed=0, calibration=cal, cfg=cfg)
-    assert alone.spread["kp"] < 0.5 and not alone.unidentified
+    assert alone.spread["kp"] < 0.5 and alone.unidentified == ["frictionloss"]  # only the fixed, unidentifiable one
     np.testing.assert_allclose(alone.params.kp / prior.kp, 0.8, rtol=0.10)
 
 
 def test_multiple_shooting_reinit(truth_run, truth):
     """Every window restarts from the logged state: the first prediction of each window equals a 1-tick-window
-    prediction from the same row, and with a wrong delay the re-initialised replay stays closer to the log than the
-    open-loop one."""
+    prediction from the same row, and the open-loop replay carries its own state instead."""
     cal, cfg, ds, _, _ = truth_run
     seg = ds.segments[0]
     model, data = load_model()
@@ -171,8 +185,10 @@ def test_multiple_shooting_reinit(truth_run, truth):
     np.testing.assert_allclose(sims[10][starts + 1], sims[1][starts + 1], atol=1e-9)  # re-init = the w=1 state
     assert not np.allclose(sims[10][starts + 1], sims[len(seg)][starts + 1])  # open loop carries its own state
     assert sims[10][0].tolist() == seg.present_ticks[0].tolist()
-    err = {w: np.abs(x[1:] - seg.present_ticks[1:]).max() for w, x in sims.items()}
-    assert err[10] < err[len(seg)]
+    # (Until 2026-10-06 this also asserted that the windowed replay stays closer to the log than the open-loop one.
+    # That held only for the old kp 0.7 / kv 1.4 truth: with the ratio-group truth the force-limited servo does not
+    # drift, a wrong delay is a pure time shift, and both replays are within 2 % of each other (mean 10.69 vs 10.52
+    # ticks on segment 0). The mechanics above are what the fit relies on.)
 
 
 def test_replay_reproduces_noise_free_truth(tmp_path, truth):
@@ -214,6 +230,18 @@ def test_fit_argument_validation(truth_run, prior):
         fit_sim_params(train, held, prior=prior, fit=("delay_ticks",), backend="tpu", calibration=cal, cfg=cfg)
     with pytest.raises(ValueError, match="held-out"):
         fit_sim_params(train, ExcitationDataset([]), prior=prior, backend="cpu", calibration=cal, cfg=cfg)
+    with pytest.raises(ValueError, match="jointly"):  # the group and one of its members at once
+        fit_sim_params(train, held, prior=prior, fit=("servo_group", "kp"), backend="cpu", calibration=cal, cfg=cfg)
+
+
+def test_default_parametrisation_is_the_ratio_group():
+    """Plan §10 2026-10-06: the default fit is the servo ratio group + delay; frictionloss is fixed (unidentified)."""
+    from so101_rl.sim.sysid.fit import DEFAULT_FIT, DEFAULT_FIXED, SERVO_GROUP, build_parser
+
+    assert DEFAULT_FIT == (SERVO_GROUP, "delay_ticks")
+    assert "frictionloss" in DEFAULT_FIXED and "frictionloss" not in DEFAULT_FIT
+    args = build_parser().parse_args(["--run", "r", "--out", "o"])
+    assert args.fit == DEFAULT_FIT and args.fixed == DEFAULT_FIXED and args.max_pct is None
 
 
 def test_delay_only_grid_search_is_exact(truth_run, prior):

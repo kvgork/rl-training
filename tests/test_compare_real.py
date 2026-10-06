@@ -159,8 +159,9 @@ def _simulate_with(calibration, cfg, target, params):
 
 def test_sim_params_change_the_error(tmp_path, calibration, cfg):
     """A log from an arm with kp x 0.5 and a 3-tick delay fails the gate under the prior and is ~0 % with matching
-    --sim-params: the gate discriminates. kp alone moves the error measurably but far below the gate (the MJCF servo
-    is force-limited, its linear band is about ±2 ticks): pinned, the 5 % gate cannot see servo-gain errors."""
+    --sim-params: the gate discriminates. kp alone moves the error measurably but far below the old 5 % gate (the MJCF
+    servo is force-limited, its linear band is about ±2 ticks); on this trajectory it is just above the 1 % gate
+    (plan §10 2026-10-06; measured 1.16 % on shoulder_pan, 2026-10-06 integration)."""
     from dataclasses import replace
 
     from so101_rl.sim.sysid.params import SimParams
@@ -179,7 +180,8 @@ def test_sim_params_change_the_error(tmp_path, calibration, cfg):
     kp_only = _write_f8(tmp_path / "kp.h5", target, _simulate_with(calibration, cfg, target, prior.scaled(kp=0.5)))
     m, d = load_model()
     e = rms_joint_error_pct(kp_only, m, d, calibration, cfg=cfg)
-    assert 0.05 < max(e.values()) < MAX_RMS_PCT, e
+    assert MAX_RMS_PCT == 1.0
+    assert MAX_RMS_PCT < max(e.values()) < 5.0, e  # the 1 % gate sees a halved kp here; the old 5 % gate did not
 
 
 def test_sim_params_cli(tmp_path, calibration, cfg, capsys):

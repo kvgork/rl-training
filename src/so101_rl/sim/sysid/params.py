@@ -5,16 +5,32 @@ set per world for :meth:`so101_rl.sim.warp_model.WarpSim.set_world_params` and t
 
 ``calib/sim_params.yaml`` (committed, like ``calib/hand_eye.yaml``; schema in ``calib/README.md``)::
 
-    version: 1            # SIM_PARAMS_VERSION: the file SCHEMA version; any other value is refused
+    version: 2            # SIM_PARAMS_VERSION: the file SCHEMA version; any other value is refused
     meta:                 # SimParamsMeta
       version: 0          # the parameter RELEASE: 0 = MJCF prior (shipped by SU2), >= 1 = fitted on the arm (HS3)
       heldout_rms_pct: null | {joint: pct}   # null = never verified against real data
+      unidentified: [...] # parameters that must NOT be read as precise (always includes frictionloss)
       ...
     params: {kp: [6], kv: [6], damping: [6], frictionloss: [6], armature: [6], forcerange: [6],
              delay_ticks: int, deadband_ticks: [6], die_mass_kg: float, die_friction: float, table_friction: float}
+    servo_group:          # ServoGroup: kp, kv, armature = prior x scale per joint (one ratio group)
+      prior: {kp: [6], kv: [6], armature: [6]}
+      scale: [6]
+    dr:                   # DrRanges: the randomisation ranges the S3 randomiser draws from (plan §10 2026-10-06)
+      servo_group_rel: 0.4            # the group (kp, kv, armature jointly) x U(1 - rel, 1 + rel)
+      frictionloss_range: [lo, hi]    # N m, absolute, uniform (frictionloss is not identified)
+      frictionloss_source: "..."
+
+**Servo parameter semantics (plan §10 2026-10-06, "Servo parameter identification"; schema 2).** Through the clamp
+chain the MJCF position servo's kp, kv and armature act almost only through their ratios, and frictionloss is
+invisible under ±1-tick noise (SU2 findings). The sysid therefore fits ONE scale per joint applied to kp, kv and
+armature jointly (the ratio group; ``servo_group.scale``, ratios kept at the prior's) plus the integer delay;
+frictionloss stays at the prior and is listed in ``meta.unidentified``. Domain randomisation varies the group by
+``dr.servo_group_rel`` (±40 %) around the fit and frictionloss over ``dr.frictionloss_range``.
 
 :meth:`SimParams.from_yaml` refuses a file whose schema version differs, or whose held-out RMS is missing (``null``)
-or above the compare-real gate (``MAX_RMS_PCT`` = 5 % of range) on any joint, unless ``allow_unverified=True``.
+or above the compare-real gate (``MAX_RMS_PCT`` = 1 % of range since plan §10 2026-10-06; was 5 %) on any joint,
+unless ``allow_unverified=True``.
 The shipped version-0 file is the MJCF prior, so the batched env always has a centre; consumers that train on it
 must opt in with ``allow_unverified`` (plan D-DIE-PARAMS: die-to-zone waits for release >= 1).
 
@@ -52,21 +68,28 @@ if TYPE_CHECKING:
 __all__ = [
     "DIE_BODY",
     "DIE_GEOM",
+    "FRICTIONLOSS_RANGE",
     "INT_FIELDS",
     "MAX_DELAY_TICKS",
     "PER_JOINT_FIELDS",
     "SCALAR_FIELDS",
+    "SERVO_GROUP_FIELDS",
+    "SERVO_GROUP_REL",
     "SIM_PARAMS_VERSION",
     "TABLE_GEOM",
     "BatchedSimParams",
+    "DrRanges",
+    "ServoGroup",
     "SimParams",
+    "SimParamsFile",
     "SimParamsMeta",
     "apply_deadband",
     "mjcf_sha256",
+    "read_sim_params_file",
     "read_sim_params_yaml",
 ]
 
-SIM_PARAMS_VERSION: Final[int] = 1
+SIM_PARAMS_VERSION: Final[int] = 2  # 2 (2026-10-06): + servo_group, dr, meta.unidentified
 MAX_DELAY_TICKS: Final[int] = 6  # the sysid delay grid is 0..MAX_DELAY_TICKS (FS7)
 MAX_DEADBAND_TICKS: Final[int] = 64  # sanity bound only; D-BACKLASH ranges are 0..6
 
@@ -86,6 +109,20 @@ _POSITIVE: Final[dict[str, bool]] = {
     "table_friction": False,
 }
 
+# The servo ratio group (plan §10 2026-10-06): fitted and randomised as ONE scale per joint.
+SERVO_GROUP_FIELDS: Final[tuple[str, ...]] = ("kp", "kv", "armature")
+SERVO_GROUP_REL: Final[float] = 0.40  # DR: the group x U(0.6, 1.4) around the fit
+# DR range of the (unidentified) Coulomb friction, N m, every joint. Lower bound 0: the fit cannot tell zero from the
+# prior (frictionloss x0 .. x4 moves the training objective by < 0.003 % of range on synthetic data, SU2/integration
+# 2026-10-06). Upper bound 0.21 N m = 4 x the upstream MJCF prior (0.052 N m, sts3215 class of TheRobotStudio's
+# so101_new_calib.xml) = 7 % of the STS3215 stall torque at 12 V (30 kg cm = 2.94 N m, the class forcerange). This
+# is a CHOICE bounded by those two sourced numbers, not a measurement; HS3 may narrow it.
+FRICTIONLOSS_RANGE: Final[tuple[float, float]] = (0.0, 0.21)
+FRICTIONLOSS_SOURCE: Final[str] = (
+    "0 .. 4 x the upstream MJCF prior 0.052 N m (TheRobotStudio so101_new_calib.xml, class sts3215) = 7 % of the "
+    "STS3215 12 V stall torque 2.94 N m (30 kg cm, the MJCF class forcerange); a bounded choice, not a measurement"
+)
+
 DIE_BODY: Final[str] = "die"
 DIE_GEOM: Final[str] = "die_geom"
 TABLE_GEOM: Final[str] = "table"
@@ -100,6 +137,7 @@ _META_KEYS: Final[tuple[str, ...]] = (
     "heldout_rms_pct",
     "spread",
     "backend",
+    "unidentified",
 )
 
 
@@ -197,23 +235,34 @@ class SimParams:
     @classmethod
     def from_yaml(cls, path: Path = Path("calib/sim_params.yaml"), *, allow_unverified: bool = False) -> SimParams:
         """Load ``calib/sim_params.yaml``. Refuses a schema version other than :data:`SIM_PARAMS_VERSION`, and an
-        unverified file (``heldout_rms_pct`` null, incomplete, or above 5 % on any joint) unless
+        unverified file (``heldout_rms_pct`` null, incomplete, or above ``MAX_RMS_PCT`` = 1 % on any joint) unless
         ``allow_unverified``."""
         params, _ = read_sim_params_yaml(path, allow_unverified=allow_unverified)
         return params
 
-    def to_yaml(self, path: Path, *, meta: SimParamsMeta) -> None:
-        """Write the schema-``SIM_PARAMS_VERSION`` file atomically (``.tmp`` + rename)."""
+    def to_yaml(
+        self, path: Path, *, meta: SimParamsMeta, servo_group: ServoGroup | None = None, dr: DrRanges | None = None
+    ) -> None:
+        """Write the schema-``SIM_PARAMS_VERSION`` file atomically (``.tmp`` + rename).
+
+        ``servo_group`` defaults to :meth:`ServoGroup.identity` (scale 1 around these values), ``dr`` to the
+        defaults of :class:`DrRanges`. The group must reproduce ``kp``/``kv``/``armature`` (checked)."""
         path = Path(path)
+        group = servo_group if servo_group is not None else ServoGroup.identity(self)
+        group.check(self)
         doc = {
             "version": SIM_PARAMS_VERSION,
             "meta": meta.to_dict(),
             "params": self.to_dict(),
+            "servo_group": group.to_dict(),
+            "dr": (dr if dr is not None else DrRanges()).to_dict(),
         }
         header = (
             "# Simulator parameters (FS7). Schema: calib/README.md. Written by so101_rl.sim.sysid "
             "(params.SimParams.to_yaml).\n"
             "# meta.version 0 = the MJCF prior (unverified: heldout_rms_pct null); >= 1 = fitted on the real arm (HS3).\n"
+            "# kp, kv, armature = servo_group.prior x servo_group.scale (one ratio group per joint); frictionloss is\n"
+            "# not identified (meta.unidentified): use the dr ranges, not the point value (plan §10 2026-10-06).\n"
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -355,6 +404,7 @@ class SimParamsMeta:
     spread: dict[str, float]
     backend: str  # "mjcf-prior", "warp", "cpu"
     notes: tuple[str, ...] = field(default=())
+    unidentified: tuple[str, ...] = field(default=("frictionloss",))  # never to be read as precise
 
     def to_dict(self) -> dict[str, Any]:
         def fdict(d: dict[str, float] | None) -> dict[str, float] | None:
@@ -370,6 +420,7 @@ class SimParamsMeta:
             "heldout_rms_pct": fdict(self.heldout_rms_pct),
             "spread": fdict(self.spread),
             "backend": self.backend,
+            "unidentified": list(self.unidentified),
         }
         if self.notes:
             out["notes"] = list(self.notes)
@@ -386,6 +437,9 @@ class SimParamsMeta:
         v = doc["version"]
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             raise ValueError(f"{where}.version must be an int >= 0, got {v!r}")
+        un = doc["unidentified"]
+        if not isinstance(un, list) or not all(isinstance(x, str) for x in un):
+            raise TypeError(f"{where}.unidentified: expected a list of parameter names")
 
         def fdict(key: str, *, nullable: bool = False) -> dict[str, float] | None:
             d = doc[key]
@@ -406,6 +460,7 @@ class SimParamsMeta:
             spread=fdict("spread") or {},
             backend=str(doc["backend"]),
             notes=tuple(str(n) for n in doc.get("notes") or ()),
+            unidentified=tuple(un),
         )
 
     def verification_problems(self, max_pct: float) -> list[str]:
@@ -420,25 +475,158 @@ class SimParamsMeta:
         return problems
 
 
+@dataclass(frozen=True, eq=False)
+class ServoGroup:
+    """kp, kv and armature as ONE ratio group per joint: ``value = prior_value x scale`` (plan §10 2026-10-06).
+
+    ``prior`` holds the three fields' reference values (the fit's prior), ``scale`` the fitted per-joint factor
+    (1 = the prior). The ratios kp : kv : armature are those of ``prior`` by construction."""
+
+    prior: dict[str, np.ndarray]  # {kp, kv, armature}: float64[6]
+    scale: np.ndarray  # float64[6], > 0
+
+    def __post_init__(self) -> None:
+        if set(self.prior) != set(SERVO_GROUP_FIELDS):
+            raise ValueError(f"servo_group.prior: keys must be exactly {list(SERVO_GROUP_FIELDS)}, got {sorted(self.prior)}")
+        pr = {}
+        for k in SERVO_GROUP_FIELDS:
+            v = _vec6(f"servo_group.prior.{k}", self.prior[k], dtype=float)
+            if not (np.isfinite(v).all() and (v > 0).all()):
+                raise ValueError(f"servo_group.prior.{k}: every value must be finite and > 0, got {v.tolist()}")
+            pr[k] = v
+        object.__setattr__(self, "prior", pr)
+        sc = _vec6("servo_group.scale", self.scale, dtype=float)
+        if not (np.isfinite(sc).all() and (sc > 0).all()):
+            raise ValueError(f"servo_group.scale: every value must be finite and > 0, got {sc.tolist()}")
+        object.__setattr__(self, "scale", sc)
+
+    @classmethod
+    def identity(cls, params: SimParams) -> ServoGroup:
+        """Scale 1 around ``params`` itself (the MJCF prior, or any set that was not group-fitted)."""
+        return cls(prior={k: getattr(params, k) for k in SERVO_GROUP_FIELDS}, scale=np.ones(N_JOINTS))
+
+    @classmethod
+    def from_fit(cls, params: SimParams, prior: SimParams) -> ServoGroup:
+        """The group of a fitted set: ``scale = params.kp / prior.kp`` (checked to hold for kv and armature)."""
+        g = cls(prior={k: getattr(prior, k) for k in SERVO_GROUP_FIELDS}, scale=params.kp / prior.kp)
+        g.check(params)
+        return g
+
+    def apply(self, base: SimParams, scale: np.ndarray | None = None) -> SimParams:
+        """``base`` with kp, kv, armature = prior x ``scale`` (default: this group's scale)."""
+        s = self.scale if scale is None else np.asarray(scale, dtype=np.float64)
+        return replace(base, **{k: self.prior[k] * s for k in SERVO_GROUP_FIELDS})
+
+    def check(self, params: SimParams, *, rtol: float = 1e-9) -> None:
+        for k in SERVO_GROUP_FIELDS:
+            want = self.prior[k] * self.scale
+            if not np.allclose(getattr(params, k), want, rtol=rtol, atol=0.0):
+                raise ValueError(
+                    f"servo_group: params.{k} {getattr(params, k).tolist()} != prior x scale {want.tolist()} "
+                    "(kp, kv and armature are one ratio group)"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"prior": {k: [float(x) for x in self.prior[k]] for k in SERVO_GROUP_FIELDS},
+                "scale": [float(x) for x in self.scale]}
+
+    @classmethod
+    def from_dict(cls, doc: Any, *, where: str = "servo_group") -> ServoGroup:
+        if not isinstance(doc, dict) or set(doc) != {"prior", "scale"} or not isinstance(doc["prior"], dict):
+            raise ValueError(f"{where}: expected a mapping with exactly prior: {{kp, kv, armature}} and scale")
+        try:
+            return cls(prior=dict(doc["prior"]), scale=doc["scale"])
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(f"{where}: {exc}") from None
+
+
+@dataclass(frozen=True)
+class DrRanges:
+    """Domain-randomisation ranges recorded with the release (plan §10 2026-10-06; consumed by FS8 / S3)."""
+
+    servo_group_rel: float = SERVO_GROUP_REL
+    frictionloss_range: tuple[float, float] = FRICTIONLOSS_RANGE
+    frictionloss_source: str = FRICTIONLOSS_SOURCE
+
+    def __post_init__(self) -> None:
+        r = self.servo_group_rel
+        if isinstance(r, bool) or not isinstance(r, int | float) or not 0.0 <= float(r) < 1.0:
+            raise ValueError(f"dr.servo_group_rel must be within [0, 1), got {r!r}")
+        lo, hi = (float(x) for x in self.frictionloss_range)
+        if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 <= lo <= hi):
+            raise ValueError(f"dr.frictionloss_range must be 0 <= lo <= hi, got {self.frictionloss_range!r}")
+        if not str(self.frictionloss_source).strip():
+            raise ValueError("dr.frictionloss_source: a source/justification is required")
+        object.__setattr__(self, "servo_group_rel", float(r))
+        object.__setattr__(self, "frictionloss_range", (lo, hi))
+
+    def servo_group_bounds(self, scale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per-joint group scale range ``scale x (1 -+ rel)``."""
+        s = np.asarray(scale, dtype=np.float64)
+        return s * (1.0 - self.servo_group_rel), s * (1.0 + self.servo_group_rel)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"servo_group_rel": self.servo_group_rel, "frictionloss_range": list(self.frictionloss_range),
+                "frictionloss_source": self.frictionloss_source}
+
+    @classmethod
+    def from_dict(cls, doc: Any, *, where: str = "dr") -> DrRanges:
+        keys = {"servo_group_rel", "frictionloss_range", "frictionloss_source"}
+        if not isinstance(doc, dict) or set(doc) != keys:
+            raise ValueError(f"{where}: expected a mapping with exactly {sorted(keys)}")
+        fr = doc["frictionloss_range"]
+        if not isinstance(fr, list | tuple) or len(fr) != 2:
+            raise ValueError(f"{where}.frictionloss_range: expected [lo, hi]")
+        try:
+            return cls(servo_group_rel=doc["servo_group_rel"], frictionloss_range=(fr[0], fr[1]),
+                       frictionloss_source=str(doc["frictionloss_source"]))
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(f"{where}: {exc}") from None
+
+
+@dataclass(frozen=True)
+class SimParamsFile:
+    """Everything in ``calib/sim_params.yaml`` (schema 2)."""
+
+    params: SimParams
+    meta: SimParamsMeta
+    servo_group: ServoGroup
+    dr: DrRanges
+
+
 def read_sim_params_yaml(
     path: Path = Path("calib/sim_params.yaml"), *, allow_unverified: bool = False
 ) -> tuple[SimParams, SimParamsMeta]:
     """Load ``(params, meta)`` strictly (see :meth:`SimParams.from_yaml` for the refusals)."""
+    f = read_sim_params_file(path, allow_unverified=allow_unverified)
+    return f.params, f.meta
+
+
+def read_sim_params_file(path: Path = Path("calib/sim_params.yaml"), *, allow_unverified: bool = False) -> SimParamsFile:
+    """Load the whole file strictly: params, meta, the servo ratio group (consistent with params) and the DR ranges."""
     from so101_rl.sim.compare_real import MAX_RMS_PCT  # the one gate value (compare-real owns it)
 
     path = Path(path)
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
         raise TypeError(f"{path}: expected a mapping")
-    keys = set(doc)
-    if keys != {"version", "meta", "params"}:
-        raise ValueError(f"{path}: top-level keys must be exactly version, meta, params; got {sorted(keys)}")
-    if doc["version"] != SIM_PARAMS_VERSION or isinstance(doc["version"], bool):
+    if doc.get("version") != SIM_PARAMS_VERSION or isinstance(doc.get("version"), bool):
         raise ValueError(
-            f"{path}: schema version {doc['version']!r} is not supported (this code reads version {SIM_PARAMS_VERSION})"
+            f"{path}: schema version {doc.get('version')!r} is not supported (this code reads version "
+            f"{SIM_PARAMS_VERSION}; regenerate release 0 with `python -m so101_rl.sim.sysid.params --write-prior`)"
         )
+    keys = set(doc)
+    want = {"version", "meta", "params", "servo_group", "dr"}
+    if keys != want:
+        raise ValueError(f"{path}: top-level keys must be exactly {sorted(want)}; got {sorted(keys)}")
     meta = SimParamsMeta.from_dict(doc["meta"], where=f"{path}: meta")
     params = SimParams.from_dict(doc["params"], where=f"{path}: params")
+    group = ServoGroup.from_dict(doc["servo_group"], where=f"{path}: servo_group")
+    try:
+        group.check(params, rtol=1e-6)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from None
+    dr = DrRanges.from_dict(doc["dr"], where=f"{path}: dr")
     if meta.backend != "mjcf-prior" or meta.version > 0:
         try:
             current = mjcf_sha256()
@@ -456,7 +644,7 @@ def read_sim_params_yaml(
             f"{path}: unverified sim parameters (release {meta.version}): {'; '.join(problems)}. "
             "Pass allow_unverified=True to use them anyway (e.g. the MJCF prior for reach on v0)."
         )
-    return params, meta
+    return SimParamsFile(params=params, meta=meta, servo_group=group, dr=dr)
 
 
 def mjcf_sha256(scene_xml: Path | None = None) -> str:
@@ -588,6 +776,7 @@ def prior_meta(*, date: str, git_sha: str) -> SimParamsMeta:
         spread={},
         backend="mjcf-prior",
         notes=("upstream sts3215 class values (so101_new_calib.xml); replaced by the HS3 fit (release >= 1)",),
+        unidentified=("servo_group", "delay_ticks", "frictionloss"),  # nothing is identified in the prior
     )
 
 
