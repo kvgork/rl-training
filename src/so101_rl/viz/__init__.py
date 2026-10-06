@@ -1,7 +1,8 @@
 """Training visualisation (sim-track unit SUV, frozen interface FS11).
 
 ``TrainingMonitor`` / ``VizConfig`` (monitor.py) are the interface the training loops call; ``live_viewer`` (a
-separate process), ``video`` (rollout mp4s) and TensorBoard scalars sit behind it. Importing this package must stay
+separate process), ``video`` (rollout mp4s) and TensorBoard scalars sit behind it; ``dashboard`` serves the
+TensorBoard logs (pixi task ``dashboard``). Importing this package must stay
 cheap (no torch / mujoco at import): everything is re-exported lazily.
 """
 

@@ -179,7 +179,7 @@ def test_missing_tensorboard_is_not_a_failure(tmp_path, monkeypatch, caplog):
 
 
 def test_tensorboard_events_written(tmp_path):
-    pytest.importorskip("tensorboard", reason="tensorboard is not installed in this env yet (add it to the `train` pixi feature)")
+    # tensorboard is in the `train` pixi feature (integration 2026-10-06): no skip, a missing package fails here
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
     m = TrainingMonitor(VizConfig(tensorboard=True, video_every_min=0), _sim(), tmp_path / "run", task="reach", render_cfg=None)
@@ -282,3 +282,13 @@ def test_viz_never_imports_safety_or_servo_hardware():
             names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
             for n in names:
                 assert not n.startswith(("so101_rl.safety", "so101_rl.rl", "so101_rl.wm", "so101_rl.servo.feetech_bus", "so101_rl.servo.bus", "serial")), (f.name, n)
+
+
+def test_dashboard_wrapper_builds_the_tensorboard_command(tmp_path, capsys):
+    from so101_rl.viz.dashboard import build_parser, main, tensorboard_argv
+
+    ns = build_parser().parse_args(["--logdir", str(tmp_path)])
+    assert tensorboard_argv(ns) == ["tensorboard", "--logdir", str(tmp_path), "--host", "127.0.0.1", "--port", "6006"]
+    assert build_parser().parse_args([]).logdir.as_posix() == "runs"
+    assert main(["--logdir", str(tmp_path / "missing")]) == 2  # refuses a missing logdir, never starts a server
+    assert "does not exist" in capsys.readouterr().err
