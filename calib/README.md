@@ -38,3 +38,37 @@ expected_corners_px:           # TL, TR, BR, BL as returned by cv2.aruco.ArucoDe
   - [320.0, 270.0]
   - [200.0, 270.0]
 ```
+
+## `sim_params.yaml`
+
+Simulator parameters (FS7 of `plans/sim-track-implementation-plan.md`), read by
+`so101_rl.sim.sysid.params.SimParams.from_yaml` / `read_sim_params_yaml` and by `compare-real --sim-params`.
+Release 0 (shipped now) is the MJCF prior, regenerated with
+`python -m so101_rl.sim.sysid.params --write-prior calib/sim_params.yaml`; release 1 is written by
+`sysid-fit` from the HS1/HS2 excitation runs (HS3), and only when the held-out gate passes.
+
+```yaml
+version: 1                 # schema version (SIM_PARAMS_VERSION); any other value is refused
+meta:
+  version: 0               # parameter release: 0 = MJCF prior, >= 1 = fitted on the real arm (HS3)
+  date: "2026-10-06"
+  git_sha: "..."
+  mjcf_sha256: "..."       # sha256 of so101_rl_scene.xml + assets/so101/upstream/*.xml
+  excitation_run: "runs/sysid/<ts>"
+  fit_rms_pct: {joint: pct}        # training RMS, % of calibrated range
+  heldout_rms_pct: null | {joint: pct}   # compare-real definition (open-loop replay); null = never verified
+  spread: {"kp.shoulder_pan": 0.12, ..., kp: max}   # log-space spread; > 0.5 = unidentified (wide DR in S3)
+  backend: mjcf-prior | warp | cpu
+  notes: [...]             # optional
+params:                    # per-joint lists in JOINT_NAMES order
+  kp: [6]; kv: [6]; damping: [6]; frictionloss: [6]; armature: [6]; forcerange: [6]
+  delay_ticks: 0           # whole servo ticks of command-to-motion delay, 0..6
+  deadband_ticks: [6]      # target hysteresis (D-BACKLASH), 0 = none
+  die_mass_kg: 0.004
+  die_friction: 1.0
+  table_friction: 0.8
+```
+
+`from_yaml` refuses the file unless every joint has `heldout_rms_pct <= 5` (`compare_real.MAX_RMS_PCT`); pass
+`allow_unverified=True` to use the release-0 prior (reach training on v0; die-to-zone waits for release >= 1, plan
+D-DIE-PARAMS). Keys are strict: a missing or unknown key is an error.

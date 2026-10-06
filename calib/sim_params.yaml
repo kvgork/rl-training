@@ -1,0 +1,26 @@
+# Simulator parameters (FS7). Schema: calib/README.md. Written by so101_rl.sim.sysid (params.SimParams.to_yaml).
+# meta.version 0 = the MJCF prior (unverified: heldout_rms_pct null); >= 1 = fitted on the real arm (HS3).
+version: 1
+meta:
+  version: 0
+  date: '2026-10-06'
+  git_sha: dcc03092eff85fdaed537a6671d4c244f1374786
+  mjcf_sha256: 6d8155e7dbf546301151602c69126fb3b90b7d5fe03eb7fd1f4f3c6db43ef6d8
+  excitation_run: none (MJCF prior)
+  fit_rms_pct: {}
+  heldout_rms_pct: null
+  spread: {}
+  backend: mjcf-prior
+  notes: [upstream sts3215 class values (so101_new_calib.xml); replaced by the HS3 fit (release >= 1)]
+params:
+  kp: [998.22, 998.22, 998.22, 998.22, 998.22, 998.22]
+  kv: [2.731, 2.731, 2.731, 2.731, 2.731, 2.731]
+  damping: [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
+  frictionloss: [0.052, 0.052, 0.052, 0.052, 0.052, 0.052]
+  armature: [0.028, 0.028, 0.028, 0.028, 0.028, 0.028]
+  forcerange: [3.35, 3.35, 3.35, 3.35, 3.35, 3.35]
+  delay_ticks: 0
+  deadband_ticks: [0, 0, 0, 0, 0, 0]
+  die_mass_kg: 0.004
+  die_friction: 1.0
+  table_friction: 0.8
