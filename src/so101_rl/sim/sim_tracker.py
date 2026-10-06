@@ -18,9 +18,10 @@ blob, bad depth or an occluding nearer object):
   a per-episode rigid error in the base frame: a small rotation of the camera pose (``rot_bias_max_rad``, about
   the camera centre) and a constant offset (``bias_max_m``, the hand-eye residual).
 
-The reported position is the die CENTRE (FS3 ``die_xyz``: "last-known die centroid"). Note for H8: the real
-tracker deprojects the median depth of the TOP face, i.e. ~8 mm above the centre; whoever wires the real object
-table into the FS3 observation must apply the same convention (open item, not handled here).
+The reported position is the die CENTRE (FS3 ``die_xyz``: "last-known die centroid"). The real tracker
+deprojects the median depth of the TOP face (~8 mm above the centre) and converts it to the centroid with
+``HsvDepthDieTracker.centroid_base`` before it is published in the object table (integration 2026-10-06;
+``tests/test_die_convention.py`` compares both trackers on rendered scenes).
 
 Occluder boxes are passed as ``jaw_centers`` / ``jaw_half`` ``[N, M, 3]`` (FS6 names) plus the optional
 ``jaw_rot [N, M, 3, 3]`` (an additive keyword: without it the boxes are base-frame axis-aligned).
