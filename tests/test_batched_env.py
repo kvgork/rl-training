@@ -87,6 +87,7 @@ def test_action_scaling_is_f7_rule(scene, mcfg, mcal):
     env = _env(scene, mcfg, mcal, n=6)
     env.start_noise_ticks = 0
     env.reset(phase_randomise=False)
+    env.goal.fill_(5.0)  # unreachable: a goal drawn next to the home tip would succeed and auto-reset the world
     a = torch.eye(6, device=env.device)
     st = env.step(a)
     applied = st.info["applied_delta_ticks"].cpu().numpy()
@@ -243,23 +244,41 @@ def test_trip_on_nan_action_truncates(scene, mcfg, mcal):
 
 @gpu
 def test_goal_sampler_matches_numpy_bounds(scene, mcfg, mcal):
-    """The torch goal sampler stays inside ``task.goal_bounds`` (the numpy GoalBounds shared with the real env),
-    covers it, and only proposes FK-reachable goals (interim voxel table; SR1's ``BoxGoalSampler`` adds its own
-    FK-reachability filter on the same bounds - the cross-test with it lands when both units are merged)."""
+    """The batched env draws reach goals from the real env's ``BoxGoalSampler`` (one sampler, FS12): inside
+    ``task.goal_bounds``, covering them, every goal in the shared FK-reachability table, and the SAME table
+    object the real ``So101GoalEnv`` uses."""
+    from so101_rl.env.goal_env import So101GoalEnv
+    from so101_rl.env.goals import FALLBACK_GOAL
+
     env = _env(scene, mcfg, mcal, n=512)
-    g = torch.cat([env._sample_goals() for _ in range(200)]).double().cpu().numpy()  # 1e5 samples
-    gb = REACH.goal_bounds
-    assert gb.contains_np(g).all()
-    assert (np.abs(g.min(0) - gb.lo) < 0.02).all() and (np.abs(g.max(0) - gb.hi) < 0.03).all()
-    fallback = np.all(np.isclose(g, (0.20, 0.0, 0.15), atol=1e-6), axis=1).mean()
-    assert fallback < 1e-3
-    ref = gb.sample_np(len(g), np.random.default_rng(0))
-    vox, dims = env._reachable_table().cpu().numpy(), env._vox_dims.cpu().numpy()
-    idx = np.floor((ref - gb.lo) / 0.01).astype(int)
-    reach_frac = vox[(idx[:, 0] * dims[1] + idx[:, 1]) * dims[2] + idx[:, 2]].mean()
-    print(f"FK-reachable fraction of the goal bounds: {reach_frac:.3f}")
-    assert reach_frac > 0.5
-    env.close()
+    try:
+        g = torch.cat([env._sample_goals() for _ in range(200)]).double().cpu().numpy()  # 1e5 samples
+        gb = REACH.goal_bounds
+        assert env.goal_sampler.bounds is gb
+        assert gb.contains_np(g).all()
+        assert (np.abs(g.min(0) - gb.lo) < 0.02).all() and (np.abs(g.max(0) - gb.hi) < 0.03).all()
+        fallback = np.all(np.isclose(g, FALLBACK_GOAL, atol=1e-6), axis=1).mean()
+        assert fallback < 1e-3
+        assert env.goal_sampler.reachable(g).all()  # the numpy lookup of the real env accepts every sim goal
+        real = So101GoalEnv(_NullBackend(mcfg, mcal), mcfg, REACH)
+        assert real.goal_sampler.keys is env.goal_sampler.keys  # literally the same reachable set
+        reach_frac = env.goal_sampler.reachable(gb.sample_np(len(g), np.random.default_rng(0))).mean()
+        print(f"FK-reachable fraction of the goal bounds: {reach_frac:.3f}")
+        assert reach_frac > 0.5
+    finally:
+        env.close()
+
+
+class _NullBackend:
+    """Enough of ``EnvBackend`` to construct ``So101GoalEnv`` (its sampler) without a servo."""
+
+    def __init__(self, cfg, calibration) -> None:
+        from so101_rl.safety.fk import KinematicChain, So101FK
+
+        self._fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
+
+    def fk(self):
+        return self._fk
 
 
 @gpu

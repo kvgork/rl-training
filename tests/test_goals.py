@@ -93,3 +93,47 @@ def test_fixed_sampler_and_protocol(sampler):
     g = f.sample(np.random.default_rng(0))
     g[0] = 9.0  # a copy: the fixed goal is not mutable through the sample
     np.testing.assert_array_equal(f.sample(np.random.default_rng(0)), [0.22, 0.10, -0.012])
+
+
+# ---------------------------------------------------------------- one sampler for both envs (integration)
+def test_torch_front_end_draws_from_the_same_reachable_set(sampler):
+    """``sample_torch`` (the batched env's path) and ``sample_n`` (the real env's path) share bounds and keys:
+    every torch goal passes the numpy bounds and the numpy reachability lookup, and the two lookups agree bit
+    for bit on arbitrary points."""
+    gen = torch.Generator().manual_seed(0)
+    g = torch.cat([sampler.sample_torch(4096, gen) for _ in range(10)])
+    assert g.dtype == torch.float32 and g.shape == (40960, 3)
+    gn = g.double().numpy()
+    assert REACH.goal_bounds.contains_np(gn).all()
+    assert sampler.reachable(gn).all()
+    pts = REACH.goal_bounds.sample_np(50_000, np.random.default_rng(11)) + np.random.default_rng(12).normal(
+        0, 0.02, (50_000, 3)
+    )
+    np.testing.assert_array_equal(sampler.reachable_torch(torch.as_tensor(pts)).numpy(), sampler.reachable(pts))
+    np.testing.assert_array_equal(sampler.contains_torch(torch.as_tensor(pts)).numpy(), REACH.goal_bounds.contains_np(pts))
+
+
+def test_torch_and_numpy_goal_distributions_match(sampler):
+    """Same set, same (uniform) distribution: per-axis means and spreads of the two front ends agree."""
+    gt = sampler.sample_torch(50_000, torch.Generator().manual_seed(1)).double().numpy()
+    gn = sampler.sample_n(50_000, np.random.default_rng(1))
+    np.testing.assert_allclose(gt.mean(0), gn.mean(0), atol=3e-3)
+    np.testing.assert_allclose(gt.std(0), gn.std(0), atol=3e-3)
+
+
+def test_torch_sampler_falls_back_when_nothing_is_reachable(sampler, monkeypatch):
+    from so101_rl.env.goals import FALLBACK_GOAL
+
+    with pytest.raises(ValueError, match="candidates"):
+        sampler.sample_torch(8, torch.Generator(), candidates=0)
+    monkeypatch.setattr(sampler, "reachable_torch", lambda x: torch.zeros(x.shape[:-1], dtype=torch.bool))
+    g = sampler.sample_torch(8, torch.Generator().manual_seed(0))
+    np.testing.assert_allclose(g.numpy(), np.tile(FALLBACK_GOAL, (8, 1)), atol=1e-7)
+    assert sampler.reachable(np.asarray(FALLBACK_GOAL)[None]).all() and REACH.goal_bounds.contains_np(FALLBACK_GOAL)
+
+
+def test_the_real_and_batched_envs_share_one_table(sampler, cfg, fk):
+    """Both envs construct ``BoxGoalSampler(task.goal_bounds, fk, cfg.joints, seed=0)``: the per-process cache
+    hands both the same key array, so they cannot drift apart."""
+    again = BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0)
+    assert again.keys is sampler.keys and not sampler.keys.flags.writeable

@@ -24,8 +24,9 @@ episode. ``info["trips"]`` / ``info["clamped_mask"]`` are ORed over the step's t
 is the command's complete post-clamp delta (the LOGGED action, L4).
 
 Resets (``reset``): the arm at ``home`` plus uniform +-``start_noise_ticks`` (30) on the five arm joints, FK
-checked inside the box (8 tries, else exact home; no host sync); reach goals from ``task.goal_bounds`` by a torch
-rejection sampler (32 candidates, fallback (0.20, 0, 0.15)) with an FK-reachability voxel table; the die task places the die at rest in the start well
+checked inside the box (8 tries, else exact home; no host sync); reach goals from the real env's ``BoxGoalSampler``
+(``env/goals.py``: ``task.goal_bounds`` + the shared FK-reachability table; ``sample_torch``: 32 candidates per
+world, fallback (0.20, 0, 0.15)); the die task places the die at rest in the start well
 (``die_start``: xy ~ N(centre, sigma) clipped so the die footprint stays on the flat well floor for its yaw,
 yaw uniform, z = table + 8 mm, zero velocity; decision D-TRAY) and the goal is the zone centre at resting height.
 The chain is resynced to the reset's present ticks (``resync_target`` semantics), the delay FIFO pre-filled with
@@ -56,9 +57,10 @@ import numpy as np
 import torch
 
 from so101_rl.config import CENTER_TICK, JOINT_NAMES, N_JOINTS, TICKS_PER_REV, MotorCalibration, So101Config
+from so101_rl.env.goals import BoxGoalSampler
 from so101_rl.env.obs import PRIV_OBS, DieObsT, build_policy_obs_torch
 from so101_rl.env.tasks import DIE_HALF_EDGE_M, TaskSpec, debounce_torch, reward_torch, success_torch
-from so101_rl.safety.fk import KinematicChain
+from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.types import TripCause
 from so101_rl.sim.batched_servo import BatchedServoChain, ChainOut
 from so101_rl.sim.gripper_map import gripper_range_rad, gripper_ticks_per_rad
@@ -71,10 +73,7 @@ __all__ = ["TRUNCATING_TRIPS", "BatchedGoalEnv", "BatchedStep", "ModelSimParams"
 _RAD_PER_TICK = 2.0 * math.pi / TICKS_PER_REV
 TRUNCATING_TRIPS = int(TripCause.NAN | TripCause.RANGE | TripCause.BOX_PRESENT)  # D-TRIPS
 GRIPPER = N_JOINTS - 1
-_GOAL_CANDIDATES = 32
-_VOXEL_M = 0.01  # reachability table resolution
 _START_TRIES = 8
-_FALLBACK_GOAL = (0.20, 0.0, 0.15)
 _WELL_HALF_M = 0.0115  # flat floor of the start well (assets/so101/so101_rl_scene.xml tray), half width
 
 
@@ -225,12 +224,11 @@ class BatchedGoalEnv:
         self._home_ctrl = torch.as_tensor(home.ctrl, dtype=torch.float32, device=dev)
 
         # ---- goals
-        gb = task.goal_bounds
-        self._goal_lo = torch.as_tensor(gb.lo, dtype=torch.float64, device=dev)
-        self._goal_hi = torch.as_tensor(gb.hi, dtype=torch.float64, device=dev)
-        self._goal_r = float(gb.radius_max_m)
-        self._reach_vox: torch.Tensor | None = None
-        self._vox_dims: torch.Tensor | None = None
+        # one sampler for the real and the batched env (FS12): same GoalBounds, same FK-reachability table
+        self.goal_sampler: BoxGoalSampler | None = None
+        if task.zone is None:
+            fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
+            self.goal_sampler = BoxGoalSampler(task.goal_bounds, fk=fk, limits=cfg.joints, seed=0)
         self._zone_goal = (
             torch.as_tensor(task.zone.goal_xyz(), dtype=torch.float32, device=dev) if task.zone is not None else None
         )
@@ -346,40 +344,10 @@ class BatchedGoalEnv:
         pr[:, P.tracker_delay] = lat[:, None]
 
     # ------------------------------------------------------------------ reset
-    def _reachable_table(self) -> torch.Tensor:
-        """bool voxel grid (``_VOXEL_M``) over the goal bounds: True where the FK of a joint configuration within
-        the joint limits lands (2e5 uniform joint samples, deterministic). Interim FK-reachability filter until
-        SR1's ``BoxGoalSampler`` table is shared (FS12 cross-test, open item)."""
-        if self._reach_vox is None:
-            g = torch.Generator(device=self.device).manual_seed(12345)
-            lo = torch.as_tensor(np.asarray(self.cfg.joints.min_ticks, np.int64), device=self.device)
-            hi = torch.as_tensor(np.asarray(self.cfg.joints.max_ticks, np.int64), device=self.device)
-            dims = torch.ceil((self._goal_hi - self._goal_lo) / _VOXEL_M).to(torch.int64) + 1
-            vox = torch.zeros(int(dims.prod()), dtype=torch.bool, device=self.device)
-            xyz = torch.zeros((50_000, 3), dtype=torch.float64, device=self.device)
-            for _ in range(4):
-                u = torch.rand((50_000, N_JOINTS), generator=g, device=self.device, dtype=torch.float64)
-                t = (lo + u * (hi - lo).double()).round().to(torch.int64)
-                p = self.chain.fk_tip(t, xyz)
-                inside = ((p >= self._goal_lo) & (p <= self._goal_hi)).all(dim=1)
-                idx = ((p - self._goal_lo) / _VOXEL_M).floor().to(torch.int64)
-                flat = (idx[:, 0] * dims[1] + idx[:, 1]) * dims[2] + idx[:, 2]
-                vox[flat[inside]] = True
-            self._reach_vox, self._vox_dims = vox, dims
-        return self._reach_vox
-
     def _sample_goals(self) -> torch.Tensor:
-        n, g = self.nworld, self._gen
-        u = torch.rand((n, _GOAL_CANDIDATES, 3), generator=g, device=self.device, dtype=torch.float64)
-        cand = self._goal_lo + u * (self._goal_hi - self._goal_lo)
-        vox, dims = self._reachable_table(), self._vox_dims
-        idx = ((cand - self._goal_lo) / _VOXEL_M).floor().to(torch.int64)
-        flat = (idx[..., 0] * dims[1] + idx[..., 1]) * dims[2] + idx[..., 2]
-        ok = (cand.norm(dim=-1) <= self._goal_r) & vox[flat]
-        first = torch.argmax(ok.to(torch.int8), dim=1)
-        pick = cand[self._arange, first]
-        fb = torch.tensor(_FALLBACK_GOAL, dtype=torch.float64, device=self.device)
-        return torch.where(ok.any(dim=1)[:, None], pick, fb).float()
+        """Reach goals for every world from the shared ``BoxGoalSampler`` (env/goals.py, the real env's sampler:
+        same bounds, same FK-reachability table)."""
+        return self.goal_sampler.sample_torch(self.nworld, self._gen, device=self.device)
 
     def _start_qpos(self) -> torch.Tensor:
         """home + uniform +-start_noise_ticks on the arm joints, FK inside the box (fixed tries, no host sync)."""

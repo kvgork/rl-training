@@ -1,16 +1,22 @@
-"""Goal samplers for the real-arm / reference env (FS12 ``BoxGoalSampler``; Phase 0 Task 8.2's ``goals.py``).
+"""The ONE reach-goal sampler of the real-arm env AND the batched sim env (FS12 ``BoxGoalSampler``, FS3/FS4).
 
-The bounds are the task's :class:`~so101_rl.env.tasks.GoalBounds` -- the SAME object the batched env's torch
-sampler uses (``REACH.goal_bounds``): the workspace box shrunk by ``margin_m``, z above the kinematic floor and at
-most ``radius_max_m`` from the base. On top of the bounds this sampler rejects goals the arm cannot reach: a
-reachability table is built once from the FK of uniformly sampled joint configurations inside the joint limits
-(voxels of ``voxel_m``; a goal is kept when its voxel holds at least one FK sample). The table is deterministic
-in (bounds, limits, chain, seed) and cached per process.
+The bounds are the task's :class:`~so101_rl.env.tasks.GoalBounds` (``REACH.goal_bounds``): the workspace box
+shrunk by ``margin_m``, z above the kinematic floor and at most ``radius_max_m`` from the base. On top of the
+bounds the sampler rejects goals the arm cannot reach: a reachability table is built once from the FK of
+uniformly sampled joint configurations inside the joint limits (voxels of ``voxel_m``; a goal is kept when its
+voxel holds at least one FK sample). The table is deterministic in (bounds, limits, chain, seed) and cached per
+process, so ``So101GoalEnv`` and ``BatchedGoalEnv`` built from the same config share one table object.
+
+Two front ends over the same set (integration 2026-10-06; SU1's interim torch voxel grid is gone):
+
+* numpy: ``sample`` / ``sample_n`` (rejection sampling with the env's ``np_random``) -- the real / reference env;
+* torch: ``sample_torch`` (a fixed number of candidates per world, no host sync, fallback goal when none is
+  accepted) -- the batched env. ``reachable_torch`` is the same voxel lookup as ``reachable``, bit for bit.
 """
 
 from __future__ import annotations
 
-from typing import Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -19,10 +25,16 @@ from so101_rl.safety.fk import N_ARM_JOINTS, So101FK
 
 from .tasks import GoalBounds
 
-__all__ = ["BoxGoalSampler", "FixedGoalSampler", "GoalSampler"]
+if TYPE_CHECKING:
+    import torch
+
+__all__ = ["FALLBACK_GOAL", "BoxGoalSampler", "FixedGoalSampler", "GoalSampler", "fk_tip_batch"]
 
 REACH_TABLE_SAMPLES: Final[int] = 500_000
 VOXEL_M: Final[float] = 0.01
+TORCH_CANDIDATES: Final[int] = 32  # per world and call of ``sample_torch``
+FALLBACK_GOAL: Final[tuple[float, float, float]] = (0.20, 0.0, 0.15)  # FK-reachable, inside REACH.goal_bounds
+_KEY_OFFSET: Final[int] = 1 << 20
 _TABLE_CACHE: dict[tuple, np.ndarray] = {}  # reachability tables are deterministic in their inputs
 
 
@@ -98,9 +110,15 @@ class BoxGoalSampler:
             keys.flags.writeable = False
             _TABLE_CACHE[ck] = keys
         self._keys = keys
+        self._keys_t: dict[str, torch.Tensor] = {}
+
+    @property
+    def keys(self) -> np.ndarray:
+        """Sorted int64 voxel keys of the reachable set (read-only; shared through the per-process cache)."""
+        return self._keys
 
     def _key(self, xyz: np.ndarray) -> np.ndarray:
-        idx = np.floor(np.asarray(xyz, np.float64) / self.voxel_m).astype(np.int64) + (1 << 20)
+        idx = np.floor(np.asarray(xyz, np.float64) / self.voxel_m).astype(np.int64) + _KEY_OFFSET
         return (idx[..., 0] << 42) | (idx[..., 1] << 21) | idx[..., 2]
 
     def reachable(self, xyz: np.ndarray) -> np.ndarray:
@@ -123,3 +141,53 @@ class BoxGoalSampler:
 
     def sample(self, rng: np.random.Generator) -> np.ndarray:
         return self.sample_n(1, rng)[0]
+
+    # ------------------------------------------------------------------ torch front end (batched env)
+    def _keys_on(self, device: torch.device) -> torch.Tensor:
+        import torch
+
+        k = self._keys_t.get(str(device))
+        if k is None:
+            k = self._keys_t[str(device)] = torch.as_tensor(self._keys, dtype=torch.int64, device=device)
+        return k
+
+    def reachable_torch(self, xyz: torch.Tensor) -> torch.Tensor:
+        """bool[...] -- ``reachable`` on a torch tensor (float64 math, the same keys; no host sync)."""
+        import torch
+
+        keys = self._keys_on(xyz.device)
+        idx = torch.floor(xyz.double() / self.voxel_m).to(torch.int64) + _KEY_OFFSET
+        k = (idx[..., 0] << 42) | (idx[..., 1] << 21) | idx[..., 2]
+        pos = torch.searchsorted(keys, k.reshape(-1)).clamp_(0, keys.numel() - 1).reshape(k.shape)
+        return keys[pos] == k
+
+    def contains_torch(self, xyz: torch.Tensor) -> torch.Tensor:
+        """bool[...] -- ``bounds.contains_np`` on a torch tensor (float64 math)."""
+        import torch
+
+        x = xyz.double()
+        lo = torch.as_tensor(self.bounds.lo, dtype=torch.float64, device=x.device)
+        hi = torch.as_tensor(self.bounds.hi, dtype=torch.float64, device=x.device)
+        return ((x >= lo) & (x <= hi)).all(dim=-1) & (x.norm(dim=-1) <= self.bounds.radius_max_m)
+
+    def sample_torch(
+        self, n: int, generator: torch.Generator, *, candidates: int = TORCH_CANDIDATES, device: torch.device | None = None
+    ) -> torch.Tensor:
+        """``n`` goals float32[n, 3] on ``generator``'s device: per row the first of ``candidates`` uniform draws in
+        the bounds' box that lies in the bounds AND in the reachable set (tested on the float32-rounded value
+        that is returned), else :data:`FALLBACK_GOAL`. Fixed work, no host sync (the batched env's reset)."""
+        import torch
+
+        if candidates < 1:
+            raise ValueError(f"sample_torch: candidates must be >= 1, got {candidates}")
+        dev = device if device is not None else generator.device
+        lo = torch.as_tensor(self.bounds.lo, dtype=torch.float64, device=dev)
+        hi = torch.as_tensor(self.bounds.hi, dtype=torch.float64, device=dev)
+        u = torch.rand((n, candidates, 3), generator=generator, device=dev, dtype=torch.float64)
+        cand = (lo + u * (hi - lo)).float()
+        c64 = cand.double()
+        ok = self.contains_torch(c64) & self.reachable_torch(c64)
+        first = torch.argmax(ok.to(torch.int8), dim=1)
+        pick = cand[torch.arange(n, device=dev), first]
+        fb = torch.tensor(FALLBACK_GOAL, dtype=torch.float32, device=dev)
+        return torch.where(ok.any(dim=1)[:, None], pick, fb)
