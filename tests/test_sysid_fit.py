@@ -287,3 +287,20 @@ def test_warp_fit_finds_delay_and_passes_heldout(truth_run, prior):
                          calibration=cal, cfg=cfg)
     assert res.backend == "warp" and res.params.delay_ticks == 3
     assert max(res.heldout_rms_pct.values()) < 1.0
+
+
+def test_shrinking_grid_includes_the_prior_and_reports_flat_valleys():
+    """The 1-D block search evaluates the prior (x = 0) first, and a flat objective is reported as a wide spread
+    (not the shrinking step), so a scalar 1-D block can still be declared unidentified."""
+    from so101_rl.sim.sysid.fit import UNIDENTIFIED_SPREAD, _ShrinkingGrid1D
+
+    for pop in (2, 7, 8):
+        assert any(x[0] == 0.0 for x in _ShrinkingGrid1D(pop, 1.6).ask())
+    sharp, flat = _ShrinkingGrid1D(8, 1.6), _ShrinkingGrid1D(8, 1.6)
+    for _ in range(25):
+        xs = sharp.ask()
+        sharp.tell(xs, [float((x[0] - 0.3) ** 2) for x in xs])
+        xs = flat.ask()
+        flat.tell(xs, [1.0 + 1e-6 * float(x[0] ** 2) for x in xs])
+    assert abs(sharp.result.xfavorite[0] - 0.3) < 1e-3 and sharp.result.stds[0] < 0.1
+    assert flat.result.stds[0] > UNIDENTIFIED_SPREAD

@@ -137,3 +137,8 @@ def test_the_real_and_batched_envs_share_one_table(sampler, cfg, fk):
     hands both the same key array, so they cannot drift apart."""
     again = BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0)
     assert again.keys is sampler.keys and not sampler.keys.flags.writeable
+
+
+def test_torch_sampler_refuses_a_device_mismatch(sampler):
+    with pytest.raises(ValueError, match="generator on"):
+        sampler.sample_torch(4, torch.Generator(), device=torch.device("meta"))

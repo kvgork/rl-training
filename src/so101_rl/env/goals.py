@@ -111,6 +111,9 @@ class BoxGoalSampler:
             _TABLE_CACHE[ck] = keys
         self._keys = keys
         self._keys_t: dict[str, torch.Tensor] = {}
+        fb = np.asarray(FALLBACK_GOAL)[None]
+        if not (bounds.contains_np(fb).all() and self.reachable(fb).all()):
+            raise ValueError(f"FALLBACK_GOAL {FALLBACK_GOAL} is outside these goal bounds or not FK-reachable")
 
     @property
     def keys(self) -> np.ndarray:
@@ -180,7 +183,9 @@ class BoxGoalSampler:
 
         if candidates < 1:
             raise ValueError(f"sample_torch: candidates must be >= 1, got {candidates}")
-        dev = device if device is not None else generator.device
+        dev = torch.device(device) if device is not None else generator.device
+        if dev.type != generator.device.type:
+            raise ValueError(f"sample_torch: generator on {generator.device}, samples requested on {dev}")
         lo = torch.as_tensor(self.bounds.lo, dtype=torch.float64, device=dev)
         hi = torch.as_tensor(self.bounds.hi, dtype=torch.float64, device=dev)
         u = torch.rand((n, candidates, 3), generator=generator, device=dev, dtype=torch.float64)

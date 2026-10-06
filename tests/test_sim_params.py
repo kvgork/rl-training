@@ -278,3 +278,12 @@ def test_sysid_package_import_is_lazy():
         "assert not bad, bad; assert p.SimParams"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_servo_group_follows_the_simparams_sign_rules(prior):
+    """kv and armature may be 0 in SimParams, so the group's prior may be too (kp and the scale must be > 0)."""
+    p = replace(prior, kv=np.zeros(6), armature=np.zeros(6))
+    g = ServoGroup.identity(p)
+    g.check(p)
+    with pytest.raises(ValueError, match="kp"):
+        ServoGroup(prior={"kp": np.zeros(6), "kv": prior.kv, "armature": prior.armature}, scale=np.ones(6))

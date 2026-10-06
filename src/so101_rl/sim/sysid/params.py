@@ -491,8 +491,10 @@ class ServoGroup:
         pr = {}
         for k in SERVO_GROUP_FIELDS:
             v = _vec6(f"servo_group.prior.{k}", self.prior[k], dtype=float)
-            if not (np.isfinite(v).all() and (v > 0).all()):
-                raise ValueError(f"servo_group.prior.{k}: every value must be finite and > 0, got {v.tolist()}")
+            ok = (v > 0) if _POSITIVE[k] else (v >= 0)  # the SimParams rule: kp > 0, kv and armature >= 0
+            if not (np.isfinite(v).all() and ok.all()):
+                rule = "> 0" if _POSITIVE[k] else ">= 0"
+                raise ValueError(f"servo_group.prior.{k}: every value must be finite and {rule}, got {v.tolist()}")
             pr[k] = v
         object.__setattr__(self, "prior", pr)
         sc = _vec6("servo_group.scale", self.scale, dtype=float)

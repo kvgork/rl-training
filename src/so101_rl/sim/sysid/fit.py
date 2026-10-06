@@ -273,34 +273,49 @@ class _WarpEvaluator:
 class _ShrinkingGrid1D:
     """Deterministic 1-D bounded search with the ``ask`` / ``tell`` / ``result`` surface the fit uses from cma.
 
-    ``ask`` returns ``popsize`` points evenly spread over ``centre ± width`` (clipped to ``±bound``); ``tell`` moves
-    the centre to the best point seen so far and shrinks the width by ``SHRINK``. Starts at the prior (0) with the
-    whole box. ``result.stds`` = the current half width (the profile spread reports flat valleys, see
-    :func:`profile_spread`)."""
+    ``ask`` returns ``popsize`` points evenly spread over ``centre ± width`` (clipped to ``±bound``), always including
+    the centre itself; ``tell`` moves the centre to the best point seen so far and shrinks the width by ``SHRINK``.
+    Starts at the prior (0) with the whole box. ``result.stds`` = the larger of the current half width and the
+    half span of every point evaluated so far whose objective is within ``FLAT_REL`` of the best (a flat valley
+    therefore reports a wide spread instead of the shrinking step; scalar blocks have no profile spread)."""
 
     SHRINK: Final[float] = 0.6
+    FLAT_REL: Final[float] = 0.02
 
     def __init__(self, popsize: int, bound: float) -> None:
         self.pop, self.bound = int(popsize), float(bound)
         self.centre, self.width = 0.0, float(bound)
         self.best_x, self.best_f = 0.0, math.inf
+        self._seen_x: list[float] = []
+        self._seen_f: list[float] = []
 
     def ask(self) -> list[np.ndarray]:
-        xs = np.clip(self.centre + self.width * np.linspace(-1.0, 1.0, self.pop), -self.bound, self.bound)
+        xs = self.centre + self.width * np.linspace(-1.0, 1.0, self.pop)
+        xs[self.pop // 2] = self.centre  # the centre (first generation: the prior) is always evaluated
+        xs = np.clip(xs, -self.bound, self.bound)
         return [np.array([x]) for x in xs]
 
     def tell(self, xs: Sequence[np.ndarray], fs: Sequence[float]) -> None:
         i = int(np.argmin(fs))
         if fs[i] < self.best_f:
             self.best_f, self.best_x = float(fs[i]), float(xs[i][0])
+        self._seen_x += [float(x[0]) for x in xs]
+        self._seen_f += [float(f) for f in fs]
         self.centre = self.best_x
         self.width = max(self.width * self.SHRINK, 1e-6)
+
+    def _flat_half_span(self) -> float:
+        if not self._seen_f:
+            return 0.0
+        x, f = np.asarray(self._seen_x), np.asarray(self._seen_f)
+        near = x[f <= self.best_f + self.FLAT_REL * abs(self.best_f) + 1e-12]
+        return float((near.max() - near.min()) / 2.0) if near.size else 0.0
 
     @property
     def result(self) -> Any:
         from types import SimpleNamespace
 
-        return SimpleNamespace(xfavorite=np.array([self.centre]), stds=np.array([self.width]))
+        return SimpleNamespace(xfavorite=np.array([self.centre]), stds=np.array([max(self.width, self._flat_half_span())]))
 
 
 def _import_cma():
