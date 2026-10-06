@@ -274,6 +274,8 @@ class SimDieTracker:
         self._burst = torch.zeros(n, dtype=torch.int64, device=dev)  # dropped frames still to come
         self._held = TrackerOut.empty(n, dev)
         self._arange = torch.arange(n, device=dev)
+        self._sig_key: TrackerNoise | None = None
+        self._sig = torch.zeros(3, device=dev)
 
     # ------------------------------------------------------------------ per episode
     def reset(self, mask: torch.Tensor, die_xyz_true: torch.Tensor) -> None:
@@ -333,7 +335,10 @@ class SimDieTracker:
         """One noisy measurement per world: camera-frame noise, then the per-episode rotation about the camera
         centre and the bias."""
         nz = self.noise
-        sig = torch.tensor([nz.sigma_xy_m, nz.sigma_xy_m, nz.sigma_z_m], dtype=torch.float32, device=self.device)
+        if self._sig_key is not nz:  # built once per noise spec: no host->device copy per frame
+            self._sig = torch.tensor([nz.sigma_xy_m, nz.sigma_xy_m, nz.sigma_z_m], dtype=torch.float32, device=self.device)
+            self._sig_key = nz
+        sig = self._sig
         noise_cam = torch.randn((self.nworld, 3), generator=self._gen, device=self.device) * sig
         meas = die + noise_cam @ self._R.T
         return torch.einsum("nij,nj->ni", self.rot, meas - self._t) + self._t + self.bias

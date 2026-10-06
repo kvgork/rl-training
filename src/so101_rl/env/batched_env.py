@@ -387,7 +387,9 @@ class BatchedGoalEnv:
         q = self._home_qpos.expand(n, -1).clone()
         if k <= 0:
             return q
-        home_t = self.q_to_ticks(q[:, :N_JOINTS])
+        home_t = self.q_to_ticks(q[:, self._q_adr])
+        jl_lo = torch.as_tensor(np.asarray(self.cfg.joints.min_ticks, np.int64), device=self.device)
+        jl_hi = torch.as_tensor(np.asarray(self.cfg.joints.max_ticks, np.int64), device=self.device)
         box = self.cfg.box
         lo = torch.tensor([box.x[0], box.y[0], box.z[0]], dtype=torch.float64, device=self.device)
         hi = torch.tensor([box.x[1], box.y[1], box.z[1]], dtype=torch.float64, device=self.device)
@@ -396,13 +398,14 @@ class BatchedGoalEnv:
         for _ in range(_START_TRIES):
             off = torch.randint(-k, k + 1, (n, N_JOINTS), generator=self._gen, device=self.device)
             off[:, GRIPPER] = 0
-            t = home_t + off
+            t = torch.maximum(torch.minimum(home_t + off, jl_hi), jl_lo)  # never start beyond a joint limit
             xyz = self.chain.fk_tip(t, self._xyz)
             ok = ((xyz >= lo) & (xyz <= hi)).all(dim=1) & ~found
             chosen = torch.where(ok[:, None], t, chosen)
             found |= ok
         qa = self.ticks_to_q(chosen).float()
-        q[:, : N_JOINTS - 1] = qa[:, : N_JOINTS - 1]  # gripper stays at the keyframe angle
+        arm = self._q_adr[: N_JOINTS - 1]
+        q[:, arm] = torch.where(found[:, None], qa[:, : N_JOINTS - 1], q[:, arm])  # no valid draw: exact home
         return q
 
     def _place_die(self, q: torch.Tensor) -> None:

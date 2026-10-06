@@ -66,7 +66,10 @@ def _rim_half_extent(model: mujoco.MjModel, center: np.ndarray) -> float:
     inner = min(
         float(np.abs(model.geom_pos[g][:2] - center).max() - model.geom_size[g][:2].min()) for g in ids
     )
-    return inner - DIE_EDGE_M / 2
+    half = inner - DIE_EDGE_M / 2
+    if not half > 0:
+        raise ValueError(f"tray rim leaves no room for the die (half extent {half:.4f} m)")
+    return half
 
 
 def run_tray_check(drops: int = 100, *, seed: int = 0, with_tray: bool = True) -> TrayReport:
