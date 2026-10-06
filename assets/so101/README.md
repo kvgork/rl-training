@@ -54,3 +54,8 @@ pose, resting on the table; `home_ticks`: in-box placeholder, NEEDS H5; qpos and
 calibration). `tests/test_sim_model.py` fails if keyframes and config drift apart. The arm sags from `home` when torque
 is off; it does not from `rest`.
 Jaw box sizes and contact parameters (friction 1.2, condim 4) are first guesses until grasps are compared with hardware.
+The jaw primitives and the die carry `solref="0.004 1" solimp="0.95 0.99 0.001"` (sim track S1.3): with MuJoCo's default
+`solref 0.02` the 4 g die's contacts are so soft against the 3.35 N m gripper that every scripted grasp crushed through
+the die (gripper at its closed limit, die squeezed out upward). With the stiffer values the die is held through a 4 cm
+lift on CPU MuJoCo and MuJoCo Warp alike (`tests/test_batched_parity.py` Layer C: die position within 4.4e-5 m, first
+jaw-die contact on the same servo tick).

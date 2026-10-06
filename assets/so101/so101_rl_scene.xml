@@ -15,9 +15,14 @@
     <!-- Primitive jaw collision geoms (plan sec. 6: mesh-mesh grasp contact is unstable and slow).
          contype 2 / conaffinity 2: collides with the die and the table, never with the (contype 1) arm meshes.
          margin 0 (was 0.0005): MuJoCo Warp 3.14 raises NotImplementedError for box-box / box-mesh pairs with a
-         non-zero margin, and CPU and GPU must run the same model (S0.2, spike 2026-10-05). -->
+         non-zero margin, and CPU and GPU must run the same model (S0.2, spike 2026-10-05).
+         solref 0.004 (= 2 timesteps, the stiffest MuJoCo recommends) / solimp 0.95 0.99 1 mm on the jaw primitives AND the
+         die (sim track S1.3, parity Layer C): with MuJoCo's default solref 0.02 the 4 g die's contacts are so soft
+         against the 3.35 N m gripper that every scripted grasp crushed through it (gripper closed to its limit, die
+         squeezed out upward); with these values the die is held through a 4 cm lift. First guesses until H-series
+         grasp data. -->
     <default class="jaw_col">
-      <geom type="box" contype="2" conaffinity="2" group="4" rgba="0.9 0.2 0.2 0.3" friction="1.2 0.01 0.001" condim="4" margin="0"/>
+      <geom type="box" contype="2" conaffinity="2" group="4" rgba="0.9 0.2 0.2 0.3" friction="1.2 0.01 0.001" condim="4" margin="0" solref="0.004 1" solimp="0.95 0.99 0.001"/>
     </default>
     <!-- D-TRAY (plan §10 2026-10-05, sim track S1.3): static start-well tray. contype 4 / conaffinity 0 with the die's
          conaffinity bit 4: the tray collides with the DIE ONLY. Not with the jaw primitives (deviation from the plan's
@@ -30,7 +35,7 @@
       <geom type="box" contype="4" conaffinity="0" priority="1" friction="0.15 0.005 0.0001" condim="3" rgba="0.55 0.6 0.65 1" group="1"/>
     </default>
     <default class="die">
-      <geom type="box" size="0.008 0.008 0.008" mass="0.004" contype="2" conaffinity="7" friction="1.0 0.01 0.001" condim="4" rgba="0.8 0.1 0.1 1"/>
+      <geom type="box" size="0.008 0.008 0.008" mass="0.004" contype="2" conaffinity="7" friction="1.0 0.01 0.001" condim="4" rgba="0.8 0.1 0.1 1" solref="0.004 1" solimp="0.95 0.99 0.001"/>
     </default>
   </default>
 

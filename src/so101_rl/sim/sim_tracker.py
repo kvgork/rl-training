@@ -305,6 +305,39 @@ class SimDieTracker:
         h.age_frames.masked_fill_(m, NEVER_SEEN_AGE)
         h.confidence.masked_fill_(m, 0.0)
 
+    def prime(self, mask: torch.Tensor, die_xyz_true: torch.Tensor, out: TrackerOut | None = None) -> None:
+        """After :meth:`reset`: fill the masked worlds' whole FIFO with noisy measurements of the (resting) die,
+        visible when in view, as if the camera had been watching it during the reset (the gripper is at ``home``,
+        never over the start well). Other worlds are untouched (the shared FIFO head does not move)."""
+        m = mask.to(device=self.device, dtype=torch.bool)
+        die = die_xyz_true.float()
+        ok = self.in_view(die) & m
+        K = self.max_latency + 1
+        for k in range(K):
+            meas = self._measure(die)
+            self._ring_xyz[:, k] = torch.where(m[:, None], meas, self._ring_xyz[:, k])
+            self._ring_ok[:, k] = torch.where(m, ok, self._ring_ok[:, k])
+            self._ring_conf[:, k] = torch.where(m, ok.float(), self._ring_conf[:, k])
+        h = self._held
+        idx = (self._head - self.latency) % K
+        e_xyz = self._ring_xyz[self._arange, idx]
+        h.xyz.copy_(torch.where(ok[:, None], e_xyz, h.xyz))
+        h.visible.copy_(torch.where(m, ok, h.visible))
+        h.age_frames.copy_(torch.where(ok, torch.zeros_like(h.age_frames), h.age_frames))
+        h.confidence.copy_(torch.where(m, ok.float(), h.confidence))
+        if out is not None:
+            for a in ("xyz", "visible", "age_frames", "confidence"):
+                getattr(out, a).copy_(getattr(h, a))
+
+    def _measure(self, die: torch.Tensor) -> torch.Tensor:
+        """One noisy measurement per world: camera-frame noise, then the per-episode rotation about the camera
+        centre and the bias."""
+        nz = self.noise
+        sig = torch.tensor([nz.sigma_xy_m, nz.sigma_xy_m, nz.sigma_z_m], dtype=torch.float32, device=self.device)
+        noise_cam = torch.randn((self.nworld, 3), generator=self._gen, device=self.device) * sig
+        meas = die + noise_cam @ self._R.T
+        return torch.einsum("nij,nj->ni", self.rot, meas - self._t) + self._t + self.bias
+
     # ------------------------------------------------------------------ geometry
     def _project(self, p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """base [..., 3] -> (uv [..., 2] pixels, depth [...] metres along the optical axis)."""
@@ -396,7 +429,6 @@ class SimDieTracker:
         over = (horiz < nz.occlusion_radius_m) & (tip_xyz.float()[:, 2] > die[:, 2])
         base_ok = self.in_view(die) & ~over & ~(covered > nz.occlusion_fraction)
         conf = (1.0 - covered).clamp(0.0, 1.0)
-        sig = torch.tensor([nz.sigma_xy_m, nz.sigma_xy_m, nz.sigma_z_m], dtype=torch.float32, device=dev)
         K = self.max_latency + 1
         h = self._held
         for _ in range(int(frames)):
@@ -409,10 +441,7 @@ class SimDieTracker:
             dropped = self._burst > 0
             self._burst = (self._burst - 1).clamp_min(0)
             ok = base_ok & ~dropped
-            # measurement: camera-frame noise, then the per-episode rigid error about the camera centre + bias
-            noise_cam = torch.randn((n, 3), generator=g, device=dev) * sig
-            meas = die + noise_cam @ self._R.T
-            meas = torch.einsum("nij,nj->ni", self.rot, meas - self._t) + self._t + self.bias
+            meas = self._measure(die)
             self._head = (self._head + 1) % K
             self._ring_xyz[:, self._head] = meas
             self._ring_ok[:, self._head] = ok
