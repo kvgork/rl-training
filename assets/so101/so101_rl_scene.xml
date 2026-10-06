@@ -55,7 +55,7 @@
     <!-- Overhead D435 (sim/sim_tracker.py CameraModel nominal pose): 0.614 m above the table at (0.20, 0), looking
          straight down; image x = base +x, image down = base -y. fovy = 2 atan(240 / 615) deg (fy = 615 px at
          640 x 480, so 1 px ~ 1 mm on the table). Replaced by calib/hand_eye.yaml for the tracker when it exists. -->
-    <camera name="overhead" pos="0.20 0 0.594" xyaxes="1 0 0 0 1 0" fovy="42.6331"/>
+    <camera name="overhead" pos="0.20 0 0.594" xyaxes="1 0 0 0 1 0" fovy="42.6358"/>
     <!-- Start-well tray around die_start (0.20, -0.05) (tasks.DIE_TO_ZONE placeholder): a flat 23 x 23 mm well on
          the table, four 50 deg funnel plates out to +-30 mm (22 mm rise; 20 / 35 / 40 deg left dice leaning on the
          slope edge, 45 / 92.5 % returned), and a 26 mm rim. The rim stays 4 mm clear
