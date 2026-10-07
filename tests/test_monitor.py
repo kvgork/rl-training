@@ -195,6 +195,40 @@ def test_tensorboard_events_written(tmp_path):
     assert acc.Scalars("train/success_rate")[0].value == pytest.approx(0.5)
 
 
+def test_tensorboard_rollout_video_is_embedded(tmp_path, monkeypatch):
+    """Plan §10 2026-10-06 "TensorBoard videos": the rollout shows inline in the dashboard. torch's add_video encodes a
+    GIF through ``moviepy.editor`` (moviepy < 2, `train` feature) and silently writes NOTHING without it, so this test
+    reads the event file back. No skip: a missing or incompatible moviepy fails here."""
+    import moviepy.editor  # noqa: F401  (the import torch's make_video needs; moviepy 2.x removed it)
+    import numpy as np
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from so101_rl.viz import video
+
+    t, h, w = 6, 24, 32
+    frames = np.zeros((t, h, w, 3), np.uint8)
+    frames[:, :, :, 0] = np.arange(t, dtype=np.uint8)[:, None, None] * 40  # a changing red channel
+
+    def rec(env, policy, *, env_step, out_dir, worlds, seconds, **kw):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        p = out_dir / f"{env_step}_0.mp4"
+        p.write_bytes(b"x")
+        return RolloutResult([p], t, frames)
+
+    monkeypatch.setattr(video, "record_rollout", rec)
+    m = TrainingMonitor(VizConfig(tensorboard=True, video_every_min=0), _sim(), tmp_path / "run", task="reach", render_cfg=None)
+    m.attach_rollout_env(_StubEnv())
+    assert m.maybe_record(700, lambda o: o, force=True) is not None
+    assert m.viz_disabled == 0
+    m.close()
+    acc = EventAccumulator(str(tmp_path / "run" / "tensorboard"), size_guidance={"images": 0})
+    acc.Reload()
+    assert "rollout/world0" in acc.Tags()["images"], acc.Tags()
+    ev = acc.Images("rollout/world0")[0]
+    assert ev.step == 700 and (ev.width, ev.height) == (w, h)
+    assert ev.encoded_image_string[:6] in (b"GIF87a", b"GIF89a") and len(ev.encoded_image_string) > 100
+
+
 class _StubEnv:
     nworld = 4
 

@@ -34,7 +34,8 @@ The held-out RMS (the compare-real definition: quantised, replayed OPEN LOOP fro
 over the held-out segments: excitation kinds in ``--heldout-kinds`` plus a
 seeded 20 % time window of every other segment) is the gate: ``sysid-fit`` writes ``--out`` only when every joint is
 at most ``MAX_RMS_PCT`` (1 % since plan §10 2026-10-06; it was 5 %, blind to a 3-tick delay); otherwise
-``<run>/sim_params.unverified.yaml`` and exit 1. A
+``<run>/sim_params.unverified.yaml`` and exit 1. ``--max-pct`` may only tighten the gate: a value above
+``MAX_RMS_PCT`` (or <= 0) is refused with exit 2 before anything is fitted or written. A
 ``<run>/fit_report.json`` (and ``history.csv``) is written either way.
 
 Backends: ``warp`` (MuJoCo Warp, one candidate per world, ``WarpSim.set_world_params``) and ``cpu`` (a spawn pool of
@@ -629,7 +630,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prior", type=Path, default=None, help="prior sim_params yaml (default: the MJCF values)")
     ap.add_argument("--release", type=int, default=1, help="meta.version of the written file (HS3: 1)")
     ap.add_argument("--calibration", type=Path, default=None, help="LeRobot calibration JSON (default: from config)")
-    ap.add_argument("--max-pct", type=float, default=None, help="held-out gate (default: compare_real.MAX_RMS_PCT = 1)")
+    ap.add_argument("--max-pct", type=float, default=None,
+                    help="held-out gate, 0 < max-pct <= compare_real.MAX_RMS_PCT (default: MAX_RMS_PCT = 1); "
+                         "a looser gate is refused (it would write a 'verified' file the 1 %% gate rejects)")
     return ap
 
 
@@ -638,6 +641,11 @@ def main(argv: list[str] | None = None) -> int:
     from so101_rl.sim.model import load_model
 
     args = build_parser().parse_args(argv)
+    if args.max_pct is not None and not 0.0 < args.max_pct <= MAX_RMS_PCT:
+        # A gate looser than the plan's (§10 2026-10-06: 1 %) must never produce a PASS and a verified --out file.
+        print(f"sysid-fit: --max-pct {args.max_pct:g} refused: must be > 0 and <= MAX_RMS_PCT = {MAX_RMS_PCT:g} %",
+              file=sys.stderr)
+        return 2
     base = load_config() if args.calibration is None else None
     calib_path = args.calibration if args.calibration is not None else base.calibration_path
     calibration = load_calibration(Path(calib_path).expanduser())

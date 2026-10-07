@@ -304,3 +304,52 @@ def test_shrinking_grid_includes_the_prior_and_reports_flat_valleys():
         flat.tell(xs, [1.0 + 1e-6 * float(x[0] ** 2) for x in xs])
     assert abs(sharp.result.xfavorite[0] - 0.3) < 1e-3 and sharp.result.stds[0] < 0.1
     assert flat.result.stds[0] > UNIDENTIFIED_SPREAD
+
+
+# ---- CLI gate: --max-pct may only tighten MAX_RMS_PCT ------------------------------------------------------------
+def _fake_cli(monkeypatch, tmp_path, heldout_pct: float):
+    """Patch the fit CLI's data / fit / writer so ``main`` runs in milliseconds; returns the list of written paths."""
+    from types import SimpleNamespace
+
+    from so101_rl.sim.sysid import fit as fitmod
+
+    held = SimpleNamespace(segments=[object()])
+    ds = SimpleNamespace(split=lambda **kw: (SimpleNamespace(segments=[object()]), held))
+    monkeypatch.setattr(fitmod.ExcitationDataset, "from_run", staticmethod(lambda run: ds))
+    res = SimpleNamespace(
+        train_rms_pct=dict.fromkeys(JOINT_NAMES, heldout_pct), heldout_rms_pct=dict.fromkeys(JOINT_NAMES, heldout_pct),
+        params=SimpleNamespace(delay_ticks=0), delay_scores={}, evals=1, wall_s=0.0, group_scale=None, unidentified=[],
+    )
+    monkeypatch.setattr(fitmod, "fit_sim_params", lambda *a, **k: res)
+    monkeypatch.setattr(fitmod, "meta_for", lambda *a, **k: None)
+    written: list[Path] = []
+    monkeypatch.setattr(fitmod, "write_result", lambda r, path, *, meta: written.append(Path(path)))
+    argv = ["--run", str(tmp_path), "--out", str(tmp_path / "sim_params.yaml"), "--backend", "cpu",
+            "--calibration", str(DATA / "so101_follower.calib.json")]
+    return fitmod, argv, written
+
+
+@pytest.mark.parametrize("pct", [MAX_RMS_PCT * 1.0001, 5.0, 0.0, -1.0, float("nan")])
+def test_cli_refuses_a_gate_looser_than_max_rms_pct(monkeypatch, tmp_path, capsys, pct):
+    """A --max-pct above the 1 % gate (or <= 0 / NaN) is refused before anything is fitted or written: no PASS."""
+    fitmod, argv, written = _fake_cli(monkeypatch, tmp_path, heldout_pct=0.5)
+    monkeypatch.setattr(fitmod, "fit_sim_params", lambda *a, **k: pytest.fail("fitted despite a refused gate"))
+    assert fitmod.main([*argv, "--max-pct", str(pct)]) == 2
+    out = capsys.readouterr()
+    assert "PASS" not in out.out + out.err and "refused" in out.err
+    assert written == []
+
+
+@pytest.mark.parametrize("pct", [None, MAX_RMS_PCT, 0.5])
+def test_cli_gate_at_or_below_max_rms_pct_behaves_as_before(monkeypatch, tmp_path, capsys, pct):
+    """At or below MAX_RMS_PCT: a held-out error within the gate PASSes and writes --out; above it writes only the
+    .unverified file and exits 1."""
+    gate = MAX_RMS_PCT if pct is None else pct
+    extra = [] if pct is None else ["--max-pct", str(pct)]
+    fitmod, argv, written = _fake_cli(monkeypatch, tmp_path, heldout_pct=0.9 * gate)
+    assert fitmod.main([*argv, *extra]) == 0
+    assert written == [tmp_path / "sim_params.yaml"] and "PASS" in capsys.readouterr().out
+    fitmod, argv, written = _fake_cli(monkeypatch, tmp_path, heldout_pct=1.1 * gate)
+    assert fitmod.main([*argv, *extra]) == 1
+    out = capsys.readouterr()
+    assert written == [tmp_path / "sim_params.unverified.yaml"] and "PASS" not in out.out + out.err
