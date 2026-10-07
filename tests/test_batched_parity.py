@@ -30,6 +30,7 @@ import pytest
 import torch
 
 from so101_rl.config import N_JOINTS, load_calibration, load_config
+from so101_rl.env.tasks import action_to_delta_np
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.pipeline import SafetyPipeline
 from so101_rl.safety.stuck import StuckActionMonitor
@@ -150,8 +151,8 @@ def corpus(cfg, cal, chain, idx: int) -> np.ndarray:
 
 
 def action_to_delta(acts: np.ndarray, cfg) -> np.ndarray:
-    """F7 rule, in float32 like the batched env: ``rint(action * max_delta_ticks)``."""
-    return np.rint(acts.astype(np.float32) * np.asarray(cfg.action.max_delta_ticks, np.float32))
+    """F7 rule, the one both envs use (``tasks.action_to_delta_np`` / ``_torch``)."""
+    return action_to_delta_np(acts, cfg.action.max_delta_ticks)
 
 
 # ------------------------------------------------------------------------------------------------ CPU rig

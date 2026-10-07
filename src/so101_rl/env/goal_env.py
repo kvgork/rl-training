@@ -11,8 +11,9 @@ One class for both tasks, both backends, and one definition of everything that s
   invisible, zeros until first seen this episode), ``die_age`` = camera frames since it was last seen. Without an
   object table the die is never visible.
 * **Action:** ``delta_ticks = rint(clip(action, -1, 1) * max_delta_ticks)`` (the F7 rule, the only scaling in the
-  code base). A NaN passes through unchanged: the servo's sanitizer trips on it (the env never pre-filters what
-  the safety chain must see).
+  code base: :func:`tasks.action_to_delta_np`, bit-identical to the batched env's ``action_to_delta_torch``). A
+  NaN passes through unchanged: the servo's sanitizer trips on it (the env never pre-filters what the safety chain
+  must see); ±inf clip to ±1.
 * **Reward / success / termination:** ``env/tasks.py`` (FS4): ``compute_reward`` = :func:`tasks.reward_np` with
   the visibility of the stored transition (:func:`tasks.visible_from_info`), and ``step`` uses the very same
   function, so SB3 HER relabelling reproduces the step reward exactly. ``terminated`` = the debounced (and, for
@@ -44,7 +45,7 @@ from so101_rl.safety.types import SmState
 from .backend import EnvBackend, ServoStateStale
 from .goals import BoxGoalSampler, FixedGoalSampler, GoalSampler
 from .obs import DIE_AGE_MAX_FRAMES, GOAL_DIM, DieObs, build_policy_obs_np
-from .tasks import TaskSpec, debounce_np, reward_np, success_np, visible_from_info
+from .tasks import TaskSpec, action_to_delta_np, debounce_np, reward_np, success_np, visible_from_info
 
 __all__ = ["DIE_LABEL", "So101GoalEnv"]
 
@@ -148,8 +149,7 @@ class So101GoalEnv(gymnasium.Env):
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
         if self._needs_reset:
             raise RuntimeError("So101GoalEnv.step() needs reset() first (new env, or after a trip / stalled servo)")
-        a = np.clip(np.asarray(action, dtype=np.float32).reshape(N_JOINTS), -1.0, 1.0)  # NaN stays NaN
-        delta = np.rint(a.astype(np.float64) * self._max_delta).astype(np.float32)
+        delta = action_to_delta_np(np.asarray(action).reshape(N_JOINTS), self._max_delta)  # NaN stays NaN
         state_seq = int(self._st[0]["seq"])
         self._cmd_seq = int(self.backend.send_delta(delta, state_seq, self._episode))
         stalled = False

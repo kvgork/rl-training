@@ -2,7 +2,8 @@
 
 One policy step (10 Hz) of every world, in the order of the real ``ServoCore`` path (``servo/core.py``):
 
-1. ``delta = rint(action * max_delta_ticks)`` in float32 (the F7 rule, the only [-1, 1] -> ticks scaling) and
+1. ``delta = tasks.action_to_delta_torch(action)`` = ``rint(float64(clip(action, -1, 1)) * max_delta_ticks)`` (the
+   F7 rule, bit-identical to the real env's ``action_to_delta_np``: ±inf clip to ±1, NaN passes through) and
    ``BatchedServoChain.new_command`` (sanitize -> rint -> goal += delta -> joint limits; NaN rows trip).
 2. Three servo ticks, ``ticks_remaining`` = 3, 2, 1. Each tick: ``present = q_to_ticks(qpos)`` (the read at the
    START of the tick, MujocoBus quantisation: arm ``rint(sign q / rad_per_tick + 2047)``, gripper through the
@@ -18,9 +19,12 @@ One policy step (10 Hz) of every world, in the order of the real ``ServoCore`` p
 4. Reward / success / debounce through ``env/tasks.py`` (the one definition for sim and real, FS4), episode
    bookkeeping, ``final_*`` (pre-reset copies) and auto-reset of the done worlds.
 
-Episode semantics (F7/FS9): ``terminated`` = debounced success; ``truncated`` = step limit or an emulated trip
-(NAN, RANGE, BOX_PRESENT; decision D-TRIPS), never both. Clamp bits (JOINT_LIMIT, TRACKING, BOX) never end an
-episode. ``info["trips"]`` / ``info["clamped_mask"]`` are ORed over the step's three ticks; ``applied_delta_ticks``
+Episode semantics (F7/FS9, the real env's rule, ``env/tasks.py`` "Episode end"): ``terminated`` = debounced
+success, where the success predicate only counts on a step without an emulated trip (NAN, RANGE, BOX_PRESENT;
+decision D-TRIPS; the sim read never fails, so ``read_ok`` is always true) -- a trip resets the debounce count, so a
+tripped step is never a success; ``truncated`` = step limit OR an emulated trip, independently of ``terminated``
+(on the step-limit step both can be true, exactly like ``So101GoalEnv``). Clamp bits (JOINT_LIMIT, TRACKING, BOX)
+never end an episode. ``info["trips"]`` / ``info["clamped_mask"]`` are ORed over the step's three ticks; ``applied_delta_ticks``
 is the command's complete post-clamp delta (the LOGGED action, L4).
 
 Resets (``reset``): the arm at ``home`` plus uniform +-``start_noise_ticks`` (30) on the five arm joints, FK
@@ -59,7 +63,14 @@ import torch
 from so101_rl.config import CENTER_TICK, JOINT_NAMES, N_JOINTS, TICKS_PER_REV, MotorCalibration, So101Config
 from so101_rl.env.goals import BoxGoalSampler
 from so101_rl.env.obs import PRIV_OBS, DieObsT, build_policy_obs_torch
-from so101_rl.env.tasks import DIE_HALF_EDGE_M, TaskSpec, debounce_torch, reward_torch, success_torch
+from so101_rl.env.tasks import (
+    DIE_HALF_EDGE_M,
+    TaskSpec,
+    action_to_delta_torch,
+    debounce_torch,
+    reward_torch,
+    success_torch,
+)
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.types import TripCause
 from so101_rl.sim.batched_servo import BatchedServoChain, ChainOut
@@ -471,10 +482,10 @@ class BatchedGoalEnv:
         """``action`` float32[N,6] in [-1, 1] -> one policy step of every world (module docstring)."""
         self._check_open()
         n, dev, ws, chain, out = self.nworld, self.device, self.ws, self.chain, self._out
-        a = action.to(device=dev, dtype=torch.float32)
+        a = action.to(device=dev)
         if a.shape != (n, N_JOINTS):
             raise ValueError(f"action must be [{n}, {N_JOINTS}], got {tuple(a.shape)}")
-        chain.new_command(torch.round(a * self._max_delta32))
+        chain.new_command(action_to_delta_torch(a, self._max_delta64))  # F7 rule, = the real env's
         trips = torch.zeros(n, dtype=torch.int64, device=dev)
         clamped = torch.zeros((n, N_JOINTS), dtype=torch.bool, device=dev)
         for k, rem in enumerate((3, 2, 1)):
@@ -520,15 +531,16 @@ class BatchedGoalEnv:
             "applied_action": (self._applied.double() / self._max_delta64).clamp(-1.0, 1.0).float(),
         }
         reward = reward_torch(self._achieved, self.goal, task, visible=vis, info=info_r)
-        pred = success_torch(self._achieved, self.goal, task, visible=vis)
+        tripped = (trips & TRUNCATING_TRIPS) != 0
+        # the real env's rule: a tripped step never counts toward success (read_ok is always true in sim)
+        pred = success_torch(self._achieved, self.goal, task, visible=vis) & ~tripped
         success, self._count = debounce_torch(
             pred, self._count, task, achieved=self._achieved, prev_achieved=self._prev_achieved
         )
         self._prev_achieved.copy_(self._achieved)
         self.episode_step += 1
-        tripped = (trips & TRUNCATING_TRIPS) != 0
         terminated = success
-        truncated = ((self.episode_step >= task.episode_steps) | tripped) & ~terminated
+        truncated = (self.episode_step >= task.episode_steps) | tripped  # So101GoalEnv: may coincide with terminated
         done = terminated | truncated
         info = {
             "applied_delta_ticks": self._applied.clone(),
