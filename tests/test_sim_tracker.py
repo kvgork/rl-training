@@ -1,18 +1,20 @@
 """FS6 SimDieTracker (sim track S1.2), CPU torch."""
 
+import math
+from dataclasses import replace
+
 import mujoco
 import numpy as np
 import pytest
 import torch
 
-from so101_rl.perception.camera import Intrinsics
-from so101_rl.perception.die_tracker import HsvDepthDieTracker
+from so101_rl.perception.camera_calib import load_camera_calib
 from so101_rl.sim.model import TABLE_Z_M, load_model
 from so101_rl.sim.sim_tracker import (
     NEVER_SEEN_AGE,
     NO_NOISE,
     CameraModel,
-    Occluders,
+    DistractorModel,
     SimDieTracker,
     TrackerNoise,
     TrackerOut,
@@ -23,9 +25,21 @@ DIE_Z = TABLE_Z_M + 0.008
 FAR = 1.0  # jaws / tip far away (no occlusion)
 
 
-def _tracker(noise=NO_NOISE, n=1, seed=0):
-    tr = SimDieTracker(CameraModel.nominal(), noise, n, device=CPU, seed=seed)
+CALIB = load_camera_calib()
+CAM = CameraModel.from_calib(CALIB)
+DCAM = CameraModel.from_calib(CALIB, "depth")
+
+
+def _tracker(noise=NO_NOISE, n=1, seed=0, **kw):
+    tr = SimDieTracker(CAM, noise, n, device=CPU, seed=seed, depth_cam=DCAM, **kw)
     return tr, TrackerOut.empty(n, CPU)
+
+
+def _toward_camera(die, dist):
+    """A point ``dist`` m from the die along the ray to the colour camera."""
+    o = torch.tensor(CAM.T_base_cam[:3, 3], dtype=torch.float32)
+    d = o - die
+    return die + dist * d / d.norm(dim=-1, keepdim=True)
 
 
 def _away(n):
@@ -44,18 +58,15 @@ def _start(tr, die, n=1):
     tr.reset(torch.ones(n, dtype=torch.bool), die)
 
 
-def test_camera_matches_scene_overhead_camera():
+def test_camera_model_is_the_scene_d435():
+    from so101_rl.sim.d435 import COLOR_CAM, DEPTH_CAM, camera_T_base
+
     model, data = load_model()
-    cam = CameraModel.nominal()
-    c = model.camera("overhead")
     mujoco.mj_forward(model, data)
-    assert np.allclose(data.cam_xpos[c.id], cam.T_base_cam[:3, 3], atol=1e-9)
-    # MuJoCo camera looks along -z, y up; OpenCV z forward, y down
-    R_mj = data.cam_xmat[c.id].reshape(3, 3)
-    assert np.allclose(R_mj[:, 0], cam.T_base_cam[:3, 0], atol=1e-9)
-    assert np.allclose(-R_mj[:, 1], cam.T_base_cam[:3, 1], atol=1e-9)
-    assert np.allclose(-R_mj[:, 2], cam.T_base_cam[:3, 2], atol=1e-9)
-    assert abs(model.cam_fovy[c.id] - cam.mujoco_fovy_deg()) < 1e-3
+    np.testing.assert_allclose(camera_T_base(model, data, COLOR_CAM), CAM.T_base_cam, atol=1e-9)
+    np.testing.assert_allclose(camera_T_base(model, data, DEPTH_CAM), DCAM.T_base_cam, atol=1e-9)
+    assert (CAM.fx, CAM.cx, DCAM.fx) == (CALIB.color.fx, CALIB.color.cx, CALIB.depth.fx)
+    assert CameraModel.default().T_base_cam.tolist() == CAM.T_base_cam.tolist()
 
 
 def test_visible_die_noise_stats():
@@ -70,42 +81,56 @@ def test_visible_die_noise_stats():
         assert bool(out.visible[0])
         xs.append(out.xyz[0].clone())
     xs = torch.stack(xs).double()
-    std = xs.std(dim=0).numpy()
+    std = (xs @ torch.tensor(CAM.T_base_cam[:3, :3]).double()).std(dim=0).numpy()  # in the camera frame
     assert abs(std[0] / noise.sigma_xy_m - 1) < 0.1
     assert abs(std[1] / noise.sigma_xy_m - 1) < 0.1
-    assert abs(std[2] / noise.sigma_z_m - 1) < 0.1  # optical axis = base -z for the overhead mount
+    assert abs(std[2] / noise.sigma_z_m - 1) < 0.1  # along the optical axis
     bias = (xs.mean(dim=0) - die[0].double()).norm().item()
     assert bias <= noise.bias_max_m + 1e-3
 
 
-def test_occluded_when_tip_over_die():
-    tr, out = _tracker()
+def test_occluded_when_tip_in_front_of_die_with_the_fallback_on():
+    noise = replace(NO_NOISE, occlusion_radius_m=0.02)
+    tr, out = _tracker(noise)
     die = _die()
     _start(tr, die)
-    tip = die + torch.tensor([[0.0, 0.0, 0.005]])
+    tip = _toward_camera(die, 0.05)
     _, c, h = _away(1)
     assert bool(tr.occluded(die, tip, c, h)[0])
     tr.update(die, tip, c, h, 3, out)
     assert not bool(out.visible[0])
+    assert not bool(_tracker()[0].occluded(die, tip, c, h)[0])  # default: off, the boxes decide
 
 
 def test_occluded_by_projected_jaw_boxes():
     tr, _ = _tracker()
     die = _die()
     tip, _, _ = _away(1)
-    centers = (die + torch.tensor([[0.0, 0.0, 0.04]]))[:, None].repeat(1, 4, 1)  # a box 4 cm above the die
+    centers = _toward_camera(die, 0.06)[:, None].repeat(1, 4, 1)  # a box between the die and the camera
     half = torch.full((1, 4, 3), 0.012)
     assert float(tr.covered_fraction(die, centers, half)[0]) > 0.9
     assert bool(tr.occluded(die, tip, centers, half)[0])
-    below = (die + torch.tensor([[0.0, 0.0, -0.03]]))[:, None].repeat(1, 4, 1)  # behind the die: not occluding
-    assert float(tr.covered_fraction(die, below, half)[0]) == 0.0
+    behind = _toward_camera(die, -0.05)[:, None].repeat(1, 4, 1)  # behind the die: not occluding
+    assert float(tr.covered_fraction(die, behind, half)[0]) == 0.0
+
+
+def test_depth_sensor_occlusion_counts():
+    """A box that hides the die from the depth sensor only (14.8 mm beside the colour sensor) still counts."""
+    tr, _ = _tracker()
+    die = _die()
+    o_d = torch.tensor(DCAM.T_base_cam[:3, 3], dtype=torch.float32)
+    p = die + 0.7 * (o_d - die)  # 70 % of the way from the die to the DEPTH sensor (the rays have parted ~1 cm)
+    centers = p[:, None].repeat(1, 1, 1)
+    half = torch.full((1, 1, 3), 0.004)
+    color_only = SimDieTracker(CAM, NO_NOISE, 1, device=CPU, seed=0)
+    assert float(tr.covered_fraction(die, centers, half)[0]) > float(color_only.covered_fraction(die, centers, half)[0])
 
 
 def test_not_occluded_when_tip_away():
     tr, out = _tracker()
     die = _die()
     _start(tr, die)
-    tip = die + torch.tensor([[0.06, 0.0, 0.03]])
+    tip = die + torch.tensor([[0.0, 0.0, 0.05]])  # above the die: the oblique camera still sees it
     _, c, h = _away(1)
     assert not bool(tr.occluded(die, tip, c, h)[0])
     tr.update(die, tip, c, h, 3, out)
@@ -169,7 +194,7 @@ def test_dropout_burst_holds_last_and_ages():
 def test_outside_fov_invisible():
     tr, out = _tracker()
     tip, c, h = _away(1)
-    for x, y in ((0.60, 0.0), (0.20, 0.30), (-0.20, 0.0)):
+    for x, y in ((0.20, 0.60), (0.9, 0.0), (-0.45, 0.0)):  # behind the camera, beside the FOV
         die = _die(x, y)
         _start(tr, die)
         assert not bool(tr.in_view(die)[0]), (x, y)
@@ -185,7 +210,8 @@ def test_per_world_independence():
     die = _die(n=3)
     tr.reset(torch.tensor([True, True, True]), die)
     tip, c, h = _away(3)
-    tip[1] = die[1] + torch.tensor([0.0, 0.0, 0.005])  # only world 1 occluded
+    c[1] = _toward_camera(die[1:2], 0.05)  # only world 1 occluded
+    h[1] = 0.015
     tr.update(die, tip, c, h, 3, out)
     assert out.visible.tolist() == [True, False, True]
     b0 = tr.bias.clone()
@@ -193,70 +219,104 @@ def test_per_world_independence():
     assert torch.equal(tr.bias[0], b0[0]) and torch.equal(tr.bias[2], b0[2])
 
 
-# ---- semantics vs the real tracker on rendered frames ----------------------------------------------------------
-def _configs(model):
-    """20 (arm qpos[6], die xy): 10 gripper-low arm poses x {die under the tip, die 6-8 cm aside}."""
-    rng = np.random.default_rng(5)
-    data = mujoco.MjData(model)
-    tip_id = model.site("gripper_tip").id
-    out = []
-    while len(out) < 20:
-        ticks = np.array([rng.integers(1750, 2350), rng.integers(1300, 2200), rng.integers(2000, 3000),
-                          rng.integers(1700, 2600), rng.integers(1500, 2600)])  # fmt: skip
-        q = np.zeros(model.nq)
-        q[:5] = (ticks - 2047) * 2 * np.pi / 4096
-        q[5] = 0.3
-        q[6:9] = (0.2, -0.05, DIE_Z)
-        q[9] = 1.0
-        data.qpos[:] = q
-        mujoco.mj_forward(model, data)
-        tip = data.site_xpos[tip_id].copy()
-        if not (0.13 < tip[0] < 0.30 and abs(tip[1]) < 0.12 and 0.03 < tip[2] < 0.10):
-            continue
-        out.append((q[:6].copy(), tip[:2] + rng.uniform(-0.003, 0.003, 2)))  # under the tip
-        ang = rng.uniform(0, 2 * np.pi)
-        out.append((q[:6].copy(), tip[:2] + rng.uniform(0.06, 0.08) * np.array([np.cos(ang), np.sin(ang)])))
-    return out
+# ---- semantics vs the real tracker on rendered frames: tests/test_camera_parity.py (calibrated pose) ------------
 
 
-def test_semantics_match_real_tracker_on_synthetic_frames():
-    model, data = load_model()
-    try:
-        renderer = mujoco.Renderer(model, 480, 640)
-    except Exception as exc:  # noqa: BLE001 - no OpenGL context on this host
-        pytest.skip(f"no MuJoCo offscreen rendering: {exc}")
-    cam = CameraModel.nominal()
-    real = HsvDepthDieTracker.from_yaml(
-        Intrinsics(fx=cam.fx, fy=cam.fy, cx=cam.cx, cy=cam.cy, width=640, height=480, depth_scale=0.001)
-    )
-    tr, _ = _tracker()
-    jaws = Occluders(model, CPU)
-    body_ids = [model.body(b).id for b in jaws.bodies]
-    agree, log = 0, []
-    for q, xy in _configs(model):
-        data.qpos[:6] = q
-        die_q = model.jnt_qposadr[model.joint("die_free").id]
-        data.qpos[die_q : die_q + 7] = (xy[0], xy[1], DIE_Z, 1, 0, 0, 0)
-        mujoco.mj_forward(model, data)
-        renderer.update_scene(data, camera="overhead")
-        rgb = renderer.render().copy()
-        renderer.enable_depth_rendering()
-        renderer.update_scene(data, camera="overhead")
-        depth = renderer.render().copy()
-        renderer.disable_depth_rendering()
-        real_visible = real.detect(rgb, depth) is not None
-        die = torch.tensor(data.qpos[die_q : die_q + 3], dtype=torch.float32)[None]
-        tip = torch.tensor(data.site_xpos[model.site("gripper_tip").id], dtype=torch.float32)[None]
-        c, h, rot = jaws.compute(
-            torch.tensor(data.xpos[body_ids], dtype=torch.float32)[None],
-            torch.tensor(data.xquat[body_ids], dtype=torch.float32)[None],
-        )
-        sim_visible = bool(tr.in_view(die)[0]) and not bool(tr.occluded(die, tip, c, h, rot)[0])
-        agree += real_visible == sim_visible
-        log.append((np.round(xy, 3).tolist(), np.round(tip[0].numpy(), 3).tolist(), real_visible, sim_visible))
-    renderer.close()
-    print("\n".join(str(r) for r in log))
-    disagreements = [r for r in log if r[2] != r[3]]
-    print(f"agreement {agree}/20; disagreements (die xy, tip, real, sim): {disagreements}")
-    assert sum(r[2] for r in log) >= 5 and sum(not r[2] for r in log) >= 5  # both verdicts exercised
-    assert agree >= 18
+# ---- camera-pose DR (C.3) ---------------------------------------------------------------------------------------
+def test_true_camera_pose_is_drawn_within_the_dr_range_and_equals_the_measurement_error():
+    noise = replace(NO_NOISE, bias_max_m=0.005, rot_bias_max_rad=math.radians(1.5))
+    tr, out = _tracker(noise, n=256, seed=4)
+    die = _die(n=256)
+    tr.reset(torch.ones(256, dtype=torch.bool), die)
+    R0 = torch.tensor(CAM.T_base_cam[:3, :3], dtype=torch.float32)
+    t0 = torch.tensor(CAM.T_base_cam[:3, 3], dtype=torch.float32)
+    dR = tr.cam_R @ R0.T
+    ang = torch.rad2deg(torch.arccos(((dR.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1, 1)))
+    assert float(ang.max()) <= 1.5 + 1e-3 and float(ang.max()) > 1.0
+    assert float((tr.cam_t - t0).norm(dim=-1).max()) <= 0.005 * 1.001 + 1e-6
+    # the reported position = calibrated camera applied to what the TRUE camera measures
+    tip, c, h = _away(256)
+    tr.update(die, tip, c, h, 1, out)
+    p_cam_true = torch.einsum("nji,nj->ni", tr.cam_R, die - tr.cam_t)  # die in the true camera frame
+    expect = p_cam_true @ R0.T + t0
+    assert torch.allclose(out.xyz, expect, atol=2e-5)
+
+
+def test_noise_widens_to_the_calibration_uncertainty():
+    from so101_rl.perception.camera_calib import CameraPose
+
+    wide = CALIB.with_pose(CameraPose(CALIB.T_base_color, "arm-shape", "x", 2.0, 12.0, 4.0))
+    n = TrackerNoise().with_camera_dr(wide)
+    assert n.bias_max_m == pytest.approx(0.012) and n.rot_bias_max_rad == pytest.approx(math.radians(4.0))
+    assert TrackerNoise().with_camera_dr(CALIB).bias_max_m >= 0.005  # the floor
+
+
+# ---- distractors (C.5) ------------------------------------------------------------------------------------------
+def test_a_larger_distractor_in_view_replaces_the_die():
+    die = _die(0.22, 0.10)
+    tip, c, h = _away(1)
+    small, big = 40.0, 3000.0
+    for area, fp in ((small, False), (big, True)):
+        dm = DistractorModel(fixed_xyz=np.array([[0.25, 0.0, TABLE_Z_M + 0.01]]), fixed_area_px=np.array([area]))
+        tr, out = _tracker(NO_NOISE, distractors=dm)
+        _start(tr, die)
+        tr.update(die, tip, c, h, 1, out)
+        assert bool(out.visible[0])
+        target = torch.tensor([[0.25, 0.0, TABLE_Z_M + 0.01]]) if fp else die
+        assert torch.allclose(out.xyz, target, atol=1e-6), (area, out.xyz)
+        assert bool(tr.false_positive[0]) == fp
+
+
+def test_a_distractor_is_a_false_positive_while_the_die_is_hidden():
+    dm = DistractorModel(fixed_xyz=np.array([[0.25, 0.0, TABLE_Z_M + 0.01]]), fixed_area_px=np.array([60.0]))
+    tr, out = _tracker(NO_NOISE, distractors=dm)
+    die = _die()
+    _start(tr, die)
+    tip, _, _ = _away(1)
+    centers = _toward_camera(die, 0.06)[:, None].repeat(1, 4, 1)
+    tr.update(die, tip, centers, torch.full((1, 4, 3), 0.012), 1, out)
+    assert bool(out.visible[0]) and bool(tr.false_positive[0])
+    out_of_band = DistractorModel(fixed_xyz=dm.fixed_xyz, fixed_area_px=np.array([5000.0]))
+    tr, out = _tracker(NO_NOISE, distractors=out_of_band)
+    _start(tr, die)
+    tr.update(die, tip, centers, torch.full((1, 4, 3), 0.012), 1, out)
+    assert not bool(out.visible[0])  # bigger than the tracker's band: ignored, as by the real tracker
+
+
+def test_random_dr_distractors_are_drawn_per_episode():
+    dm = DistractorModel(random_p=1.0, random_count=(2, 2), random_area_px=(3000.0, 3500.0))
+    tr, out = _tracker(NO_NOISE, n=64, seed=2, distractors=dm)
+    die = _die(n=64)
+    tr.reset(torch.ones(64, dtype=torch.bool), die)
+    assert int(tr._dist_on.sum()) == 128
+    xyz = tr._dist_xyz
+    assert float(xyz[..., 0].min()) >= 0.10 and float(xyz[..., 0].max()) <= 0.32
+    tip, c, h = _away(64)
+    tr.update(die, tip, c, h, 1, out)
+    assert bool(tr.false_positive.any())  # a 3000 px blob beats a ~500 px die wherever it is in view
+    none = DistractorModel(random_p=0.0)
+    tr2, _out2 = _tracker(NO_NOISE, n=4, distractors=none)
+    assert tr2._dist_xyz.shape[1] == 0
+
+
+def test_measured_distractors_file_loads():
+    dm = DistractorModel.from_yaml(random_p=0.3)
+    assert dm.fixed_xyz.shape[1] == 3 and len(dm.fixed_area_px) == len(dm.fixed_xyz)
+    assert dm.min_area_px == 40 and dm.max_area_px == 4000
+
+
+def test_area_band_matches_the_real_tracker_and_applies_without_distractors():
+    import yaml
+
+    from so101_rl.perception.die_tracker import DEFAULT_HSV_YAML
+    from so101_rl.sim.sim_tracker import DEFAULT_MAX_AREA_PX, DEFAULT_MIN_AREA_PX
+
+    hsv = yaml.safe_load(DEFAULT_HSV_YAML.read_text())
+    assert (DEFAULT_MIN_AREA_PX, DEFAULT_MAX_AREA_PX) == (hsv["min_area_px"], hsv["max_area_px"])
+    tr, out = _tracker()
+    near = _toward_camera(_die(0.22, 0.10), 0.33)  # a die a few cm from the lens: blob far above the band
+    assert float(tr.die_area_px(near)[0]) > DEFAULT_MAX_AREA_PX
+    _start(tr, near)
+    tip, c, h = _away(1)
+    tr.update(near, tip, c, h, 1, out)
+    assert not bool(out.visible[0])

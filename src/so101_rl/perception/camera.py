@@ -52,6 +52,7 @@ class D435Camera:
         fps: int = 30,
         warmup_frames: int = 45,
         timeout_ms: int = 2000,
+        depth: bool = True,
     ) -> None:
         self.serial = serial
         self.width = width
@@ -59,6 +60,7 @@ class D435Camera:
         self.fps = fps
         self.warmup_frames = warmup_frames
         self.timeout_ms = timeout_ms
+        self.depth = depth  # False: colour only (read() fills depth with 0 = no depth)
         self._rs = None
         self._pipeline = None
         self._align = None
@@ -78,11 +80,12 @@ class D435Camera:
         cfg = rs.config()
         cfg.enable_device(self.serial)
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
-        cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+        if self.depth:
+            cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
         pipeline = rs.pipeline()
         profile = pipeline.start(cfg)  # raises RuntimeError if the serial is not connected
         try:
-            self._align = rs.align(rs.stream.color)
+            self._align = rs.align(rs.stream.color) if self.depth else None
             depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
             ci = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             self._intr = Intrinsics(ci.fx, ci.fy, ci.ppx, ci.ppy, ci.width, ci.height, depth_scale)
@@ -100,15 +103,19 @@ class D435Camera:
             raise RuntimeError("camera not started")
         try:
             frames = self._pipeline.wait_for_frames(self.timeout_ms)
-            frames = self._align.process(frames)
+            if self._align is not None:
+                frames = self._align.process(frames)
             color = frames.get_color_frame()
-            depth = frames.get_depth_frame()
+            depth = frames.get_depth_frame() if self.depth else None
         except RuntimeError:  # wait_for_frames timeout
             return Frame(time.monotonic_ns(), False)
         t = time.monotonic_ns()
-        if not color or not depth:
+        if not color or (self.depth and not depth):
             return Frame(t, False)
         rgb_out[:] = np.asanyarray(color.get_data())
+        if not self.depth:
+            depth_m_out[:] = 0.0
+            return Frame(t, True)
         np.multiply(
             np.asanyarray(depth.get_data()), np.float32(self._intr.depth_scale), out=depth_m_out, casting="unsafe"
         )

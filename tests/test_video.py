@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import yaml
 
 import so101_rl
 from so101_rl.viz import video
@@ -42,40 +41,42 @@ def test_overlay_text_present():
     assert not np.array_equal(out, other)  # the text really encodes the step
 
 
-def test_overhead_camera_matches_d435_extrinsics(tmp_path):
+def test_d435_view_is_the_calibrated_camera():
     import mujoco
 
-    # no calib/hand_eye.yaml in the repo: the documented fallback pose
-    T, src = video.overhead_camera_pose(tmp_path / "missing.yaml")
-    assert "default_synthetic_camera_pose" in src
-    for path, expect in ((tmp_path / "missing.yaml", T), (None, None)):
-        model, _ = video.build_render_model(120, 160, hand_eye_path=path)
-        d = mujoco.MjData(model)
-        mujoco.mj_forward(model, d)
-        cid = model.camera(video.OVERHEAD_CAM).id
-        if expect is None:
-            expect, _ = video.overhead_camera_pose()
-        np.testing.assert_allclose(d.cam_xpos[cid], expect[:3, 3], atol=1e-9)
-        r_mj = d.cam_xmat[cid].reshape(3, 3)
-        np.testing.assert_allclose(r_mj, expect[:3, :3] @ np.diag([1.0, -1.0, -1.0]), atol=1e-9)
-        np.testing.assert_allclose(-r_mj[:, 2], expect[:3, 2], atol=1e-9)  # optical axis (z forward in the CV frame)
-        assert 40.0 < model.cam_fovy[cid] < 45.0  # D435 colour: ~42 deg vertical
+    from so101_rl.perception.camera_calib import load_camera_calib
+
+    calib = load_camera_calib()
+    T, src = video.d435_camera_pose()
+    assert "camera.yaml" in src and calib.require_pose().method in src
+    model, _ = video.build_render_model(120, 160)
+    d = mujoco.MjData(model)
+    mujoco.mj_forward(model, d)
+    cid = model.camera(video.D435_CAM).id
+    np.testing.assert_allclose(d.cam_xpos[cid], T[:3, 3], atol=1e-9)
+    r_mj = d.cam_xmat[cid].reshape(3, 3)
+    np.testing.assert_allclose(r_mj, T[:3, :3] @ np.diag([1.0, -1.0, -1.0]), atol=1e-9)
+    np.testing.assert_allclose(-r_mj[:, 2], T[:3, 2], atol=1e-9)  # optical axis (z forward in the RealSense frame)
+    assert tuple(model.cam_resolution[cid]) == (calib.color.width, calib.color.height)  # intrinsics, not fovy
 
 
-def test_overhead_camera_follows_hand_eye_calibration(tmp_path):
+def test_d435_view_follows_camera_yaml(tmp_path):
     import mujoco
 
+    from so101_rl.perception.camera_calib import CameraPose, load_camera_calib, save_camera_calib
+
+    calib = load_camera_calib()
     T = np.eye(4)
     T[:3, :3] = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
     T[:3, 3] = [0.30, -0.05, 0.55]
-    he = tmp_path / "hand_eye.yaml"
-    he.write_text(yaml.safe_dump({"T_base_cam": T.tolist(), "residual_mm": 1.2, "n_poses": 12, "date": "2026-10-06", "camera_serial": "TEST"}))
-    pose, source = video.overhead_camera_pose(he)
+    p = tmp_path / "camera.yaml"
+    save_camera_calib(calib.with_pose(CameraPose(T, "hand-eye", "2026-10-07", 1.2, 3.0, 0.5)), p)
+    pose, source = video.d435_camera_pose(p)
     assert "hand-eye" in source
-    model, _ = video.build_render_model(120, 160, hand_eye_path=he)
+    model, _ = video.build_render_model(120, 160, camera_path=p)
     d = mujoco.MjData(model)
     mujoco.mj_forward(model, d)
-    np.testing.assert_allclose(d.cam_xpos[model.camera(video.OVERHEAD_CAM).id], [0.30, -0.05, 0.55], atol=1e-9)
+    np.testing.assert_allclose(d.cam_xpos[model.camera(video.D435_CAM).id], [0.30, -0.05, 0.55], atol=1e-9)
     np.testing.assert_allclose(pose, T)
 
 

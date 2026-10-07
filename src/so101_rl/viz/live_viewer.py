@@ -435,7 +435,7 @@ def build_viewer_model(slots: int, spacing: float = SLOT_SPACING_M) -> tuple[muj
 
     parent = build_spec()
     for s in range(1, slots):
-        child = build_spec()
+        child = build_spec(camera=False)  # one D435 (slot 0) is enough
         frame = parent.worldbody.add_frame(pos=[0.0, s * spacing, 0.0])
         parent.attach(child, prefix=f"w{s}_", frame=frame)
     model = parent.compile()

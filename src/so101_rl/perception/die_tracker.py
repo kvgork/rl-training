@@ -1,19 +1,23 @@
 """HSV + depth red-die tracker (plan F9).
 
-``detect`` returns ``None`` whenever the die is not reliably visible (no blob, blob outside the area band,
-inconsistent or missing depth, or a nearer object touching the blob = occlusion). The verifier maps ``None``
+``detect`` returns ``None`` whenever the die is not reliably visible (no blob, blob outside the area band, a blob
+cut by the image border, inconsistent or missing depth, or a nearer object touching the blob = occlusion). The verifier maps ``None``
 to UNKNOWN, never SUCCESS (L11).
 
 **Position convention (integration 2026-10-06).** ``Detection.xyz_cam`` is the deprojected median depth at the
-blob centre, i.e. a point on the die's visible TOP face, about half an edge (8 mm) above its centre (it is also
-the right point for the hand-eye marker, which is a flat surface at the FK tip). Everything published as a die
-position -- the object table's ``xyz_base``, FS3's ``die_xyz``, the reward and the success predicate -- is the
-die CENTROID, the convention of the sim tracker (``sim/sim_tracker.py``) and of ``env/tasks.py``. Convert with
-:func:`die_centroid_base` / :meth:`HsvDepthDieTracker.centroid_base`: base frame, then half an edge along the
-TABLE NORMAL (base +z: the table is the base frame's horizontal plane) subtracted. This assumes the die rests
-face-up (on the table or flat in the gripper); a die tilted by theta reads up to half an edge x (sqrt(2)-1)
-(about 3 mm at 45 deg about one axis) off, inside the 16 mm height band of the success predicate.
-``tests/test_die_convention.py`` checks the real and sim trackers against each other on rendered scenes.
+blob centre, i.e. the point where the camera ray through the blob centre ENTERS the die (a point on its visible
+surface; it is also the right point for the hand-eye marker, which is a flat surface at the FK tip). Everything
+published as a die position -- the object table's ``xyz_base``, FS3's ``die_xyz``, the reward and the success
+predicate -- is the die CENTROID, the convention of the sim tracker (``sim/sim_tracker.py``) and of
+``env/tasks.py``. Convert with :func:`die_centroid_base` / :meth:`HsvDepthDieTracker.centroid_base`: base frame,
+then push the surface point ON ALONG THE VIEWING RAY by the cube's entry depth, half an edge / max_i |d_i| for the
+unit ray d in the die frame (camera parity C.4: the real D435 is oblique, 64 deg from vertical, so the blob centre
+lies on a side face, not on the top face). The die is assumed face-up with an unknown yaw: max_i |d_i| =
+max(|d_z|, s (1 + 1/sqrt 2) / 2) with s the horizontal part of d (the yaw average of the two extremes). Overhead
+(d = -z) this is exactly "half an edge along the table normal", the previous rule. Error budget: the yaw
+assumption <= ~1.5 mm, a die tilted in the gripper a few mm, inside the 16 mm height band.
+``tests/test_die_convention.py`` and ``tests/test_camera_parity.py`` check the real and sim trackers against each
+other on scenes rendered from the calibrated camera.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import numpy as np
 import yaml
 
 from so101_rl.perception.camera import Intrinsics
+from so101_rl.perception.camera_calib import CameraCalib, load_camera_calib
 from so101_rl.perception.frames import cam_to_base, pixel_to_cam
 
 DEFAULT_HSV_YAML = Path(__file__).with_name("hsv_red_die.yaml")
@@ -35,12 +40,24 @@ _OCCLUDED_RING_FRACTION = 0.15  # share of the blob's surrounding ring that is n
 TABLE_NORMAL_BASE = np.array([0.0, 0.0, 1.0])  # the table is the base frame's horizontal plane (z = table_z_m)
 
 
+def die_entry_depth(ray_base: np.ndarray, die_edge_m: float) -> float:
+    """Distance from where the unit viewing ray ``ray_base`` enters a face-up die of unknown yaw to its centroid
+    (module docstring)."""
+    d = np.asarray(ray_base, dtype=np.float64)
+    d = d / np.linalg.norm(d)
+    s = float(np.hypot(d[0], d[1]))
+    m = max(abs(float(d @ TABLE_NORMAL_BASE)), s * (1.0 + 1.0 / np.sqrt(2.0)) / 2.0)
+    return 0.5 * float(die_edge_m) / m
+
+
 def die_centroid_base(xyz_cam: np.ndarray, T_base_cam: np.ndarray, die_edge_m: float) -> np.ndarray:
-    """Die centroid in the base frame from the deprojected TOP-face point ``xyz_cam`` (see the module docstring):
-    ``cam_to_base(xyz_cam) - die_edge_m / 2 * TABLE_NORMAL_BASE``."""
+    """Die centroid in the base frame from the deprojected surface point ``xyz_cam`` (module docstring): the point
+    in the base frame pushed along the viewing ray by :func:`die_entry_depth`."""
     if not die_edge_m > 0:
         raise ValueError(f"die_edge_m must be > 0, got {die_edge_m}")
-    return cam_to_base(xyz_cam, T_base_cam) - 0.5 * float(die_edge_m) * TABLE_NORMAL_BASE
+    p = np.asarray(xyz_cam, dtype=np.float64)
+    ray = T_base_cam[:3, :3] @ (p / np.linalg.norm(p))
+    return cam_to_base(p, T_base_cam) + die_entry_depth(ray, die_edge_m) * ray
 
 
 @dataclass
@@ -77,6 +94,12 @@ class HsvDepthDieTracker:
             raise ValueError("depth_window_m must be > 0")
         if not self.die_edge_m > 0:
             raise ValueError("die_edge_m must be > 0")
+
+    @classmethod
+    def from_camera_calib(cls, calib: CameraCalib | None = None, path: Path = DEFAULT_HSV_YAML) -> HsvDepthDieTracker:
+        """The tracker on the colour stream of ``calib/camera.yaml`` (or ``calib``): depth is aligned to colour."""
+        c = calib if calib is not None else load_camera_calib()
+        return cls.from_yaml(c.color_intrinsics(), path)
 
     @classmethod
     def from_yaml(cls, intr: Intrinsics, path: Path = DEFAULT_HSV_YAML) -> HsvDepthDieTracker:
@@ -116,6 +139,11 @@ class HsvDepthDieTracker:
                 best, best_area = i, area
         if best < 0:
             return None
+        x0, y0 = int(stats[best, cv2.CC_STAT_LEFT]), int(stats[best, cv2.CC_STAT_TOP])
+        x1, y1 = x0 + int(stats[best, cv2.CC_STAT_WIDTH]), y0 + int(stats[best, cv2.CC_STAT_HEIGHT])
+        if x0 == 0 or y0 == 0 or x1 >= mask.shape[1] or y1 >= mask.shape[0]:
+            return None  # cut by the image border: its centre is not the die's (camera parity C.4; the sim
+            # tracker calls a die whose centre leaves the image invisible)
         u, v = float(cents[best][0]), float(cents[best][1])
 
         h, w = depth_m.shape

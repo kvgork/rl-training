@@ -4,15 +4,23 @@
 keyframes. MJCF cannot add geoms to an *included* body, so :func:`load_model` compiles the scene through ``MjSpec``
 and adds the primitive jaw collision geoms (class ``jaw_col``) and the ``gripper_tip`` site there; the upstream mesh
 collision geoms of both jaws are switched off (``contype = conaffinity = 0``) so grasp contact is primitive-only.
+
+It also adds the real D435 as two cameras, ``d435_color`` and ``d435_depth``, from ``calib/camera.yaml`` (camera
+parity C.3, ``sim/d435.py``): intrinsics from the device, pose from the camera calibration. Cameras change neither
+the dof layout nor the body/geom order. ``camera=False`` builds the scene without them (nothing in the scene XML
+hard-codes a camera).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import mujoco
 import numpy as np
+
+if TYPE_CHECKING:
+    from so101_rl.perception.camera_calib import CameraCalib
 
 ASSETS: Final[Path] = Path(__file__).resolve().parents[3] / "assets"
 SCENE_XML: Final[Path] = ASSETS / "so101" / "so101_rl_scene.xml"
@@ -35,7 +43,18 @@ _JAW_BOXES: Final[tuple[tuple[str, str, tuple[float, float, float], tuple[float,
 )
 
 
-def build_spec(scene_xml: Path = SCENE_XML) -> mujoco.MjSpec:
+def _camera_calib(camera: CameraCalib | Path | str | bool | None) -> CameraCalib | None:
+    """None / True: ``calib/camera.yaml``; False: no cameras; a path or a ``CameraCalib``: that one."""
+    if camera is False:
+        return None
+    from so101_rl.perception.camera_calib import CameraCalib, load_camera_calib
+
+    if isinstance(camera, CameraCalib):
+        return camera
+    return load_camera_calib(None if camera in (None, True) else Path(camera))
+
+
+def build_spec(scene_xml: Path = SCENE_XML, *, camera: CameraCalib | Path | str | bool | None = None) -> mujoco.MjSpec:
     spec = mujoco.MjSpec.from_file(str(scene_xml))
     jaw_default = spec.find_default(JAW_COL_CLASS)
     if jaw_default is None:
@@ -55,12 +74,21 @@ def build_spec(scene_xml: Path = SCENE_XML) -> mujoco.MjSpec:
     gripper = spec.body(FIXED_JAW_BODY)
     frame = spec.site("gripperframe")
     gripper.add_site(name="gripper_tip", pos=list(frame.pos), quat=list(frame.quat), size=[0.003, 0.003, 0.003], group=3)
+
+    calib = _camera_calib(camera)
+    if calib is not None:
+        from so101_rl.sim.d435 import add_d435_cameras
+
+        add_d435_cameras(spec, calib)
     return spec
 
 
-def load_model(scene_xml: Path = SCENE_XML) -> tuple[mujoco.MjModel, mujoco.MjData]:
-    """Compile the RL scene. Resolves mesh paths relative to ``assets/``; returns ``(model, data)`` at keyframe ``rest``."""
-    model = build_spec(Path(scene_xml)).compile()
+def load_model(
+    scene_xml: Path = SCENE_XML, *, camera: CameraCalib | Path | str | bool | None = None
+) -> tuple[mujoco.MjModel, mujoco.MjData]:
+    """Compile the RL scene with the D435 cameras of ``calib/camera.yaml`` (``camera``: see :func:`build_spec`).
+    Resolves mesh paths relative to ``assets/``; returns ``(model, data)`` at keyframe ``rest``."""
+    model = build_spec(Path(scene_xml), camera=camera).compile()
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, model.key("rest").id)
     mujoco.mj_forward(model, data)

@@ -57,10 +57,8 @@
     <site name="zone" type="box" pos="0.22 0.10 -0.0195" size="0.03 0.03 0.0005" rgba="0.1 0.7 0.2 0.5" group="1"/>
     <!-- ArUco-sized fiducial (30 mm) for hand-eye calibration -->
     <site name="fiducial" type="box" pos="0.10 -0.16 -0.0195" size="0.015 0.015 0.0005" rgba="0 0 0 1" group="1"/>
-    <!-- Overhead D435 (sim/sim_tracker.py CameraModel nominal pose): 0.614 m above the table at (0.20, 0), looking
-         straight down; image x = base +x, image down = base -y. fovy = 2 atan(240 / 615) deg (fy = 615 px at
-         640 x 480, so 1 px ~ 1 mm on the table). Replaced by calib/hand_eye.yaml for the tracker when it exists. -->
-    <camera name="overhead" pos="0.20 0 0.594" xyaxes="1 0 0 0 1 0" fovy="42.6358"/>
+    <!-- No camera here: the D435 cameras d435_color / d435_depth are added by sim/model.py build_spec from
+         calib/camera.yaml (the single source of the real camera's intrinsics and pose; sim/d435.py). -->
     <!-- Start-well tray around die_start (0.20, -0.05) (tasks.DIE_TO_ZONE placeholder): a flat 23 x 23 mm well on
          the table, four 50 deg funnel plates out to +-30 mm (22 mm rise; 20 / 35 / 40 deg left dice leaning on the
          slope edge, 45 / 92.5 % returned), and a 26 mm rim. The rim stays 4 mm clear

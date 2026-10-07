@@ -1,7 +1,60 @@
 # calib/
 
-Committed calibration artifacts for the perception stack. Both files are produced on the real rig (H8) and are
+Committed calibration artifacts for the perception stack. They are produced on the real rig and are
 **refused at load time when they fail their own gates**; there is no fallback to defaults.
+
+## `camera.yaml`
+
+The ONE source of the D435 model (camera parity unit SUC, plan §10 2026-10-06 "Camera parity"): the sim cameras
+`d435_color` / `d435_depth`, the sim tracker, the rollout videos, the real tracker and `perception.frames` all read
+it (`so101_rl.perception.camera_calib.load_camera_calib`; `tests/test_camera_single_source.py` fails on hard-coded
+intrinsics or poses). Written by `pixi run camera-intrinsics --serial 819312071240 --out calib/camera.yaml`
+(device block; keeps an existing pose) and by `pixi run camera-calibrate --method arm-shape` (pose + table plane,
+only when its gate passes). Frames: RealSense optical (x right, y down, z forward), metres.
+
+```yaml
+version: 1
+serial: "819312071240"
+firmware: 5.11.1.100
+color: {width: 640, height: 480, fps: 30, fx: .., fy: .., cx: .., cy: .., distortion: {model: inverse_brown_conrady, coeffs: [0, 0, 0, 0, 0]}}
+depth: {width: 640, height: 480, fps: 30, fx: .., fy: .., cx: .., cy: .., distortion: {...}, depth_scale: 0.001}
+depth_to_color: [[4x4]]       # p_color = T @ p_depth (librealsense get_extrinsics_to; its rotation is column-major)
+T_base_color:                 # null = never calibrated
+  matrix: [[4x4]]             # colour frame -> robot base frame
+  method: arm-shape | hand-eye | provisional
+  date: "YYYY-MM-DD"
+  residual_mm: 1.8            # null only for provisional; a calibrated pose above 5 mm is refused
+  uncertainty: {trans_mm: .., rot_deg: ..}   # 2 sigma bootstrap; the camera-pose DR uses max(this, 5 mm / 1.5 deg)
+  notes: "..."
+table_plane:                  # null = not measured
+  normal_color: [3]           # unit, pointing UP (towards the camera), colour frame
+  height_m: 0.3457            # camera centre above the table
+  inlier_fraction: 0.35
+  n_frames: 5
+  date: "2026-10-06"
+```
+
+Strict: unknown or missing keys are errors; non-zero distortion coefficients are refused (every consumer is
+pinhole). **Current state (2026-10-07):** device intrinsics; a PROVISIONAL pose (height and tilt from the
+2026-10-06 table plane, yaw and x/y read off a colour frame; see its `notes`) until `camera-calibrate` passes on the
+rig. To regenerate the provisional pose: `python -m so101_rl.perception.camera_calib --provisional ...` (all
+numbers are arguments; it refuses to replace a calibrated pose).
+
+## `distractors.yaml`
+
+Red/orange blobs the HSV die tracker would take for the die (C.5), written by `pixi run camera-distractors` (a
+colour frame WITHOUT the die; `--from-npz` for a saved capture). Read by
+`so101_rl.sim.sim_tracker.DistractorModel.from_yaml` (the sim tracker's false-positive model).
+
+```yaml
+version: 1
+date: "2026-10-07"
+source: "camera-distractors ..., what else was in the frame"
+camera_pose_method: provisional     # the pose used for xyz_base (a provisional pose makes them provisional)
+hsv: {hsv_lo: [..], hsv_hi: [..], min_area_px: 40, max_area_px: 4000}   # perception/hsv_red_die.yaml at the time
+distractors:
+  - {label: blob0, u: 357.5, v: 300.4, area_px: 306, xyz_base: [x, y, z], xyz_source: depth | table-ray}
+```
 
 ## `hand_eye.yaml`
 

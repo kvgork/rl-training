@@ -1,0 +1,94 @@
+# D435 camera calibration (plan C.1, schema: perception/camera_calib.py, calib/README.md). Generated.
+version: 1
+serial: '819312071240'
+firmware: 5.11.1.100
+color:
+  width: 640
+  height: 480
+  fps: 30
+  fx: 617.16943359375
+  fy: 617.5703735351562
+  cx: 327.94647216796875
+  cy: 236.11865234375
+  distortion:
+    model: inverse_brown_conrady
+    coeffs:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+depth:
+  width: 640
+  height: 480
+  fps: 30
+  fx: 388.3305358886719
+  fy: 388.3305358886719
+  cx: 326.9906921386719
+  cy: 240.8697509765625
+  distortion:
+    model: brown_conrady
+    coeffs:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+  depth_scale: 0.0010000000474974513
+depth_to_color:
+- - 0.999977890283638
+  - 0.0034407637742682297
+  - 0.005690350475543523
+  - 0.014757096767425537
+- - -0.0034489259876740513
+  - 0.9999930368255461
+  - 0.0014252052318658704
+  - 0.00012602945207618177
+- - -0.00568540705810775
+  - -0.0014447993186162255
+  - 0.9999827942027366
+  - 0.00013457550085149705
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+T_base_color:
+  matrix:
+  - - -0.9924819279155145
+    - 0.12239126913756332
+    - 3.362857138430466e-16
+    - 0.16499999999999973
+  - - 0.05371674242041026
+    - 0.4355939476273296
+    - -0.8985390499995972
+    - 0.4377454829248404
+  - - -0.10997333469911127
+    - -0.8917837686509751
+    - -0.4388935812082715
+    - 0.3257
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  method: provisional
+  date: '2026-10-07'
+  residual_mm: null
+  uncertainty:
+    trans_mm: 150.0
+    rot_deg: 30.0
+  notes: 'PROVISIONAL until camera-calibrate passes; not a training pose (the camera-pose
+    DR uses the 5 mm / 1.5 deg floor). Height 345.7 mm and tilt 64 deg: table-plane
+    RANSAC on aligned D435 depth, 5 frames, 2026-10-06 (plans/camera-parity-plan.md).
+    Yaw, x and y are NOT measured: camera on the +y side looking along -y (the arm
+    reaches towards image-left in the 2026-10-07 colour frame), x/y chosen so the
+    base origin projects to pixel (530, 330), where the base sits in that frame (look-at
+    0.165, -0.27).'
+table_plane:
+  normal_color:
+  - -0.10997333469911126
+  - -0.891783768650975
+  - -0.4388935812082713
+  height_m: 0.3457
+  inlier_fraction: 0.35
+  n_frames: 5
+  date: '2026-10-06'

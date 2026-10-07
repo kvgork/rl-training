@@ -1,7 +1,9 @@
 """Camera geometry and the hand-eye artifact (plan F9).
 
-``T_base_cam`` is the 4x4 transform taking a point in the camera frame to the robot base frame.
-``calib/hand_eye.yaml`` schema is documented in ``calib/README.md``.
+``T_base_cam`` is the 4x4 transform taking a point in the camera frame to the robot base frame. The camera pose
+every consumer uses is ``calib/camera.yaml``'s ``T_base_color`` (camera parity C.1; :func:`default_T_base_cam`).
+``calib/hand_eye.yaml`` is the H8 hand-eye artifact (schema in ``calib/README.md``): its result is folded into
+``camera.yaml`` (method ``hand-eye``) once H8 has run (plan C.6).
 """
 
 from __future__ import annotations
@@ -26,6 +28,14 @@ class HandEye:
     n_poses: int
     date: str
     camera_serial: str
+
+
+def default_T_base_cam(path: Path | None = None, *, require_calibrated: bool = False) -> np.ndarray:
+    """``T_base_color`` of ``calib/camera.yaml`` (or ``path``): the colour optical frame, which the aligned depth
+    shares. ``require_calibrated`` refuses a provisional pose."""
+    from so101_rl.perception.camera_calib import load_camera_calib
+
+    return load_camera_calib(path, require_calibrated=require_calibrated).T_base_color
 
 
 def pixel_to_cam(u: float, v: float, z_m: float, intr: Intrinsics) -> np.ndarray:

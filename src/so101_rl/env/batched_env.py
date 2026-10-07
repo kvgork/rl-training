@@ -71,12 +71,21 @@ from so101_rl.env.tasks import (
     reward_torch,
     success_torch,
 )
+from so101_rl.perception.camera_calib import CameraCalib, load_camera_calib
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.types import TripCause
 from so101_rl.sim.batched_servo import BatchedServoChain, ChainOut
+from so101_rl.sim.d435 import COLOR_CAM
 from so101_rl.sim.gripper_map import gripper_range_rad, gripper_ticks_per_rad
 from so101_rl.sim.model import TABLE_Z_M, jaw_collision_geom_ids, load_model
-from so101_rl.sim.sim_tracker import CameraModel, Occluders, SimDieTracker, TrackerNoise, TrackerOut
+from so101_rl.sim.sim_tracker import (
+    CameraModel,
+    DistractorModel,
+    Occluders,
+    SimDieTracker,
+    TrackerNoise,
+    TrackerOut,
+)
 from so101_rl.sim.warp_model import WarpSim
 
 __all__ = ["TRUNCATING_TRIPS", "BatchedGoalEnv", "BatchedStep", "ModelSimParams", "model_sim_params"]
@@ -168,6 +177,8 @@ class BatchedGoalEnv:
         sim_params: Any,
         randomizer: Any | None = None,
         tracker_noise: TrackerNoise | None = None,
+        camera: CameraCalib | None = None,
+        distractors: DistractorModel | None = None,
         model: mujoco.MjModel | None = None,
         seed: int = 0,
         device: str = "cuda:0",
@@ -248,8 +259,14 @@ class BatchedGoalEnv:
         self.tracker: SimDieTracker | None = None
         self._occl: Occluders | None = None
         if task.obs.has_die:
-            noise = tracker_noise if tracker_noise is not None else TrackerNoise()
-            self.tracker = SimDieTracker(CameraModel.default(), noise, n, device=dev, seed=seed + 7919)
+            # the real D435 from calib/camera.yaml (camera parity C.3): colour + depth sensor, camera-pose DR within
+            # the calibration uncertainty (>= 5 mm / 1.5 deg) unless the caller passes its own noise
+            calib = camera if camera is not None else load_camera_calib()
+            noise = tracker_noise if tracker_noise is not None else TrackerNoise().with_camera_dr(calib)
+            self.tracker = SimDieTracker(
+                CameraModel.from_calib(calib, "color"), noise, n, device=dev, seed=seed + 7919,
+                depth_cam=CameraModel.from_calib(calib, "depth"), distractors=distractors,
+            )  # fmt: skip
             self._occl = Occluders(m, dev)
             self._trk = TrackerOut.empty(n, dev)
             self._trk_obs = TrackerOut.empty(n, dev)
@@ -586,7 +603,7 @@ class BatchedGoalEnv:
         return out
 
     def render_worlds(
-        self, worlds: Sequence[int], *, width: int = 320, height: int = 240, camera: str = "overhead"
+        self, worlds: Sequence[int], *, width: int = 320, height: int = 240, camera: str = COLOR_CAM
     ) -> np.ndarray:
         """uint8[k,H,W,3] via ``mujoco.Renderer`` on a CPU MjData copy of each world (pixel-track hook)."""
         self._check_open()
