@@ -136,6 +136,12 @@ class WorkspaceBox:
     # BOX_PRESENT trips only when the PRESENT tip is more than this outside the box (review S3: 1 mm of sag at
     # the floor must not end the run). Commanded targets are still clamped to the exact box.
     present_tolerance_m: float = 0.005
+    # Gripper floor (plan §10 2026-10-06 "Gripper floor check", 2026-10-07 "Gripper floor clearance"): the LOWEST
+    # wrist/gripper point (kinematics floor_points) must stay at or above this z (= safe_state.table_z_m +
+    # box.gripper_floor_clearance_m, 1 mm above the table; set by the loader); the present pose trips BOX_PRESENT
+    # only below it minus gripper_present_tolerance_m (2 mm: at most ~1 mm into the table). The tip keeps z[0].
+    gripper_floor_z_m: float = -0.019
+    gripper_present_tolerance_m: float = 0.002
 
 
 @dataclass(frozen=True)

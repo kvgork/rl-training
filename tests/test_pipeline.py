@@ -1,6 +1,7 @@
 """SafetyPipeline (plan task 2.5): order, interpolation, anti-windup, BOX vs BOX_PRESENT, import fence."""
 
 import ast
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +64,21 @@ class Rig:
 
     def xyz(self, ticks):
         return self.fk.gripper_xyz_from_ticks(ticks, np.zeros(3))
+
+    def floor_z(self, ticks):
+        """Lowest wrist/gripper point (plan §10 2026-10-06 / 2026-10-07 gripper floor)."""
+        return self.fk.tip_and_floor_z_from_ticks(ticks, np.zeros(3))
+
+    def inside(self, ticks):
+        """The pipeline's exact box test (tip box + gripper floor)."""
+        xyz = np.zeros(3)
+        zf = self.fk.tip_and_floor_z_from_ticks(ticks, xyz)
+        return self.fk.in_box_gripper(xyz, zf, self.cfg.box)
+
+
+def tip_only(cfg):
+    """The shipped config with the gripper floor out of the way, to test the TIP box rules on their own."""
+    return dataclasses.replace(cfg, box=dataclasses.replace(cfg.box, gripper_floor_z_m=-1.0))
 
 
 @pytest.fixture
@@ -183,14 +199,14 @@ def test_box_on_commanded_target_reverts_to_previous_target(cfg, calibration):
     box_seen = False
     for _ in range(4):
         for tgt, trips, mask in r.cycle(d(0, 45)):
-            assert r.fk.in_box(r.xyz(tgt), cfg.box), "a target outside the box was emitted"
+            assert r.inside(tgt), "a target outside the box (or below the gripper floor) was emitted"
             if trips & T.BOX:
                 box_seen = True
                 assert mask[1]
         assert not r.v.trips & T.BOX_PRESENT
     assert box_seen
     # anti-windup: the stored goal is the reverted one, so it cannot push against the wall
-    assert r.fk.in_box(r.xyz(r.pipe.goal), cfg.box)
+    assert r.inside(r.pipe.goal)
     np.testing.assert_array_equal(r.v.goal_ticks, r.pipe.goal)
 
 
@@ -211,21 +227,25 @@ def test_box_present_is_a_trip(cfg, calibration):
     np.testing.assert_array_equal(v.target_ticks, q0)  # holds; does not push further
 
 
-def _pose_below_floor(r, cfg, depth_m):
-    """LOW_POSE with shoulder_lift lowered until the tip is ``depth_m`` below the box floor (+-0.5 mm)."""
+def _pose_below_floor(r, cfg, depth_m, *, points=False):
+    """LOW_POSE with shoulder_lift lowered until the tip (or, ``points``, the lowest gripper point) is ``depth_m``
+    below its floor (box.z[0] / box.gripper_floor_z_m), within 1.5 mm."""
     q = LOW_POSE.copy()
+    floor = cfg.box.gripper_floor_z_m if points else cfg.box.z[0]
     for lift in range(1930, 2300):
         q[1] = lift
-        z = r.xyz(q)[2]
-        if z <= cfg.box.z[0] - depth_m:
-            assert z >= cfg.box.z[0] - depth_m - 0.0015
+        z = r.floor_z(q) if points else r.xyz(q)[2]
+        if z <= floor - depth_m:
+            assert z >= floor - depth_m - 0.0015
             return q
     raise AssertionError("no such pose")
 
 
 @pytest.mark.parametrize("depth_mm", [1.0, 3.0, 4.0])
 def test_present_sag_within_the_tolerance_is_not_a_trip(cfg, calibration, depth_mm):
-    """S3: a few mm of sag below the box floor must not end the run; commands are still clamped to the box."""
+    """S3: a few mm of TIP sag below the box floor must not end the run; commands are still clamped to the box.
+    (Gripper floor moved out of the way: it has its own tolerance, tested below.)"""
+    cfg = tip_only(cfg)
     r = Rig(cfg, calibration, LOW_POSE)
     q = _pose_below_floor(r, cfg, depth_mm / 1000)
     assert depth_mm / 1000 < cfg.box.present_tolerance_m
@@ -237,11 +257,42 @@ def test_present_sag_within_the_tolerance_is_not_a_trip(cfg, calibration, depth_
 
 
 def test_present_beyond_the_tolerance_is_a_trip(cfg, calibration):
+    cfg = tip_only(cfg)
     r = Rig(cfg, calibration, LOW_POSE)
     q = _pose_below_floor(r, cfg, cfg.box.present_tolerance_m + 0.002)
     r = Rig(cfg, calibration, q)
     r.command(d(0, -10))
     assert r.tick(3).trips & T.BOX_PRESENT
+
+
+@pytest.mark.parametrize("depth_mm", [0.5, 1.5])
+def test_gripper_point_sag_within_its_tolerance_is_not_a_trip(cfg, calibration, depth_mm):
+    """Plan §10 2026-10-07: the lowest gripper point may sag up to gripper_present_tolerance_m (2 mm) below its floor
+    (table + 1 mm) without a trip; commands never take it lower."""
+    r = Rig(cfg, calibration, LOW_POSE)
+    q = _pose_below_floor(r, cfg, depth_mm / 1000, points=True)
+    assert r.fk.in_box(r.xyz(q), cfg.box, margin=cfg.box.present_tolerance_m)  # the tip alone would not trip
+    r = Rig(cfg, calibration, q)
+    for tgt, trips, _m in r.cycle(d(0, 45)):
+        assert not trips & T.BOX_PRESENT
+        assert r.floor_z(tgt) <= r.floor_z(q) + 1e-9 or r.inside(tgt)
+    assert not r.v.trips & T.BOX_PRESENT
+
+
+def test_gripper_point_beyond_its_tolerance_is_a_trip_although_the_tip_is_fine(cfg, calibration):
+    r = Rig(cfg, calibration, LOW_POSE)
+    q = _pose_below_floor(r, cfg, cfg.box.gripper_present_tolerance_m + 0.0005, points=True)
+    assert r.fk.in_box(r.xyz(q), cfg.box, margin=cfg.box.present_tolerance_m)  # tip-only would NOT trip
+    r = Rig(cfg, calibration, q)
+    r.command(d(0, -10))
+    assert r.tick(3).trips & T.BOX_PRESENT
+
+
+def test_commanded_target_never_takes_the_lowest_gripper_point_below_its_floor(cfg, calibration):
+    r = Rig(cfg, calibration, LOW_POSE)
+    for _ in range(8):
+        for tgt, _trips, _m in r.cycle(d(0, 45)):
+            assert r.floor_z(tgt) >= cfg.box.gripper_floor_z_m
 
 
 def test_commanded_target_is_clamped_to_the_exact_box_not_the_tolerance_band(cfg, calibration):
@@ -310,7 +361,7 @@ def test_order_of_checks_matches_architecture_6_3(rig, monkeypatch):
 
     for n in ("clamp_joint_limits", "clamp_velocity", "clamp_tracking", "check_range"):
         spy(pipeline_mod.clamp, n)
-    spy(rig.fk, "gripper_xyz_from_ticks")
+    spy(rig.fk, "tip_and_floor_z_from_ticks")
     spy(rig.thermal, "update")
     spy(rig.stuck, "update")
     rig.tick(1)
@@ -319,7 +370,7 @@ def test_order_of_checks_matches_architecture_6_3(rig, monkeypatch):
         first.setdefault(n, i)
     # thermal.update and stuck.update share the name "update": both run after the box FK and before check_range
     assert first["clamp_joint_limits"] < first["clamp_velocity"] < first["clamp_tracking"]
-    assert first["clamp_tracking"] < first["gripper_xyz_from_ticks"] < first["update"]
+    assert first["clamp_tracking"] < first["tip_and_floor_z_from_ticks"] < first["update"]
     assert calls.index("check_range") == len(calls) - 1  # the very last call
     assert calls.count("update") == 2 and calls[-3:-1] == ["update", "update"]
 

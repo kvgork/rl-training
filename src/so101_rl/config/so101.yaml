@@ -72,6 +72,10 @@ box:                              # metres, base frame (from LIT DEFAULT_BOX)
   y: [-0.22, 0.22]
   z: [-0.015, 0.28]               # floor = table + 5 mm (plan §10 2026-10-06): the jaws can reach a die on the table
   present_tolerance_m: 0.005      # BOX_PRESENT trips only this far outside the box (review S3); targets: exact box
+  # Gripper floor (plan §10 2026-10-06 / 2026-10-07): the LOWEST wrist/gripper point (so101_kinematics.yaml
+  # floor_points) stays >= safe_state.table_z_m + this (1 mm above the table); the tip keeps z[0] = -0.015.
+  gripper_floor_clearance_m: 0.001
+  gripper_present_tolerance_m: 0.002  # BOX_PRESENT for the gripper points: <= ~1 mm into the table
 
 registers:
   return_delay_time: 0

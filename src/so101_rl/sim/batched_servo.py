@@ -26,9 +26,12 @@ Semantics (identical to ``safety/pipeline.py``, which is the source of truth; di
 3. per-tick velocity cap ``|target - prev| <= max_ticks_per_tick`` (mask only, no trip bit: like the pipeline)
 4. tracking ``|target - present| <= E`` (``TRACKING``); anti-windup: the GOAL is clipped to the same band (its mask
    is not reported, like the pipeline)
-5. box via FK: present tip outside the box grown by ``present_tolerance_m`` -> ``BOX_PRESENT`` and
-   ``target = prev_target`` (the target box test is skipped); else the target tip outside the exact box ->
-   ``target = goal = prev_target`` with mask ``target != prev_target`` and ``BOX`` iff that mask is non-empty
+5. box via FK (``So101FK.in_box_gripper``: the tip box, AND the lowest of the chain's ``floor_wrist`` /
+   ``floor_gripper`` points at or above ``box.gripper_floor_z_m``, plan §10 2026-10-06 "Gripper floor check" /
+   2026-10-07 "Gripper floor clearance"): present outside (tip box grown by ``present_tolerance_m``, point floor
+   lowered by ``gripper_present_tolerance_m``) -> ``BOX_PRESENT`` and ``target = prev_target`` (the target box test
+   is skipped); else the target outside the exact box / point floor -> ``target = goal = prev_target`` with mask
+   ``target != prev_target`` and ``BOX`` iff that mask is non-empty
 6. thermal / protection bits / stuck: NOT emulated (decision D-TRIPS)
 7. ``applied_delta_ticks = goal - goal_at_cmd_start`` (float32; the LOGGED action, L4)
 8. ``RANGE`` if any target is outside 0..4095 (the target is left as-is, pipeline semantics)
@@ -122,7 +125,10 @@ class BatchedServoChain:
         self._E = i64(cfg.action.tracking_error_ticks)
         box = cfg.box
         m = float(box.present_tolerance_m)
-        # Same float64 arithmetic as So101FK.in_box (bounds computed as Python floats).
+        # Same float64 arithmetic as So101FK.in_box_gripper (bounds computed as Python floats): the tip box, and the
+        # lowest gripper point against the gripper floor (exact for targets, lowered by its tolerance for present).
+        self._gfloor = float(box.gripper_floor_z_m)
+        self._gfloor_p = float(box.gripper_floor_z_m) - float(box.gripper_present_tolerance_m)
         self._box_lo = torch.tensor([box.x[0], box.y[0], box.z[0]], dtype=torch.float64, device=dev)
         self._box_hi = torch.tensor([box.x[1], box.y[1], box.z[1]], dtype=torch.float64, device=dev)
         self._boxp_lo = torch.tensor([box.x[0] - m, box.y[0] - m, box.z[0] - m], dtype=torch.float64, device=dev)
@@ -135,6 +141,8 @@ class BatchedServoChain:
         self._base_T = torch.as_tensor(chain.base_T, dtype=torch.float64, device=dev)
         self._parent_T = torch.as_tensor(chain.parent_T, dtype=torch.float64, device=dev)
         self._tip_pos = torch.as_tensor(chain.tip_T[:3, 3], dtype=torch.float64, device=dev)
+        self._pw = torch.as_tensor(chain.floor_wrist.T.copy(), dtype=torch.float64, device=dev)  # [3, Kw]
+        self._pg = torch.as_tensor(chain.floor_gripper.T.copy(), dtype=torch.float64, device=dev)  # [3, Kg]
 
         n = self.nworld
         z = torch.zeros((n, N_JOINTS), dtype=torch.int64, device=dev)
@@ -144,6 +152,7 @@ class BatchedServoChain:
         self._cmd_mask = torch.zeros((n, N_JOINTS), dtype=torch.bool, device=dev)
         self._cmd_trips = torch.zeros(n, dtype=torch.int64, device=dev)
         self._xyz = torch.zeros((n, 3), dtype=torch.float64, device=dev)
+        self._zlow = torch.zeros(n, dtype=torch.float64, device=dev)
         self._counts = torch.zeros(len(STAGES), dtype=torch.int64, device=dev)
         self._world_ticks = 0
 
@@ -213,11 +222,11 @@ class BatchedServoChain:
         m_trk = t3 != t2
         trips |= torch.where(m_trk.any(dim=1), _TRK, 0)
         goal = _clip_around(self.goal, present, self._E)
-        # 5. box through FK
-        xyz_p = self.fk_tip(present, self._xyz)
-        present_in = ((xyz_p >= self._boxp_lo) & (xyz_p <= self._boxp_hi)).all(dim=1)
-        xyz_t = self.fk_tip(t3, self._xyz)
-        target_in = ((xyz_t >= self._box_lo) & (xyz_t <= self._box_hi)).all(dim=1)
+        # 5. box through FK (x/y/top on the tip, floor on the lowest gripper point)
+        xyz_p, zl_p = self.fk_tip_and_floor_z(present, self._xyz, self._zlow)
+        present_in = self._in_box(xyz_p, zl_p, self._boxp_lo, self._boxp_hi, self._gfloor_p)
+        xyz_t, zl_t = self.fk_tip_and_floor_z(t3, self._xyz, self._zlow)
+        target_in = self._in_box(xyz_t, zl_t, self._box_lo, self._box_hi, self._gfloor)
         box_present = ~present_in
         box_revert = present_in & ~target_in
         m_box = (t3 != prev) & box_revert[:, None]
@@ -245,9 +254,41 @@ class BatchedServoChain:
         return out
 
     # ------------------------------------------------------------------ FK
+    @staticmethod
+    def _in_box(
+        xyz: torch.Tensor, zlow: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, floor: float
+    ) -> torch.Tensor:
+        """``So101FK.in_box_gripper`` for every world: tip in [lo, hi], lowest gripper point >= ``floor``."""
+        return ((xyz >= lo) & (xyz <= hi)).all(dim=1) & (zlow >= floor)
+
     def fk_tip(self, ticks: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Fixed-jaw tip (``gripperframe``) in the base frame, metres, for every world: batched ``So101FK`` (5 Rz)
         from the same ``KinematicChain``. ``ticks`` int[N,6] (only the 5 arm joints are used); fills ``out [N,3]``."""
+        out.copy_(self._fk(ticks)[0])
+        return out
+
+    def fk_tip_and_floor_z(
+        self, ticks: torch.Tensor, out: torch.Tensor, zlow: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``So101FK.tip_and_floor_z`` for every world: tip into ``out [N,3]``, the lowest z of every gripper-floor
+        point into ``zlow [N]`` (same elementwise float64 arithmetic)."""
+        xyz, aw, ag = self._fk(ticks)
+        out.copy_(xyz)
+
+        def pts_min(frame: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+            r = frame[:, 2, :]  # [N, 4]
+            z = p[0] * r[:, 0:1]
+            z = z + p[1] * r[:, 1:2]
+            z = z + p[2] * r[:, 2:3]
+            z = z + r[:, 3:4]
+            return z.amin(dim=1)
+
+        zl = torch.minimum(pts_min(aw, self._pw), pts_min(ag, self._pg))
+        zlow.copy_(zl)
+        return out, zlow
+
+    def _fk(self, ticks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(tip xyz [N,3], wrist frame [N,4,4], gripper frame [N,4,4])."""
         q = (ticks[:, :N_ARM_JOINTS].to(torch.float64) - CENTER_TICK) * self._sign[:N_ARM_JOINTS] * _RAD_PER_TICK
         n = q.shape[0]
         c, s = torch.cos(q), torch.sin(q)
@@ -255,6 +296,7 @@ class BatchedServoChain:
         rz = torch.zeros((n, 4, 4), dtype=torch.float64, device=q.device)
         rz[:, 2, 2] = 1.0
         rz[:, 3, 3] = 1.0
+        aw = a
         for i in range(N_ARM_JOINTS):
             b = torch.matmul(a, self._parent_T[i])
             rz[:, 0, 0] = c[:, i]
@@ -262,9 +304,10 @@ class BatchedServoChain:
             rz[:, 1, 0] = s[:, i]
             rz[:, 1, 1] = c[:, i]
             a = torch.matmul(b, rz)
+            if i == N_ARM_JOINTS - 2:
+                aw = a  # the wrist body frame
         xyz = torch.matmul(a[:, :3, :3], self._tip_pos) + a[:, :3, 3]
-        out.copy_(xyz)
-        return out
+        return xyz, aw, a
 
     # ------------------------------------------------------------------ stats
     @property

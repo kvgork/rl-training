@@ -25,6 +25,9 @@ POSE = np.array([2047, 1395, 2699, 2047, 2047, 2047], dtype=np.int64)
 # shoulder_lift 2010: tip z ~ -0.009, 6 mm above the box floor (table + 5 mm = -0.015, plan §10 2026-10-06);
 # +45 ticks of lift leaves the box (was 1930 / z ~ 0.016 with the old 0.010 floor)
 LOW_POSE = np.array([2047, 2010, 2699, 2047, 2047, 2047], dtype=np.int64)
+# gripper pointing down over the table: tip z ~ -0.009 (6 mm above the tip floor), lowest gripper point ~ -0.0178
+# (1.2 mm above the gripper floor table + 1 mm): the random walk crosses the gripper floor with the tip still in the box
+GRIPPER_DOWN = np.array([2047, 2105, 2405, 2680, 2047, 2350], dtype=np.int64)
 
 
 @pytest.fixture
@@ -88,6 +91,23 @@ def test_fk_matches_so101fk(cfg, calibration, chain):
     fk = So101FK(chain, calibration)
     want = np.stack([fk.gripper_xyz_from_ticks(t.astype(np.int32), np.zeros(3)) for t in ticks])
     assert np.abs(got - want).max() < 1e-9
+
+
+def test_floor_z_bit_identical_to_so101fk(cfg, calibration, chain):
+    """The gripper-floor arithmetic (lowest wrist/gripper point) is the same in both implementations. The point step is
+    elementwise in the same order, but the frames come from 4x4 matmuls and cos/sin whose last bit differs between
+    numpy/libm and torch (as for the tip, test_fk_matches_so101fk): agreement to ~1e-16 m, so a box DECISION can only
+    differ for a pose within ~1e-15 m of a face (the Layer A streams never hit that; they are bit-identical)."""
+    rng = np.random.default_rng(1)
+    ticks = rng.integers(0, 4096, size=(500, N_JOINTS))
+    bc = BatchedServoChain(cfg, calibration, chain, 500, device=CPU)
+    _xyz, zl = bc.fk_tip_and_floor_z(
+        torch.as_tensor(ticks), torch.zeros(500, 3, dtype=torch.float64), torch.zeros(500, dtype=torch.float64)
+    )
+    fk = So101FK(chain, calibration)
+    tip = np.zeros(3)
+    want = np.array([fk.tip_and_floor_z_from_ticks(t.astype(np.int32), tip) for t in ticks])
+    assert np.abs(zl.numpy() - want).max() < 1e-12
 
 
 # ---- stage semantics --------------------------------------------------------------------------------------------
@@ -204,7 +224,7 @@ def test_clamp_active_fraction_counts_stages(cfg, calibration, chain):
 
 
 # ---- randomised open-loop equivalence with the numpy pipeline --------------------------------------------------
-KINDS = ("uniform", "saturating", "nan", "pushes", "low")
+KINDS = ("uniform", "saturating", "nan", "pushes", "low", "gfloor")
 
 
 def _stream(rng, kind, pose, steps):
@@ -221,6 +241,9 @@ def _stream(rng, kind, pose, steps):
             presents[t : t + 4] += rng.integers(-400, 401, size=6)
     if kind == "low":  # around the box floor
         presents = LOW_POSE + np.cumsum(rng.integers(-15, 16, size=(steps * 3, 6)), axis=0)
+    if kind == "gfloor":  # gripper down around the gripper floor (tip in the box), pushed down
+        presents = GRIPPER_DOWN + np.cumsum(rng.integers(-12, 13, size=(steps * 3, 6)), axis=0)
+        deltas[:, 1] = np.abs(deltas[:, 1])  # shoulder_lift down
     return deltas.astype(np.float32), np.clip(presents, 0, 4095)
 
 
@@ -228,22 +251,30 @@ def _stream(rng, kind, pose, steps):
 @pytest.mark.parametrize("seed", range(3))
 def test_random_streams_bit_identical_to_pipeline(cfg, calibration, chain, kind, seed):
     rng = np.random.default_rng(1000 * seed + KINDS.index(kind))
-    pose = LOW_POSE if kind == "low" else POSE
+    pose = {"low": LOW_POSE, "gfloor": GRIPPER_DOWN}.get(kind, POSE)
     steps = 80
     deltas, presents = _stream(rng, kind, pose, steps)
     ref = NpRef(cfg, calibration, chain, pose)
     bc, out = _batched(cfg, calibration, chain, 3, pose=pose)
     stages_seen = 0
+    point_only = 0
+    fk = So101FK(chain, calibration)
     for i in range(steps):
         ref.command(deltas[i])
         bc.new_command(torch.as_tensor(np.stack([deltas[i], np.zeros(6, np.float32), deltas[i]])))
         for k, rem in enumerate((3, 2, 1)):
             p = presents[3 * i + k]
             v = ref.tick(p, rem)
-            pt = torch.as_tensor(np.stack([p, POSE if kind != "low" else LOW_POSE, p]))
+            pt = torch.as_tensor(np.stack([p, pose, p]))
             bc.apply(pt, rem, out)
             for w in (0, 2):
                 bad = _same(v, out, w)
                 assert not bad, f"step {i} tick {k} world {w}: {bad}"
             stages_seen |= int(v.trips)
+            if kind == "gfloor":
+                tip = np.zeros(3)
+                zf = fk.tip_and_floor_z_from_ticks(np.asarray(p, np.int32), tip)
+                point_only += int(fk.in_box(tip, cfg.box) and zf < cfg.box.gripper_floor_z_m)
     assert stages_seen  # the stream exercised at least one clamp
+    if kind == "gfloor":
+        assert point_only > 0, "the stream never put the lowest gripper point below its floor with the tip in the box"

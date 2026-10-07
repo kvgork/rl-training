@@ -383,7 +383,9 @@ def check_plan_in_box(
 ) -> PlanCheck:
     """Kinematic preview of the clamped path, assuming perfect tracking: per command ``goal = clip(goal +
     clip(delta, ±max_delta), joint limits)``, interpolated over ``interp_ticks`` like the pipeline; every tick's FK
-    tip must stay inside ``cfg.box`` shrunk by ``margin_m`` and above ``table_z_m + table_clearance_m``.
+    tip must stay inside ``cfg.box`` shrunk by ``margin_m`` and above ``table_z_m + table_clearance_m``, and the lowest
+    wrist/gripper point (``So101FK.tip_and_floor_z``) ``margin_m`` above ``box.gripper_floor_z_m`` (the pipeline's
+    gripper floor, plan §10 2026-10-06 / 2026-10-07; ``min_box_margin_m`` includes that face).
 
     The box clamp is deliberately NOT applied: a plan must not rely on it (it would also wreck the excitation).
     ``chain`` is a ``safety.fk.KinematicChain``.
@@ -416,9 +418,9 @@ def check_plan_in_box(
         cmd_clamped = bool((goal != raw).any())
         for rem in range(interp, 0, -1):
             target = prev + np.rint((goal - prev) / rem).astype(np.int64)
-            fk.gripper_xyz_from_ticks(target, xyz)
+            floor_z = fk.tip_and_floor_z_from_ticks(target, xyz)
             m = min(xyz[0] - box.x[0], box.x[1] - xyz[0], xyz[1] - box.y[0], box.y[1] - xyz[1],
-                    xyz[2] - box.z[0], box.z[1] - xyz[2])
+                    xyz[2] - box.z[0], box.z[1] - xyz[2], floor_z - box.gripper_floor_z_m)
             min_margin = min(min_margin, m)
             min_clear = min(min_clear, xyz[2] - table)
             if (m < margin_m or xyz[2] < table) and first is None:
@@ -427,7 +429,10 @@ def check_plan_in_box(
             prev = target
             tick += 1
     if first is not None:
-        reasons.append(f"tip leaves the box (margin {margin_m} m) or goes below the table at tick {first[0]}: {first[1]}")
+        reasons.append(
+            f"tip leaves the box (or the lowest gripper point its floor; margin {margin_m} m) or goes below the table "
+            f"at tick {first[0]}: {first[1]}"
+        )
     if not math.isfinite(min_margin):
         reasons.append("empty plan")
     return PlanCheck(

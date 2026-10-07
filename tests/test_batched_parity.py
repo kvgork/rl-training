@@ -408,6 +408,30 @@ def test_layer_a_exercises_every_stage(cpu_rig, mcfg, mcal, kchain):
     print("clamp-active fraction per sequence:", [{k: round(v, 4) for k, v in f.items()} for f in totals])
 
 
+def test_layer_a_gripper_floor_is_exercised(cpu_rig, mcfg, mcal, kchain):
+    """Layer A covers the gripper floor (plan §10 2026-10-06 / 2026-10-07): on the box sequences (d) a chain with the
+    gripper floor moved out of the way emits different targets, i.e. the point floor decided some ticks (and Layer A
+    above is bit-identical WITH it)."""
+    no_floor = dataclasses.replace(mcfg, box=dataclasses.replace(mcfg.box, gripper_floor_z_m=-1.0))
+    differ = 0
+    for idx in [i for i in range(N_SEQ) if KIND[i] == "d"]:
+        run = cpu_run(cpu_rig, mcfg, mcal, kchain, idx)
+        chains = [BatchedServoChain(c, mcal, kchain, 1, device=CPU) for c in (mcfg, no_floor)]
+        outs = [ChainOut.empty(1, CPU) for _ in chains]
+        for bc in chains:
+            bc.resync(torch.as_tensor(run.present[:1]))
+        for i, dl in enumerate(run.deltas):
+            for bc in chains:
+                bc.new_command(torch.as_tensor(dl[None]))
+            for k, rem in enumerate((3, 2, 1)):
+                p = torch.as_tensor(run.present[3 * i + k][None])
+                for bc, out in zip(chains, outs, strict=True):
+                    bc.apply(p, rem, out)
+                differ += int(not torch.equal(outs[0].target_ticks, outs[1].target_ticks))
+    print(f"ticks decided by the gripper floor on the (d) sequences: {differ}")
+    assert differ > 0
+
+
 def test_layer_a_shown_to_fail_with_perturbed_vmax(cpu_rig, mcfg, mcal, kchain):
     """The gate can fail: the torch chain with ``max_ticks_per_tick`` perturbed (only there) mismatches."""
     total = 0
@@ -559,17 +583,12 @@ def test_layer_b_closed_loop(cpu_rig, parity_env, mcfg, mcal, kchain, idx):
 # shoulder_lift: MJCF min = tick 909, calibrated limit 869), seq15e 1.7e-3 rad (alternating +-1: the actuators sit
 # in their force saturation +-3.35 N m on almost every tick). Smooth sequences agree to 1e-6..8e-5 rad. Not loosened:
 # a user decision (plan §10 2026-10-06 "Layer B parity tolerance"): strict xfails, only these three, each capped
-# at _B3_XFAIL_CEILING_RAD (2e-3 rad; seq7b: see _B3_CEILING_PENDING_RAD) so worse drift fails outright.
+# at _B3_XFAIL_CEILING_RAD (2e-3 rad) so worse drift fails outright. With the gripper floor check (2026-10-07)
+# seq7b no longer touches the table (it drifted 4.9e-3 rad with jaw-table contact under the tip-only floor).
 _B3_XFAIL = {6: "self-contact + MJCF joint limit", 7: "self-contact + MJCF joint limit", 15: "actuator force saturation"}
 _B3_SEQ = [i for i in range(N_SEQ) if KIND[i] in (*CONTACT_FREE, "d")]
 # Ceiling for the xfail sequences: the drift may exceed 1e-4 rad (strict xfail) but never this (else a hard failure).
 _B3_XFAIL_CEILING_RAD = 2e-3
-# TEMPORARY, per sequence (integration fix 2026-10-07, reported to the user): seq7b drifts 4.93e-3 rad since the box
-# floor moved to table + 5 mm (2026-10-06 18:39; the jaws now touch the table: contacts_equal False, CPU max 2
-# jaw-table contacts). With the "Gripper floor check" (plan §10 2026-10-06; implemented, held back in a git stash
-# because the die-reach feasibility test cannot stay green with it) it measures 1.20e-3 rad without table contact.
-# Until that lands seq7b is capped at its measured value, so it cannot get worse; then this entry goes.
-_B3_CEILING_PENDING_RAD = {7: 5e-3}
 
 
 @gpu
@@ -594,9 +613,8 @@ def test_layer_b_trajectory(cpu_rig, parity_env, mcfg, mcal, kchain, idx):
     r = _B_RESULTS[idx]
     # the documented ceiling of the accepted xfails (plan §10 2026-10-06, max measured 1.7e-3 rad): worse drift is a
     # real failure, raised as RuntimeError so the strict xfail(raises=AssertionError) does NOT absorb it
-    ceiling = _B3_CEILING_PENDING_RAD.get(idx, _B3_XFAIL_CEILING_RAD)
-    if idx in _B3_XFAIL and not r["qpos_max"] <= ceiling:
-        raise RuntimeError(f"seq{idx}: qpos drift {r['qpos_max']} rad exceeds the xfail ceiling {ceiling}")
+    if idx in _B3_XFAIL and not r["qpos_max"] <= _B3_XFAIL_CEILING_RAD:
+        raise RuntimeError(f"seq{idx}: qpos drift {r['qpos_max']} rad exceeds the xfail ceiling {_B3_XFAIL_CEILING_RAD}")
     bound = 5e-4 if KIND[idx] == "d" else 1e-4
     assert r["qpos_max"] <= bound, (r["qpos_max"], r["qpos_max_per_joint"])
 
