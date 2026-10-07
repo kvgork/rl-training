@@ -1,8 +1,8 @@
 """SO-101 deadman watchdog (MicroPython, RP2040). Protocol: PROTOCOL.md. Relay is ON only while ARMED."""
 
 T_MS, UV_MV, UV_HOLD, RST_HOLD, DROP_MV, DROP_TMO = 1000, 9000, 50, 500, 1000, 2000
-WELD_MS, PART_MS = 500, 100  # relay-weld detect window; partial-frame timeout
-NONE, TIMEOUT, UNDERVOLT, SEQ, ESTOP, TEST, RESET, WELD = range(8)
+WELD_MS, PART_MS, ARM_TMO = 500, 100, 120000  # weld window; partial-frame timeout; DISARMED without ARM
+NONE, TIMEOUT, UNDERVOLT, SEQ, ESTOP, TEST, RESET, WELD, ARMTMO = range(9)
 DISARMED, ARMED, LATCHED = range(3)
 
 
@@ -10,7 +10,7 @@ class Core:  # pure logic, no hardware: the host tests drive exactly this class
     def __init__(self, now, diff):  # MCU: time.ticks_diff (wrap-safe); host tests inject an equivalent
         self.d, self.state, self.reason, self.uv, self.es = diff, LATCHED, RESET, False, False  # boot LATCHED
         self.last, self.seq, self.buf, self.lo, self.rst, self.drop = now, None, b"", None, None, None
-        self.live, self.wt, self.ft = False, None, now  # servo side >= 1 V; weld timer; last rx byte
+        self.live, self.wt, self.ft, self.dt = False, None, now, now  # bus live; weld/rx/DISARMED t0
 
     def status(self):
         a = self.state == ARMED
@@ -25,10 +25,12 @@ class Core:  # pure logic, no hardware: the host tests drive exactly this class
         uv_trip = self.uv and self.d(now, self.lo) > UV_HOLD
         if self.state == ARMED and (estop or uv_trip or self.d(now, self.last) >= T_MS):
             self.trip(ESTOP if estop else UNDERVOLT if uv_trip else TIMEOUT)
+        if self.state == DISARMED and self.d(now, self.dt) >= ARM_TMO:
+            self.trip(ARMTMO)  # a press means: arm within 2 minutes (window from DISARMED entry, wrap-safe)
         held = self.state == LATCHED and btn and not estop  # only the physical button clears a latch
         self.rst = (self.rst if self.rst is not None else now) if held else None
         if held and self.d(now, self.rst) >= RST_HOLD:
-            self.state, self.rst = DISARMED, None  # reason kept until the next ARM
+            self.state, self.rst, self.dt = DISARMED, None, now  # reason kept until the next ARM
         self.wt = (self.wt if self.wt is not None else now) if self.live and self.state != ARMED else None
         if self.wt is not None and self.d(now, self.wt) >= WELD_MS:
             self.trip(WELD)  # relay open yet servo bus live: weld fault

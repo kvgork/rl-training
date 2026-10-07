@@ -610,8 +610,8 @@
    ]
   },
   {
-   "name": "disarmed_never_times_out",
-   "doc": "A DISARMED MCU stays DISARMED forever.",
+   "name": "disarmed_119999ms_still_disarmed",
+   "doc": "FW1: DISARMED without ARM stays DISARMED for 119 999 ms after DISARMED entry (the button release); the ARM timeout is >= 120 000 ms.",
    "start_ms": 0,
    "portable": true,
    "steps": [
@@ -635,7 +635,7 @@
      "out": "60"
     },
     {
-     "dt": 100000,
+     "dt": 114999,
      "tx": "e0",
      "out": "60"
     }
@@ -1462,6 +1462,459 @@
      "dt": 2,
      "tx": "e0",
      "out": "12"
+    }
+   ]
+  },
+  {
+   "name": "disarmed_120000ms_latches_reason_8",
+   "doc": "FW1: exactly 120 000 ms in DISARMED without ARM latches reason 8 (ARM_TIMEOUT): 0x82. The timeout is evaluated before the frame, so an ARM at exactly 120 000 ms is refused.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 120000,
+     "tx": "e05a",
+     "out": "8282"
+    }
+   ]
+  },
+  {
+   "name": "arm_at_119000ms_accepted",
+   "doc": "FW1: ARM inside the 2-minute window is accepted (0x05); once ARMED the arm timer no longer applies (still ARMED with heartbeats past 120 000 ms from DISARMED entry).",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 119000,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 999,
+     "tx": "a510ef",
+     "out": "05"
+    },
+    {
+     "dt": 999,
+     "tx": "a511ee",
+     "out": "05"
+    }
+   ]
+  },
+  {
+   "name": "press_after_arm_timeout_reenters_disarmed_and_restarts_window",
+   "doc": "FW1: after an ARM_TIMEOUT latch a new 500 ms press re-enters DISARMED (0x80, reason 8 kept) and restarts the 120 000 ms window from the new DISARMED entry.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 120000,
+     "tx": "e0",
+     "out": "82"
+    },
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "tx": "e0",
+     "out": "80"
+    },
+    {
+     "dt": 119999,
+     "tx": "e0",
+     "out": "80"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "wrap_safe_arm_timeout_30bit",
+   "doc": "FW1: the ARM timeout uses wrap-safe ticks_diff; the 2**30 tick wrap (RP2040 MicroPython) falls inside the window (DISARMED entry 60 000 ms before the wrap).",
+   "start_ms": 1073681324,
+   "portable": false,
+   "wrap_bits": 30,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 60000,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 59999,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "serial_traffic_does_not_extend_arm_window",
+   "doc": "FW1 grill: STATUS, heartbeats, line noise, a stalled partial frame and ARM attempts while the window runs never move it: still 0x82 at exactly 120 000 ms after DISARMED entry.",
+   "start_ms": 0,
+   "portable": true,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 30000,
+     "tx": "a510ef0013e0",
+     "out": "6060"
+    },
+    {
+     "dt": 30000,
+     "tx": "a5",
+     "out": ""
+    },
+    {
+     "dt": 30000,
+     "tx": "1112e0",
+     "out": "60"
+    },
+    {
+     "dt": 29999,
+     "tx": "a511ee",
+     "out": "60"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "arm_refused_by_undervolt_does_not_extend_arm_window",
+   "doc": "FW1 grill: an ARM refused while DISARMED (PSU-side undervolt; the undervolt bit shows 0x68) neither arms nor restarts the window; undervolt does not trip DISARMED by itself.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 100000,
+     "vbus_mv": 8000,
+     "tx": "5a",
+     "out": "68"
+    },
+    {
+     "dt": 19999,
+     "tx": "5a",
+     "out": "68"
+    },
+    {
+     "dt": 0,
+     "vbus_mv": 12000,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 1,
+     "tx": "5a",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "button_while_disarmed_does_not_restart_arm_window",
+   "doc": "FW1 grill: the button acts only on LATCHED; holding it while DISARMED neither re-enters DISARMED nor restarts the window.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 60000,
+     "btn": true,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 600,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 400,
+     "btn": false,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 58999,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "button_held_through_arm_timeout_only_returns_to_disarmed",
+   "doc": "FW1 grill: a button held through the timeout latches 0x82 first; the arm timeout is checked before the button rows (like the heartbeat TIMEOUT), so the 500 ms hold starts at the latch tick and DISARMED (0x80) returns at exactly latch + 500 ms, with a fresh window from that entry. The relay never closes without ARM.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 119000,
+     "btn": true,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 1000,
+     "tx": "e0",
+     "out": "82"
+    },
+    {
+     "dt": 499,
+     "tx": "e0",
+     "out": "82"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "80"
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "tx": "e0",
+     "out": "80"
+    },
+    {
+     "dt": 119999,
+     "tx": "e0",
+     "out": "80"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "arm_timeout_window_restarts_after_armed_trip",
+   "doc": "FW1 grill: ARM at 100 s, heartbeat TIMEOUT latch (0x12), press: the new DISARMED entry restarts the window (no stale entry tick from the first press).",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 100000,
+     "tx": "5a",
+     "out": "05"
+    },
+    {
+     "dt": 1000,
+     "tx": "e0",
+     "out": "12"
+    },
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "tx": "e0",
+     "out": "10"
+    },
+    {
+     "dt": 119999,
+     "tx": "e0",
+     "out": "10"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "82"
+    }
+   ]
+  },
+  {
+   "name": "weld_overrides_arm_timeout",
+   "doc": "FW1 grill: the arm timeout is checked before the weld timer (and before the button rows); a live servo side that started 400 ms before the timeout latches 0x82 first and is then overwritten by WELD (0x72) at its 500 ms.",
+   "start_ms": 0,
+   "portable": false,
+   "steps": [
+    {
+     "dt": 0,
+     "btn": true,
+     "out": ""
+    },
+    {
+     "dt": 500,
+     "out": ""
+    },
+    {
+     "dt": 0,
+     "btn": false,
+     "out": ""
+    },
+    {
+     "dt": 119600,
+     "servo_mv": 12000,
+     "tx": "e0",
+     "out": "60"
+    },
+    {
+     "dt": 400,
+     "tx": "e0",
+     "out": "82"
+    },
+    {
+     "dt": 99,
+     "tx": "e0",
+     "out": "82"
+    },
+    {
+     "dt": 1,
+     "tx": "e0",
+     "out": "72"
     }
    ]
   },
