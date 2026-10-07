@@ -8,6 +8,7 @@
 > - **[v2]** marks new or changed content.
 > - **[v2-conflict]** marks a place where vault evidence contradicts v1. Each conflict is an open decision in §8 until it is resolved.
 > - **[v3]** marks the sim-first changes (2026-10-05).
+> - **[v4]** marks the AI training connector (2026-10-07, §12).
 >
 > The sources are listed in §11. Vault paths are relative to `~/Documents/Vaults/Local`, and `LIT` means `/mnt/data/workspaces/lerobot-isaac-training`.
 
@@ -568,11 +569,46 @@ Each decision is recorded here once it is made, so it is not argued again.
 | 2026-10-06 | Gripper floor check | The box floor applies to the **lowest point of the gripper** (several FK points on the gripper body), not only the jaw tip, so no part of the gripper is driven into the table. The safety pipeline and the batched sim chain must implement it identically. | User answer to the integration review: tip-only allowed pressing about 3 mm into the table |
 | 2026-10-07 | Gripper floor clearance | Supersedes the 5 mm clearance for the gripper-point check, which made the 16 mm die ungraspable: the jaw centres sit about 11 mm above the lowest gripper vertex, and the best margin was +0.05 mm on the points and −1.1 mm on the mesh. The **lowest gripper/wrist point must stay ≥ 1 mm above the table**. Its BOX_PRESENT tolerance for these points is **2 mm**, so nothing presses more than about 1 mm into the table. The jaw-tip floor stays at −0.015 m. | User answer after the executor stopped on the feasibility test |
 | 2026-10-07 | Re-energise start floor value | The start floor is the old box-floor value, tip **z ≥ 0.010 m in the base frame (3 cm above the table)**, as shipped in `safe_state.start_min_tip_z_m`. The rest-pose tolerance branch is unchanged. | User clarification. The earlier row said "≥ 1 cm above the table"; this row supersedes it. |
+| 2026-10-07 | AI connector (P1) | `so101_rl.lab` (a Python API) plus a thin stdio MCP server with 12 tools in LA1. Training jobs run as detached processes under a `systemd --user` supervisor and outlive the MCP session. A read-only local web dashboard (127.0.0.1) supersedes "no web UI beyond TensorBoard". The trainer interface is general in shape; only FastSAC, SB3 SAC+HER and TD-MPC2 are implemented. Done = full unattended sim runs, plus unattended real-hardware runs after Tier 1 approval. | User request and answers; design `plans/ai-connector-design.md` v2 |
+| 2026-10-07 | Signed human records (P2) | Approvals (`APPROVE <run_id> <episodes>x<speed>`), S4-exit checklist ticks, needs-human acks and the Tier 1 record are all Ed25519-signed. They are made only by root-owned scripts outside the repo (`so101-approve`, `so101-gate-sign`, `so101-ack`) against a root-owned `allowed_signers`. The connector verifies records and never creates them. The S4 exit gate: the AI reviews first, and the human signs later; nothing reaches the real arm unsigned. | User answers |
+| 2026-10-07 | Servo park / idle / resume (P3, SV1) | Between Tier 1 runs the arm holds at `home`. A servo-side idle timer (`park_timeout_s`, default 600) rests the arm and turns torque off. `RESUME_REQ` triggers the full existing re-energise. Every existing safety obligation is kept. This is a servo work item with its own review. Supersedes "rest + torque off between runs". | User answer to the design critic |
+| 2026-10-07 | Firmware arm timeout (P4, FW1) | The watchdog goes DISARMED → LATCHED after 120 s without ARM (new reason 8). A button press therefore means "arm within 2 minutes". The servo's `--arm-timeout-s` is 110 s. At Tier 1 the connector may start the servo itself, inside that window. | User answer to the design critic |
+| 2026-10-07 | Tier 1 session rules (P5) | Session cap ramp: 60 → 120 → 240 → 480 min, raised only after clean sessions. A clean session has no faults beyond at most 1 auto-resumed thermal trip. Also required:<br>• a power-cycle and relay-weld check between sessions;<br>• quiet hours 23:00–07:00;<br>• a minimum 2-minute gap between runs;<br>• a policy allow-list;<br>• at most 240 arm-minutes per day, with the day ending at local midnight;<br>• a ≥ 120-minute strict soak, verified at promotion and at every admission. | User answers |
+| 2026-10-07 | Budget accounting (P6) | Probes (≤ 10 min, ≤ 1 GPU-h pooled per task) are not attempts. GPU-h is counted as progress-holding time, with a stall cap. The ledger is derived from the run dirs, has an `import-run` CLI, and halts when attempts shrink. | User answer |
+| 2026-10-07 | Review triggers via connector (P7) | Sim attempts: the AI is the first reviewer and may pause and resume at most twice, then the run stops. Probes continue. Real runs stop and need a signed ack. The method is never switched automatically. | User answer |
+| 2026-10-07 | Thermal fail-closed (P8) | GPU core: pause at 85 °C, resume at 75 °C (as logged before). GPU memory junction: pause at 95 °C, resume at 85 °C, when observable via NVML. Six empty samples pause all jobs and raise a needs-human item. | User answer |
+| 2026-10-07 | Proposals inbox (P9) | The AI proposes plan changes only as files in `plans/proposals/`. A human merges them into §10. | User answer |
 | 2026-10-06 | TensorBoard videos | Add `moviepy` so rollout videos show inline in the dashboard | User answer |
 | 2026-10-06 | Camera parity | The sim camera must equal the real D435. Intrinsics come from the device (colour 640×480, fx 617.17, fy 617.57, cx 327.95, cy 236.12; depth fx 388.33, 14.8 mm from colour; no distortion). Extrinsics come from a **camera-only calibration**: a table-plane fit (measured on 2026-10-06: height 346 mm, axis 64° from vertical) plus registration of the arm's FK shape (servo angles read read-only) against the depth point cloud. H8 hand-eye later refines it. **The current oblique mount is kept**, and the sim models its occlusion. One file, `calib/camera.yaml`, is the source for the sim camera, the sim tracker and the videos. | User answers. No camera-to-base calibration existed in the LeRobot workspace (`extrinsics.json` was never written). |
 | 2026-09-30 | RL algorithm | TD-MPC2 as main, plus a SAC + HER baseline on reach | Tests whether the world model helps. Fitting in 10 GB is a hypothesis to be measured in Phase 2. TD-MPC2 is **vendored** (MIT licence, no packaging files in the repo). |
 | 2026-09-30 | Simulator | MuJoCo, using the official TheRobotStudio MJCF, system-identified | Light on VRAM, good contacts. Supersedes the Isaac choice from the earlier plans for this project. |
 | 2026-09-30 | Autonomy | Hardware e-stop, then tiers: attended until the 30-minute soak test passes, then unattended with a watchdog that cuts power | Resolves the conflict between minimal human time and the current consent rule. |
+
+## 12. [v4] AI training connector (2026-10-07)
+
+An AI client (e.g. Claude Code) can drive training through the `so101_rl.lab` Python API and its thin MCP server.
+
+**What the AI can do on its own:**
+- create, run, monitor, pause, evaluate, gate and export **sim** training runs, fully unattended, within the GPU budgets and thermal limits;
+- run **real-hardware** jobs only under the autonomy tiers:
+  - **Tier 0:** a signed human approval per run.
+  - **Tier 1:** after the signed promotion and the session rules, the AI may run real-arm jobs and start the servo inside a human-opened arming window.
+
+**What never changes:** the connector never bypasses ServoCore, the hardware gates or the safety layer.
+
+The trainer interface is generic in shape (datasets, offline training, export), so imitation, world-model and VLA trainers can be added later without changing the connector.
+
+**Sources:** the design is `plans/ai-connector-design.md` (v2), and the decisions are the §10 rows dated 2026-10-07.
+
+**Build order:**
+
+| Phase | Contents | Depends on |
+|---|---|---|
+| LA0–LA1 | Core lab, trainers, supervisor, 12-tool MCP, dashboard | Buildable now |
+| LA2 | Training pipelines | SU4 |
+| LA3 | Real-arm deployment | SU5 / SR2 |
+| LA4 | Real-arm jobs via the connector | LA3, SV1, FW1, PE1 and the H-track |
+| LA5 | Tier 1 unattended | H13, the 120-minute soak and a clean attended session |
 
 ## 11. [v2] Sources
 
