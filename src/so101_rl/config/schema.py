@@ -121,7 +121,11 @@ class SafeStateConfig:
     table_clearance_m: float = 0.005
     transit_zone_m: float = 0.05
     home_box_margin_m: float = 0.010  # FK(home) at least this far inside every box face
-    rest_tolerance_ticks: int = 100  # reenergize starts only within this of rest (arm joints) or inside the box
+    rest_tolerance_ticks: int = 100  # reenergize starts within this of rest (arm joints), or see start_min_tip_z_m
+    # Re-energise start rule (plan §10 2026-10-06): away from rest, the tip must be inside the box AND at least this
+    # high (the old 0.010 m floor). Independent of the running box floor (box.z[0] = -0.015): a fallen arm with its
+    # tip near the table needs a human.
+    start_min_tip_z_m: float = 0.010
 
 
 @dataclass(frozen=True)

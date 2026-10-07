@@ -18,6 +18,9 @@ S = 1_000_000_000
 NEAR_REST = [2060, 2190, 2310, 2740, 2047, 2300]  # within rest_tolerance_ticks of the shipped rest pose
 IN_BOX = [1900, 1300, 2600, 2700, 2047, 2300]  # tip inside the box, far from rest
 OUTSIDE = [2047, 2047, 2047, 2047, 2047, 2047]  # tip at x = 0.39 m: outside the box and far from rest
+# Fallen sideways (pan +44 deg from rest, arm folded down): tip (0.110, -0.070, 0.000) m, INSIDE the running box
+# (floor -0.015) but below the 0.010 m start floor, and far from rest. The pre-2026-10-07 rule accepted it.
+FALLEN = [2550, 1800, 2700, 2745, 2047, 2065]
 
 
 class LoggingBus:
@@ -233,6 +236,30 @@ def test_start_pose_neither_near_rest_nor_in_box_is_refused_before_any_goal_or_t
     with pytest.raises(UnsafeStartPose, match="neither"):
         reenergize(bus, cfg, calibration, clock, BlockRead())
     assert "write_goal" not in bus.log and "set_torque:True" not in bus.log
+
+
+def test_fallen_pose_with_tip_near_the_table_is_refused_before_any_goal_or_torque(cfg, calibration, clock, fk):
+    """Plan §10 2026-10-06 "Re-energise start rule": the lower running floor must not widen the start rule."""
+    xyz = fk.gripper_xyz_from_ticks(np.asarray(FALLEN), np.zeros(3))
+    assert fk.in_box(xyz, cfg.box) and abs(xyz[2]) < 1e-3  # in the running box, tip at z = 0.0 m
+    rest = np.asarray(cfg.safe_state.rest_ticks)
+    assert np.abs(np.asarray(FALLEN)[:5] - rest[:5]).max() > cfg.safe_state.rest_tolerance_ticks
+    bus = LoggingBus(calibration, clock, present=FALLEN)
+    with pytest.raises(UnsafeStartPose, match="start_min_tip_z_m"):
+        reenergize(bus, cfg, calibration, clock, BlockRead())
+    assert "write_goal" not in bus.log and "set_torque:True" not in bus.log
+
+
+def test_start_floor_is_the_config_key_not_the_running_box_floor(cfg, calibration, clock, fk):
+    """A high in-box pose is accepted; lowering safe_state.start_min_tip_z_m to the box floor would re-admit the
+    fallen pose (the key, not box.z[0], decides)."""
+    assert cfg.safe_state.start_min_tip_z_m == pytest.approx(0.010)
+    assert fk.gripper_xyz_from_ticks(np.asarray(IN_BOX), np.zeros(3))[2] >= cfg.safe_state.start_min_tip_z_m
+    reenergize(LoggingBus(calibration, clock, present=IN_BOX), cfg, calibration, clock, BlockRead())
+    low = replace(cfg, safe_state=replace(cfg.safe_state, start_min_tip_z_m=cfg.box.z[0]))
+    bus = LoggingBus(calibration, clock, present=FALLEN)
+    reenergize(bus, low, calibration, clock, BlockRead())  # only to show the key is what refuses FALLEN above
+    assert bus.torque
 
 
 def test_rest_tolerance_is_per_arm_joint(cfg, calibration, clock):

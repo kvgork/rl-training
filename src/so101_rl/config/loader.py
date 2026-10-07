@@ -61,6 +61,8 @@ HOMING_OFFSET_RANGE = (-2047, 2047)
 MAX_TRIPS_PER_HOUR_RANGE = (1, 10)
 # Plausible table height below the base frame origin (m); the box floor is the upper bound.
 TABLE_Z_RANGE_M = (-0.2, 0.0)
+# Lowest allowed safe_state.start_min_tip_z_m above the table (plan §10 2026-10-06: "tip >= 1 cm above the table").
+START_MIN_ABOVE_TABLE_M = 0.010
 SAFE_STATE_KEYS = frozenset(
     {
         "bound_s",
@@ -73,6 +75,7 @@ SAFE_STATE_KEYS = frozenset(
         "transit_zone_m",
         "home_box_margin_m",
         "rest_tolerance_ticks",
+        "start_min_tip_z_m",
     }
 )
 
@@ -427,12 +430,22 @@ def load_config(
         rest_tolerance_ticks=_in_range(
             _int(s["rest_tolerance_ticks"], "safe_state.rest_tolerance_ticks"), 1, 400, "safe_state.rest_tolerance_ticks"
         ),
+        start_min_tip_z_m=_num(s["start_min_tip_z_m"], "safe_state.start_min_tip_z_m"),
     )
     _in_range(safe.ramp_ticks_per_tick, 1, 64, "safe_state.ramp_ticks_per_tick")
     if not TABLE_Z_RANGE_M[0] <= safe.table_z_m < box.z[0]:
         raise ValueError(
             f"safe_state.table_z_m: must be within {TABLE_Z_RANGE_M[0]} m and below box.z[0] = {box.z[0]} m, "
             f"got {safe.table_z_m}"
+        )
+    # The start floor is at least 1 cm above the table (plan §10 2026-10-06 "Re-energise start rule"; shipped: 0.010 m,
+    # the old box floor) and below the box top. It is independent of box.z[0]: lowering the running floor must never
+    # widen the start rule again.
+    start_lo = safe.table_z_m + START_MIN_ABOVE_TABLE_M
+    if not start_lo <= safe.start_min_tip_z_m < box.z[1]:
+        raise ValueError(
+            f"safe_state.start_min_tip_z_m: must be within [table_z_m + {START_MIN_ABOVE_TABLE_M} = {start_lo:.4f} m, "
+            f"box.z[1] = {box.z[1]} m), got {safe.start_min_tip_z_m}"
         )
     for key in ("table_clearance_m", "transit_zone_m", "home_box_margin_m"):
         if not getattr(safe, key) >= 0.0:

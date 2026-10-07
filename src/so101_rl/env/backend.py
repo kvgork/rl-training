@@ -372,8 +372,8 @@ class SimBackend:
 
     def reset(self, q0_ticks: np.ndarray | None) -> None:
         """Boot a fresh servo core with the arm limp at the start keyframe (``q0_ticks`` overrides its joint
-        positions; it must be at rest or inside the box, like any re-energise start pose). Ends in RUN after one
-        published RUN record; the re-energise ramp has moved the arm to home."""
+        positions; it must be near rest or in the box above safe_state.start_min_tip_z_m, like any re-energise
+        start pose). Ends in RUN after one published RUN record; the re-energise ramp has moved the arm to home."""
         import mujoco
 
         from so101_rl.servo.core import build_servo_core

@@ -126,6 +126,7 @@ def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
         raw["safe_state"]["rest_ticks"] = [2050, 2264, 2481, 2993, 2040, 2065]
         raw["safe_state"]["table_z_m"] = 0.0025
         raw["box"]["z"] = [0.010, 0.28]  # the loader needs table_z_m < box.z[0] (shipped floor: -0.015)
+        raw["safe_state"]["start_min_tip_z_m"] = 0.0125  # >= table + 1 cm (loader rule)
 
     probs = _problems(tmp_path, calibration, mut)
     assert len(probs) == 1
@@ -220,9 +221,23 @@ def test_present_tolerance_is_bounded(tmp_path, calibration, bad):
     _rejects(tmp_path, calibration, lambda r: r["box"].update(present_tolerance_m=bad), "present_tolerance_m")
 
 
-@pytest.mark.parametrize("key", ["table_z_m", "table_clearance_m", "transit_zone_m", "home_box_margin_m", "rest_tolerance_ticks"])
+@pytest.mark.parametrize(
+    "key",
+    ["table_z_m", "table_clearance_m", "transit_zone_m", "home_box_margin_m", "rest_tolerance_ticks", "start_min_tip_z_m"],
+)
 def test_new_safe_state_keys_have_no_hidden_default(tmp_path, calibration, key):
     _rejects(tmp_path, calibration, lambda r: r["safe_state"].pop(key), key)
+
+
+@pytest.mark.parametrize("bad", [-0.0101, -0.015, -0.03, 0.28, 0.5, "0.01", float("nan")])
+def test_start_min_tip_z_is_range_checked(tmp_path, calibration, bad):
+    """Less than 1 cm above the table (z < -0.010; e.g. the running box floor -0.015), at/above the box top, or not
+    a finite number: refused."""
+    _rejects(tmp_path, calibration, lambda r: r["safe_state"].update(start_min_tip_z_m=bad), "start_min_tip_z_m")
+
+
+def test_start_min_tip_z_is_loaded(cfg):
+    assert cfg.safe_state.start_min_tip_z_m == pytest.approx(0.010)
 
 
 def test_present_tolerance_has_no_hidden_default(tmp_path, calibration):

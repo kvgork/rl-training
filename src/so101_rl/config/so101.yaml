@@ -62,7 +62,10 @@ safe_state:
   table_clearance_m: 0.005        # the ramp target's tip never goes below table_z_m + this
   transit_zone_m: 0.05            # below floor + this, joints that lower the tip wait for the lifting joints
   home_box_margin_m: 0.010        # FK(home) at least this far inside every box face
-  rest_tolerance_ticks: 100       # reenergize starts only within this of rest (arm joints) or inside the box
+  rest_tolerance_ticks: 100       # reenergize starts within this of rest (arm joints), or per start_min_tip_z_m
+  # Re-energise start rule (plan §10 2026-10-06): away from rest the tip must be inside the box AND at least this
+  # high (the old 0.010 m floor, 3 cm above the table). Independent of the running box floor box.z[0] = -0.015.
+  start_min_tip_z_m: 0.010
 
 box:                              # metres, base frame (from LIT DEFAULT_BOX)
   x: [0.08, 0.34]

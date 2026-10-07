@@ -14,9 +14,11 @@ Order, and why:
 4. ``read_block`` -> start-pose check -> temperature / status check -> ``write_goal(present)`` -> read
    ``Goal_Position`` back from every motor and require it equals present. A failed read is never treated as
    ``present = 0``.
-   * Start pose (review B1 d): the arm must be near the rest pose (every arm joint within
-     ``safe_state.rest_tolerance_ticks``) or with its tip inside the box; anything else (the arm fell somewhere
-     after a torque-off in place) needs a human.
+   * Start pose (review B1 d; plan §10 2026-10-06 "Re-energise start rule"): the arm must be near the rest pose
+     (every arm joint within ``safe_state.rest_tolerance_ticks``) or have its tip inside the box AND at least
+     ``safe_state.start_min_tip_z_m`` (0.010 m, the old box floor) high. The running box floor (-0.015 m, table
+     + 5 mm) does NOT apply here: anything else (the arm fell somewhere after a torque-off in place, e.g. on its
+     side with the tip near the table) needs a human.
    * Temperatures and status (review S5): every joint below ``thermal.trip_c`` and not 0/255, Status 0.
 5. ``set_torque(True)``: only now. The arm does not jump because goal == present.
 6. ramp home through the transit zone (``safety/transit.py``), with the same per-tick step and tracking clamp as
@@ -81,7 +83,8 @@ class ReenergizeAborted(RuntimeError):
 
 
 class UnsafeStartPose(RuntimeError):
-    """The arm is neither near rest nor inside the box: re-energising could swing it through anything."""
+    """The arm is neither near rest nor inside the box above the start floor: re-energising could swing it through
+    anything."""
 
 
 def register_name(field_name: str) -> str:
@@ -237,11 +240,13 @@ def _check_start_pose(cfg: So101Config, fk: So101FK, present: np.ndarray) -> Non
     if near_rest:
         return
     xyz = fk.gripper_xyz_from_ticks(present, np.zeros(3))
-    if fk.in_box(xyz, cfg.box):
+    z_min = cfg.safe_state.start_min_tip_z_m
+    if fk.in_box(xyz, cfg.box) and float(xyz[2]) >= z_min:
         return
     raise UnsafeStartPose(
         f"re-energise refused: present {present.tolist()} (tip {np.round(xyz, 3).tolist()} m) is neither within "
-        f"{cfg.safe_state.rest_tolerance_ticks} ticks of rest {rest.tolist()} nor inside the box"
+        f"{cfg.safe_state.rest_tolerance_ticks} ticks of rest {rest.tolist()} nor inside the box with the tip at "
+        f"z >= {z_min} m (safe_state.start_min_tip_z_m; the running box floor does not apply to a start)"
     )
 
 
