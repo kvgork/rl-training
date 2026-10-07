@@ -71,4 +71,21 @@ break on torch 2.11 and are patched (see `src/so101_rl/_vendor/tdmpc2/PATCHES.md
   real-time scheduling (`rt_active`); a strict pass needs at least 30 minutes. A run with too few samples or policy
   steps, or one cut short, fails on any host.
 
+Sim-first track (`plans/sim-track-implementation-plan.md`; GPU tasks in the `default` env, never a serial device):
+
+- `pixi run bench-warp` MuJoCo Warp throughput / VRAM / overflow / parity, the S0 gate.
+- `pixi run sim-parity` the frozen three-layer servo-parity test of the batched env (`tests/test_batched_parity.py`:
+  Layer A on CPU, B and C need the GPU; 3 Layer B xfails are accepted, plan §10 2026-10-06).
+- `pixi run -e cpu tray-check --drops 100` the sim twin of H9: the start-well tray returns a dropped die (PASS at
+  >= 95 %, `runs/tray/<ts>.json`).
+- `pixi run -e cpu sysid-excite --backend sim --plan short --out runs/sysid/dry` an excitation dry run against a
+  `servo --backend mujoco` child (`--backend real --attended` is HS1, after H2/H3/H5/H7; `--backend synthetic` is the
+  ground-truth rig).
+- `pixi run sysid-fit --run runs/sysid/<ts> --backend {warp,cpu} --out calib/sim_params.yaml` the sysid fit (servo
+  ratio group + delay); writes the yaml only when the held-out RMS is <= 1 % per joint.
+- `pixi run viz-demo --nworld 256 --record 5 --out runs/viz-demo/` the visualisation demo (random walk on MuJoCo
+  Warp; headless EGL rollout videos, TensorBoard scalars; `--viewer` opens the live window on a display).
+- `pixi run viz-attach --run runs/<run>` attaches the live 3D viewer to a running training run (needs a display).
+- `pixi run dashboard [--logdir runs/]` TensorBoard on localhost:6006 over every `runs/<run>/tensorboard`.
+
 `pixi task list` shows all tasks; tasks pointing at modules that later units create fail until then.

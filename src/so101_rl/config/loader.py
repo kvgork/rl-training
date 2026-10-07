@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -61,6 +62,12 @@ HOMING_OFFSET_RANGE = (-2047, 2047)
 MAX_TRIPS_PER_HOUR_RANGE = (1, 10)
 # Plausible table height below the base frame origin (m); the box floor is the upper bound.
 TABLE_Z_RANGE_M = (-0.2, 0.0)
+# Gripper floor (plan §10 2026-10-07): clearance of the lowest gripper point above the table, and how far its present
+# tolerance may let it press into the table.
+GRIPPER_CLEARANCE_MAX_M = 0.02
+GRIPPER_MAX_PENETRATION_M = 0.001
+# Lowest allowed safe_state.start_min_tip_z_m above the table (plan §10 2026-10-06: "tip >= 1 cm above the table").
+START_MIN_ABOVE_TABLE_M = 0.010
 SAFE_STATE_KEYS = frozenset(
     {
         "bound_s",
@@ -73,6 +80,7 @@ SAFE_STATE_KEYS = frozenset(
         "transit_zone_m",
         "home_box_margin_m",
         "rest_tolerance_ticks",
+        "start_min_tip_z_m",
     }
 )
 
@@ -397,18 +405,35 @@ def load_config(
             f"{firmware_max}"
         )
 
-    b = _keys(raw["box"], {"x", "y", "z", "present_tolerance_m"}, "box")
+    b = _keys(
+        raw["box"], {"x", "y", "z", "present_tolerance_m", "gripper_floor_clearance_m", "gripper_present_tolerance_m"}, "box"
+    )
     box = WorkspaceBox(
         x=_pair(b["x"], "box.x"),
         y=_pair(b["y"], "box.y"),
         z=_pair(b["z"], "box.z"),
         present_tolerance_m=_num(b["present_tolerance_m"], "box.present_tolerance_m"),
+        gripper_present_tolerance_m=_num(b["gripper_present_tolerance_m"], "box.gripper_present_tolerance_m"),
     )
+    gripper_clearance = _num(b["gripper_floor_clearance_m"], "box.gripper_floor_clearance_m")
+    if not 0.0 <= gripper_clearance <= GRIPPER_CLEARANCE_MAX_M:
+        raise ValueError(
+            f"box.gripper_floor_clearance_m: must be within 0..{GRIPPER_CLEARANCE_MAX_M} m, got {gripper_clearance}"
+        )
     for axis, (lo_m, hi_m) in (("x", box.x), ("y", box.y), ("z", box.z)):
         if not lo_m < hi_m:
             raise ValueError(f"box.{axis}: lower bound must be below upper bound")
     if not 0.0 <= box.present_tolerance_m <= 0.02:
         raise ValueError(f"box.present_tolerance_m: must be within 0..0.02 m, got {box.present_tolerance_m}")
+
+    # The gripper-point present tolerance may let a point press at most GRIPPER_MAX_PENETRATION_M into the table
+    # (plan §10 2026-10-07: 1 mm clearance, 2 mm tolerance -> ~1 mm); checked below once table_z_m is known.
+    if not 0.0 <= box.gripper_present_tolerance_m <= gripper_clearance + GRIPPER_MAX_PENETRATION_M:
+        raise ValueError(
+            f"box.gripper_present_tolerance_m: must be within 0..gripper_floor_clearance_m + "
+            f"{GRIPPER_MAX_PENETRATION_M} = {gripper_clearance + GRIPPER_MAX_PENETRATION_M:.4f} m, "
+            f"got {box.gripper_present_tolerance_m}"
+        )
 
     s = _keys(raw["safe_state"], SAFE_STATE_KEYS, "safe_state")
     order = s["torque_off_order"]
@@ -427,6 +452,7 @@ def load_config(
         rest_tolerance_ticks=_in_range(
             _int(s["rest_tolerance_ticks"], "safe_state.rest_tolerance_ticks"), 1, 400, "safe_state.rest_tolerance_ticks"
         ),
+        start_min_tip_z_m=_num(s["start_min_tip_z_m"], "safe_state.start_min_tip_z_m"),
     )
     _in_range(safe.ramp_ticks_per_tick, 1, 64, "safe_state.ramp_ticks_per_tick")
     if not TABLE_Z_RANGE_M[0] <= safe.table_z_m < box.z[0]:
@@ -434,9 +460,20 @@ def load_config(
             f"safe_state.table_z_m: must be within {TABLE_Z_RANGE_M[0]} m and below box.z[0] = {box.z[0]} m, "
             f"got {safe.table_z_m}"
         )
+    # The start floor is at least 1 cm above the table (plan §10 2026-10-06 "Re-energise start rule"; shipped: 0.010 m,
+    # the old box floor) and below the box top. It is independent of box.z[0]: lowering the running floor must never
+    # widen the start rule again.
+    start_lo = safe.table_z_m + START_MIN_ABOVE_TABLE_M
+    if not start_lo <= safe.start_min_tip_z_m < box.z[1]:
+        raise ValueError(
+            f"safe_state.start_min_tip_z_m: must be within [table_z_m + {START_MIN_ABOVE_TABLE_M} = {start_lo:.4f} m, "
+            f"box.z[1] = {box.z[1]} m), got {safe.start_min_tip_z_m}"
+        )
     for key in ("table_clearance_m", "transit_zone_m", "home_box_margin_m"):
         if not getattr(safe, key) >= 0.0:
             raise ValueError(f"safe_state.{key}: must be >= 0, got {getattr(safe, key)}")
+    # rounded to 1e-9 m so the shipped value equals the schema default exactly (-0.02 + 0.001 is not -0.019 in binary)
+    box = dataclasses.replace(box, gripper_floor_z_m=round(safe.table_z_m + gripper_clearance, 9))
     if sorted(safe.torque_off_order) != sorted(JOINT_NAMES):
         raise ValueError("safe_state.torque_off_order must list every joint exactly once")
     for key, ticks in (("home_ticks", safe.home_ticks), ("rest_ticks", safe.rest_ticks)):

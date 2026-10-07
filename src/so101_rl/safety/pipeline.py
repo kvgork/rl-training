@@ -2,7 +2,8 @@
 
     new_command (10 Hz):  sanitize_delta -> goal += delta -> clamp_joint_limits(goal)
     apply (30 Hz):        interpolate -> joint limits -> per-tick velocity -> tracking (anti-windup)
-                          -> Cartesian box (FK of the target) -> thermal -> protection bits -> stuck -> check_range
+                          -> Cartesian box (FK of the target: tip box + lowest gripper point) -> thermal
+                          -> protection bits -> stuck -> check_range
 
 State kept between calls (all int32[6], preallocated):
 
@@ -15,6 +16,11 @@ State kept between calls (all int32[6], preallocated):
 
 Semantics worth knowing
 -----------------------
+* The box test (``So101FK.in_box_gripper``): the tip inside the box (unchanged, floor -0.015), AND the LOWEST wrist/
+  gripper point (``floor_points``, ``So101FK.tip_and_floor_z``) at or above ``box.gripper_floor_z_m`` = table + 1 mm
+  (plan §10 2026-10-06 "Gripper floor check" / 2026-10-07 "Gripper floor clearance"; tip-only allowed pressing ~3 mm
+  into the table). BOX_PRESENT uses ``present_tolerance_m`` (5 mm) for the tip and ``gripper_present_tolerance_m``
+  (2 mm, so at most ~1 mm into the table) for the points.
 * BOX on the *commanded* target is a CLAMP: the target reverts to ``prev_target`` (and the goal with it), reported in
   ``clamped_mask`` and ``TripCause.BOX``. BOX_PRESENT (the *present* position is more than
   ``box.present_tolerance_m`` outside the box) is a TRIP: the state machine stops the arm (fresh process). The
@@ -140,15 +146,19 @@ class SafetyPipeline:
         self.goal[...] = self._g
         target = self._t1
 
-        # 5. Cartesian box through FK. Present outside -> trip. Commanded target outside -> revert (clamp).
+        # 5. Cartesian box through FK: the tip box and the gripper floor on the lowest gripper point (in_box_gripper).
+        #    Present outside -> trip. Commanded target outside -> revert (clamp).
         fk = self._fk
-        fk.gripper_xyz_from_ticks(present, self._xyz)
-        if not fk.in_box(self._xyz, cfg.box, margin=cfg.box.present_tolerance_m):
+        z_low = fk.tip_and_floor_z_from_ticks(present, self._xyz)
+        box = cfg.box
+        if not fk.in_box_gripper(
+            self._xyz, z_low, box, margin=box.present_tolerance_m, point_margin=box.gripper_present_tolerance_m
+        ):
             v.trips |= TripCause.BOX_PRESENT
             target = self.prev_target  # hold what was last written; the state machine takes over
         else:
-            fk.gripper_xyz_from_ticks(target, self._xyz)
-            if not fk.in_box(self._xyz, cfg.box):
+            z_low = fk.tip_and_floor_z_from_ticks(target, self._xyz)
+            if not fk.in_box_gripper(self._xyz, z_low, box):
                 np.not_equal(target, self.prev_target, out=m)
                 self._note(mask, m, v, TripCause.BOX)
                 target = self.prev_target

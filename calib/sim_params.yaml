@@ -1,0 +1,40 @@
+# Simulator parameters (FS7). Schema: calib/README.md. Written by so101_rl.sim.sysid (params.SimParams.to_yaml).
+# meta.version 0 = the MJCF prior (unverified: heldout_rms_pct null); >= 1 = fitted on the real arm (HS3).
+# kp, kv, armature = servo_group.prior x servo_group.scale (one ratio group per joint); frictionloss is
+# not identified (meta.unidentified): use the dr ranges, not the point value (plan §10 2026-10-06).
+version: 2
+meta:
+  version: 0
+  date: '2026-10-06'
+  git_sha: e732654411448316da5c5ec4120fb1cbd2af8111
+  mjcf_sha256: 770e04756c0ef502e440be5a1c3e652be701bfc102076da3c7103965c01c3a98
+  excitation_run: none (MJCF prior)
+  fit_rms_pct: {}
+  heldout_rms_pct: null
+  spread: {}
+  backend: mjcf-prior
+  unidentified: [servo_group, delay_ticks, frictionloss]
+  notes: [upstream sts3215 class values (so101_new_calib.xml); replaced by the HS3 fit (release >= 1)]
+params:
+  kp: [998.22, 998.22, 998.22, 998.22, 998.22, 998.22]
+  kv: [2.731, 2.731, 2.731, 2.731, 2.731, 2.731]
+  damping: [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
+  frictionloss: [0.052, 0.052, 0.052, 0.052, 0.052, 0.052]
+  armature: [0.028, 0.028, 0.028, 0.028, 0.028, 0.028]
+  forcerange: [3.35, 3.35, 3.35, 3.35, 3.35, 3.35]
+  delay_ticks: 0
+  deadband_ticks: [0, 0, 0, 0, 0, 0]
+  die_mass_kg: 0.004
+  die_friction: 1.0
+  table_friction: 0.8
+servo_group:
+  prior:
+    kp: [998.22, 998.22, 998.22, 998.22, 998.22, 998.22]
+    kv: [2.731, 2.731, 2.731, 2.731, 2.731, 2.731]
+    armature: [0.028, 0.028, 0.028, 0.028, 0.028, 0.028]
+  scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+dr:
+  servo_group_rel: 0.4
+  frictionloss_range: [0.0, 0.21]
+  frictionloss_source: 0 .. 4 x the upstream MJCF prior 0.052 N m (TheRobotStudio so101_new_calib.xml, class sts3215) = 7
+    % of the STS3215 12 V stall torque 2.94 N m (30 kg cm, the MJCF class forcerange); a bounded choice, not a measurement

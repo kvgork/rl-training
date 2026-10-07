@@ -1,8 +1,10 @@
 """Transit zone between the rest pose and home (review B1).
 
-The rest pose lies outside the Cartesian box (it rests on the table), so the box check that guards RUN cannot
-guard the ramps that leave or return to rest. Instead, every ramp tick of ``reenergize`` (rest -> home) and of
-the :class:`~so101_rl.safety.safe_state.SafeStateSequencer` (-> home -> rest) goes through
+The box check that guards RUN does not run on the ramps that leave or return to rest: those ramps are outside RUN,
+and the rest pose rests on the table (its tip at z = -0.012 m has been inside the box since the floor moved to
+table + 5 mm, plan §10 2026-10-06, but a pose near rest can still sag below that floor). Instead they are checked
+against the TABLE, independently of the box: every ramp tick of ``reenergize`` (rest -> home) and of the
+:class:`~so101_rl.safety.safe_state.SafeStateSequencer` (-> home -> rest) goes through
 :meth:`TransitPlanner.next_target`:
 
 1. Every joint moves toward its goal by at most ``ramp_ticks_per_tick`` (``ramp_toward``).

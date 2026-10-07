@@ -23,6 +23,13 @@
   steps (die 2, reach 1). The die task also needs the die **settled**: the tracker position moved at most
   ``settle_m`` (3 mm) between consecutive counted steps, else the count restarts at 1. A slide through the zone
   (0.05 m/s = 5 mm per 10 Hz step) or a nudge out of it never terminates.
+- **Episode end** (both envs): ``terminated`` = debounced success, where the predicate only counts on a step with a
+  good read and no trip (a trip or stale read resets the debounce count); ``truncated`` = step limit OR trip OR
+  stalled servo, independently of ``terminated`` (on the step-limit step both may be true; a learner zeroes the
+  bootstrap on ``terminated`` only).
+- **Action mapping** (:func:`action_to_delta_np` / :func:`action_to_delta_torch`, the F7 rule, the only
+  [-1, 1] -> ticks scaling): ``delta = float32(rint(float64(clip(float32(a), -1, 1)) * max_delta_ticks))``. ±inf
+  clips to ±1, NaN passes through unchanged so the servo's sanitizer trips on it; rint is half-to-even in float64.
 - SB3 HER: ``compute_reward(achieved, desired, info)`` must take the visibility of the STORED transition from
   ``info`` (:func:`visible_from_info`, key ``"tracker_visible"``); relabelling the goal never changes it, and it
   never defaults to visible. Terms that read ``info`` (``clamp``, ``action_l2``) take the stored transition's
@@ -353,3 +360,22 @@ def debounce_torch(
         extend = extend & (moved <= spec.settle_m)
     new = torch.where(pred, torch.where(extend, count + 1, torch.ones_like(count)), torch.zeros_like(count))
     return new >= spec.success_debounce_steps, new
+
+
+def action_to_delta_np(action: np.ndarray, max_delta_ticks: np.ndarray) -> np.ndarray:
+    """F7 action rule (real env): ``float32(rint(float64(clip(float32(a), -1, 1)) * max_delta_ticks))``.
+
+    ``max_delta_ticks`` is used in float64. NaN stays NaN (``np.clip`` propagates it) so the servo sanitizer trips;
+    ±inf clip to ±1 like any other out-of-range value.
+    """
+    a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+    return np.rint(a.astype(np.float64) * np.asarray(max_delta_ticks, np.float64)).astype(np.float32)
+
+
+def action_to_delta_torch(action: torch.Tensor, max_delta_ticks: torch.Tensor) -> torch.Tensor:
+    """Tensor twin of :func:`action_to_delta_np` (bit-identical: float32 clamp, float64 product, half-to-even
+    round, float32 result). ``max_delta_ticks`` float64 [6]. ``torch.clamp`` propagates NaN like ``np.clip``."""
+    import torch
+
+    a = action.to(torch.float32).clamp(-1.0, 1.0)
+    return torch.round(a.to(torch.float64) * max_delta_ticks.to(torch.float64)).to(torch.float32)

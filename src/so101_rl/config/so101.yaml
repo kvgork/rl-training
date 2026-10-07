@@ -52,7 +52,7 @@ safe_state:
   ramp_ticks_per_tick: 8
   # NEEDS H5 (both poses).
   # rest: the gravity-stable pose measured on the arm on 2026-09-30, torque off. Tip (0.208, -0.001, -0.012) m:
-  #       below the box floor (it rests on the table) but above the table floor (table_z_m + table_clearance_m).
+  #       inside the box since the floor moved to table + 5 mm (plan §10 2026-10-06), above the table floor.
   # home: in-box PLACEHOLDER from the wave-1 review, tip (0.200, 0.000, 0.150) m, FK-checked by the loader.
   home_ticks: [2047, 960, 2700, 2748, 2047, 2047]
   rest_ticks: [2050, 2200, 2301, 2745, 2040, 2065]
@@ -62,13 +62,20 @@ safe_state:
   table_clearance_m: 0.005        # the ramp target's tip never goes below table_z_m + this
   transit_zone_m: 0.05            # below floor + this, joints that lower the tip wait for the lifting joints
   home_box_margin_m: 0.010        # FK(home) at least this far inside every box face
-  rest_tolerance_ticks: 100       # reenergize starts only within this of rest (arm joints) or inside the box
+  rest_tolerance_ticks: 100       # reenergize starts within this of rest (arm joints), or per start_min_tip_z_m
+  # Re-energise start rule (plan §10 2026-10-06): away from rest the tip must be inside the box AND at least this
+  # high (the old 0.010 m floor, 3 cm above the table). Independent of the running box floor box.z[0] = -0.015.
+  start_min_tip_z_m: 0.010
 
 box:                              # metres, base frame (from LIT DEFAULT_BOX)
   x: [0.08, 0.34]
   y: [-0.22, 0.22]
-  z: [0.010, 0.28]
+  z: [-0.015, 0.28]               # floor = table + 5 mm (plan §10 2026-10-06): the jaws can reach a die on the table
   present_tolerance_m: 0.005      # BOX_PRESENT trips only this far outside the box (review S3); targets: exact box
+  # Gripper floor (plan §10 2026-10-06 / 2026-10-07): the LOWEST wrist/gripper point (so101_kinematics.yaml
+  # floor_points) stays >= safe_state.table_z_m + this (1 mm above the table); the tip keeps z[0] = -0.015.
+  gripper_floor_clearance_m: 0.001
+  gripper_present_tolerance_m: 0.002  # BOX_PRESENT for the gripper points: <= ~1 mm into the table
 
 registers:
   return_delay_time: 0

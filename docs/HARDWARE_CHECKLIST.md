@@ -288,6 +288,8 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 - **Artifact:** `runs/hw/sysid-<ts>.json {rms_pct per joint}`.
 - **Pass:** <= 5 %. Above 5 % is **recorded, not fixed** here (the parallel sysid track fits it).
 - **Shown-to-fail:** not applicable.
+- **Superseded by HS1-HS3 (sim track, 2026-10-06):** the sysid track fits the parameters from dedicated excitation
+  runs and the gate is now **<= 1 %** held-out RMS per joint (plan §10 2026-10-06). See the HS sections below.
 
 ## H13 - Tier promotion review (0 to 1)
 
@@ -297,3 +299,60 @@ Header (append one row per artifact; the H-track, not the software waves, writes
   precondition.
 - **Pass:** `pixi run check-milestone` exits 0.
 - **Shown-to-fail:** run `check-milestone` with one artifact removed: it must fail.
+
+---
+
+# Sim-track hardware tasks (HS1-HS3, sysid; `plans/sim-track-implementation-plan.md`)
+
+Appended 2026-10-06 (SU2 sync, integration). All attended (Tier 0): a human at the e-stop for the whole run. The
+software never opens a serial device by itself: the operator starts the servo on the real bus, and the excitation
+runner only attaches to its shared memory. Prerequisites for every HS run: **H2** (power path + e-stop, its artifact
+`runs/hw/estop-*.json`), **H3** (deadman, `runs/hw/deadman-*.json`), **H5** (rest pose, `runs/hw/rest-pose-*.json`)
+and **H7** (calibration read-back, `runs/hw/calib-check-*.json`); `sysid-excite --backend real` refuses (exit 2)
+without them and without `--attended`. H6 (register proof) is recommended.
+
+## HS1 - Reach-space excitation run on the real arm
+
+- **Parts:** the arm on its clamp, foam under the reach space, the e-stop in hand; the camera is not needed.
+- **Needs:** H2, H3, H5, H7 passed; `sysid-excite` (S2.2), dry-run first on sim:
+  `pixi run -e cpu sysid-excite --backend sim --plan short --out runs/sysid/dry` (exit 0).
+- **Procedure:**
+  1. Terminal 1 (the servo owns the bus): `REQUIRE_RT=1 pixi run servo --backend feetech --heartbeat-port <mcu>
+     --tick-log runs/sysid/<ts>/tick_log.bin`. Press the reset button when asked; wait for RUN at home.
+  2. Terminal 2: `pixi run sysid-excite --backend real --attended --plan default --out runs/sysid/<ts>` (~10 min of
+     arm motion; every segment starts and ends at the start pose and was previewed inside the box).
+  3. Watch the temperatures in the servo output: a 60 °C trip ends the segment (safe state, rest, torque off);
+     resume after the cool-down with a fresh run directory.
+  4. Stop the servo with Ctrl-C (normal shutdown to rest).
+- **Artifact:** `runs/sysid/<ts>/{episodes/*.h5, tick_log.bin, plan.json}`; every `check_episode` OK (the runner
+  exits 1 otherwise).
+- **Pass:** exit 0; `plan.json` clamp-active fraction in [0.05, 0.4] for the multisine and chirp segments (else lower
+  the amplitudes and repeat: fully clamped data is blind to the servo dynamics).
+- **Shown-to-fail:** run the same command without `--attended`, and once with one H-artifact moved away: both must
+  refuse with exit 2 and no motion.
+
+## HS2 - Gripper and die excitation
+
+- **Needs:** HS1 done; H9 (tray) optional.
+- **Procedure:** as HS1 with `--with-gripper-die` and the die in the start well: gripper open/close cycles at three
+  speeds, closing on the die and on air.
+- **Artifact:** `runs/sysid/<ts>-grip/` as in HS1. **Pass:** exit 0, every episode OK.
+- **Shown-to-fail:** not applicable (HS1 covers the gates).
+
+## HS3 - Sysid fit to `calib/sim_params.yaml` release 1
+
+- **Needs:** HS1 (and HS2 for the die task); the GPU host.
+- **Procedure:** `pixi run sysid-fit --run runs/sysid/<ts> --backend warp --heldout-kinds chirp,random --out
+  calib/sim_params.yaml`. The default fit is the servo ratio group (one scale per joint on kp, kv, armature) plus
+  the integer delay; frictionloss stays at the prior and is listed unidentified (plan §10 2026-10-06). Inspect the
+  printed group scales, `delay_ticks`, the spread (`fit_report.json`) and the held-out table.
+- **Artifact:** `calib/sim_params.yaml` release 1 (committed; `meta.heldout_rms_pct` <= 1 % on every joint,
+  `servo_group`, `dr` ranges) and `runs/hw/sysid-<ts>.json` (H12's artifact, now from the fitted model:
+  `pixi run compare-real --tick-log runs/sysid/<ts>/tick_log.bin --sim-params calib/sim_params.yaml`).
+- **Pass:** `sysid-fit` exit 0 (it writes `--out` only when every joint's held-out RMS is <= 1 %).
+- **On failure (exit 1):** the candidate is in `runs/sysid/<ts>/sim_params.unverified.yaml`. Widen the fit once
+  (`--fit servo_group,delay_ticks,damping`), repeat; if a joint still fails, record it in the results table as a
+  negative result and treat that joint's parameters as unidentified (wide DR) — do not loosen the gate (it is a
+  plan §10 decision).
+- **Shown-to-fail:** `pixi run sysid-fit ... --fixed damping,forcerange,frictionloss,delay_ticks` (delay held at 0)
+  must exit 1 when the arm has a command delay (the synthetic twin fails at 1.5 %).

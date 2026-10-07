@@ -75,6 +75,10 @@ opencv = ">=4.9,<4.14"   # lerobot 0.6.1 needs opencv-python-headless<4.14
 [tool.pixi.feature.perception.pypi-dependencies]
 pyrealsense2 = ">=2.57"
 
+[tool.pixi.feature.train.dependencies]
+tensorboard = "*"   # the live dashboard (viz.monitor / viz.dashboard; SUV, integration 2026-10-06)
+moviepy = ">=1.0.3,<2"   # TensorBoard rollout videos inline (plan §10 2026-10-06); torch add_video imports moviepy.editor, gone in 2.x
+
 [tool.pixi.feature.train.pypi-dependencies]
 torchrl = "*"
 tensordict = "*"
@@ -116,11 +120,18 @@ compare-real = "python -m so101_rl.sim.compare_real"
 test-gpu = 'pytest -m "gpu and not hardware"'
 ci-gpu = { depends-on = ["lint", "test", "test-gpu"] }
 bench-warp = "python scripts/bench_warp.py"
+# Sim wave 1 (SU1, SU2, SUV; integration 2026-10-06).
+sim-parity = "pytest tests/test_batched_parity.py"   # no -m filter: the CPU layer A and the GPU layers B and C
+tray-check = "python -m so101_rl.sim.tray_check"
+sysid-excite = "python -m so101_rl.sim.sysid.run_excitation"
+sysid-fit = "python -m so101_rl.sim.sysid.fit"
+viz-demo = { cmd = "python -m so101_rl.viz.demo", env = { MUJOCO_GL = "egl" } }   # headless rendering
+viz-attach = "python -m so101_rl.viz.live_viewer attach"
+dashboard = "python -m so101_rl.viz.dashboard"   # --logdir runs/ (default), localhost:6006
 # Planned tasks: each is added in the same commit that creates its module, so `pixi task list` never advertises a
 # broken task (tests/test_pixi_tasks.py). Phase 0 U8-U10 / SR1-SR3: random-policy-sim / random-policy-real
 # (so101_rl.env.random_policy --backend {sim,real}), train-reach-sac (rl.train_sac_her), train-reach-tdmpc2
 # (rl.train_tdmpc2), train-wm-state (wm.train_state_wm), check-milestone (scripts/check_milestone_phase0.py).
-# Sim track SU1-SU5: sim-parity (pytest tests/test_batched_parity.py: no -m filter, it runs the CPU and GPU layers),
-# tray-check (sim.tray_check), sysid-excite (sim.sysid.run_excitation), sysid-fit (sim.sysid.fit), sim-gates
-# (rl.gates), train-sim-sac (rl.train_sim_sac), eval-sim (rl.eval_sim), export-policy (rl.policy_export),
-# deploy-policy (rl.deploy_policy), pretrain-tdmpc2 (rl.tdmpc2_offline), gap-report (rl.gap_report).
+# Sim track SU3-SU5: sim-gates (rl.gates), train-sim-sac (rl.train_sim_sac), eval-sim (rl.eval_sim), export-policy
+# (rl.policy_export), deploy-policy (rl.deploy_policy), pretrain-tdmpc2 (rl.tdmpc2_offline), gap-report
+# (rl.gap_report).

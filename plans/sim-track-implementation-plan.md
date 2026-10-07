@@ -370,6 +370,8 @@ def fit_sim_params(ds_train: ExcitationDataset, ds_heldout: ExcitationDataset, *
 
 `compare_real.py` (U4) gains `--sim-params PATH` and `--tick-log` (30 Hz replay); the gate value `MAX_RMS_PCT = 5.0` is unchanged. `calib/sim_params.yaml` schema: `{version, meta: SimParamsMeta, params: {kp: [...], ...}}`; committed like `calib/hand_eye.yaml`; version 0 (= MJCF prior, `heldout_rms_pct: null`, `allow_unverified`) ships with SU2 so the batched env always has a centre.
 
+> **As built / changed 2026-10-06 (integration, plan §10 "Sysid gate" and "Servo parameter identification"; the text above is kept as written):** `MAX_RMS_PCT = 1.0`. `SIM_PARAMS_VERSION = 2`: the yaml adds `servo_group: {prior: {kp, kv, armature}, scale: [6]}` (checked to reproduce `params`), `dr: {servo_group_rel: 0.40, frictionloss_range: [0, 0.21], frictionloss_source}` and `meta.unidentified`; new `ServoGroup`, `DrRanges`, `SimParamsFile`, `read_sim_params_file` (`read_sim_params_yaml` still returns `(params, meta)`). `fit_sim_params` defaults: `fit=("servo_group", "delay_ticks")` (one per-joint scale on kp, kv, armature jointly), `fixed=("damping", "forcerange", "frictionloss")`; frictionloss is always reported unidentified; `FitResult.servo_group` / `.group_scale`. 1-D blocks use a deterministic shrinking grid instead of CMA-ES (cma does not support 1-D). FS8 (SU3) must draw the servo DR from `dr` (group ±40 % around the fit, frictionloss over its range) instead of `servo_rel` on separate fields.
+
 ### FS8. Domain randomisation and curriculum — `src/so101_rl/sim/domain_rand.py`, `src/so101_rl/sim/dr_stages.yaml`, `src/so101_rl/rl/curriculum.py`
 
 ```python
@@ -433,6 +435,8 @@ class BatchedGoalEnv:
 ```
 
 Episode semantics (F7): `terminated` = success (after debounce), `truncated` = step limit **or** any emulated trip (NAN, RANGE, BOX_PRESENT); `final_*` hold the pre-reset state so a learner bootstraps correctly through truncation. `phase_randomise` starts each world at a random `episode_step` offset on the first reset (decorrelated auto-resets).
+
+> **As built 2026-10-06 (SU1 + integration):** observation timing = the real arm's: obs / priv / achieved / reward use the 3rd tick's state record, whose `present` was read after two ticks of the new command (Layer B pins it). Reach goals come from the real env's `env/goals.py` `BoxGoalSampler` (`sample_torch`; the same FK-reachability table object as `So101GoalEnv`), not an env-local voxel grid. The scene gained the start-well tray (die-only collisions) and the `overhead` camera; die/jaw contacts use `solref` 0.004. `randomizer` still raises (SU3 hand-off).
 
 ### FS10. Learner, replay, export, rollout log — `src/so101_rl/rl/`
 
@@ -517,6 +521,8 @@ class So101GoalEnv(gymnasium.Env):
 class BoxGoalSampler(GoalSampler): def __init__(self, bounds: GoalBounds, *, fk: So101FK, limits: JointLimits, seed: int) -> None   # rejection sampling + FK-reachability table
 gymnasium.register("So101Reach-v0" -> So101GoalEnv(task=REACH)); gymnasium.register("So101DieToZone-v0" -> So101GoalEnv(task=DIE_TO_ZONE))
 ```
+
+> **As built 2026-10-06 (SR1 + integration):** registered ids default to the CPU `SimBackend`, never the arm. `BoxGoalSampler` gained a torch front end (`sample_torch`, `reachable_torch`, `contains_torch`, `.keys`) and is the one sampler of both envs. The object table's die position is the **centroid** (`HsvDepthDieTracker.centroid_base`: top-face detection minus half an edge along the table normal).
 
 ## Parity test definition (frozen; `tests/test_batched_parity.py`)
 
@@ -1240,3 +1246,37 @@ execution_shape:
 - `pixi.lock` regeneration is the only step that needs network access; everything else is offline.
 - The spike's grasp-level contact parity (Layer C) is the single most likely S0/S1 gate failure; the fallback (ManiSkill3) is named in plan §6 but **not** planned here (anti-hypertrophy) — it would need its own plan.
 - `plans/phase0-implementation-plan.md` keeps its F7 and F11 text; S0.4 adds a status note pointing at this plan's supersession table rather than rewriting them.
+
+## As-built notes: sim wave 1 integration (2026-10-06)
+
+Appended by the integrator (branch `integration/sim-wave1`: main + SU1, SU2, SR1, SUV). Nothing above is rewritten
+except the additive "As built" notes under FS7, FS9 and FS12.
+
+- **SU1 (S1.1–S1.3):** `sim/batched_servo.py` (Layer A bit-identical, 20 × 600 ticks), `sim/sim_tracker.py`
+  (occluders = jaw boxes + arm-link mesh bounding boxes; 19/20 agreement with the real tracker on rendered frames),
+  `env/batched_env.py`, the tray + overhead camera, `sim/tray_check.py` (100/100). Layer B: targets identical on all
+  sequences; 3 trajectory xfails accepted (plan §10 2026-10-06). Layer C passes; since the integration it runs on the
+  shipped config (box floor −0.015). S1.4 (ARCHITECTURE sync) was applied by the integrator (v0.15).
+- **SU2 (S2.1–S2.3):** `sim/sysid/` and `compare_real --sim-params/--tick-log` as planned. Findings that led to the
+  2026-10-06 decisions: kp/kv/armature act almost only as ratios through the clamp chain; frictionloss is invisible
+  under ±1-tick noise; the 5 % gate could not see a 3-tick delay. Integration: gate 1 %, ratio-group fit + delay,
+  `sim_params.yaml` schema 2 (see FS7 note); synthetic recovery: delay exact, group scale within 10 % per joint,
+  held-out ≤ 0.07 %; the delay-0 twin fails the gate at 1.5 %. S2.4 applied by the integrator (ARCHITECTURE,
+  README, `docs/HARDWARE_CHECKLIST.md` HS1–HS3, H12 superseded note).
+- **SR1 (R1.1–R1.2):** `env/backend.py`, `env/goal_env.py`, `env/goals.py`, registrations. Integration: one goal
+  sampler for both envs (FS12 note). R1.3 applied by the integrator.
+- **SUV (V.1–V.3):** `viz/{monitor,live_viewer,video,demo}.py`. Integration: `tensorboard` (conda-forge) in the
+  `train` feature, `viz/dashboard.py` (the `dashboard` task wraps `tensorboard.main` so the task targets a module of
+  this package), tasks `viz-demo` (`MUJOCO_GL=egl`), `viz-attach`, `dashboard`. The Warp batch renderer is not used
+  (CPU `mujoco.Renderer`; recorded deviation of V.2).
+- **Decisions applied (plan §10 2026-10-06):** box floor = table + 5 mm (z −0.015 m) in `so101.yaml` and the
+  `WorkspaceBox` default; the rest tip is inside the box; L1 feasibility test `tests/test_die_reach_feasibility.py`
+  (jaws reach a resting die at the well and the zone inside the box; none with the old floor). Die position
+  convention: centroid everywhere (`tests/test_die_convention.py`). Import-path guard in `tests/conftest.py` (the
+  shared editable install pointed at another worktree).
+- **Pixi tasks added** (removed from the planned list): `sim-parity`, `tray-check`, `sysid-excite`, `sysid-fit`,
+  `viz-demo`, `viz-attach`, `dashboard`.
+- **Open:** the `check_milestone_phase0.py` row "held-out RMS ≤ 5 %" (SR3) must use `MAX_RMS_PCT` (1 %); FS8
+  `servo_rel` must follow `dr` from `sim_params.yaml`; `frictionloss_range` upper bound is a bounded choice to revisit
+  after HS3; `tests/test_live_viewer.py::test_viewer_overhead_under_5pct` is timing-noisy (measured −10 % … +6 % on
+  repeated runs of one tree).

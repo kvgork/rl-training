@@ -20,6 +20,25 @@ def pytest_configure(config):
     # The stdlib `logging` name would be shadowed if src/so101_rl itself were importable as top level.
     on_path = [p for p in sys.path if p and str(Path(p).resolve()) == SRC_PKG]
     assert not on_path, f"src/so101_rl must not be on sys.path: {on_path}"
+    _check_import_path(Path(str(config.rootpath)))
+
+
+def _check_import_path(rootdir: Path) -> None:
+    """Fail the session at once when ``so101_rl`` is imported from anywhere but ``<rootdir>/src``.
+
+    The pixi env's editable install is shared by every checkout/worktree of this repo: it points at whichever
+    checkout ran ``pixi install`` last, so tests in one worktree can silently exercise another worktree's code.
+    """
+    import so101_rl
+
+    pkg = Path(so101_rl.__file__).resolve().parent
+    src = (rootdir / "src").resolve()
+    if not pkg.is_relative_to(src):
+        raise pytest.UsageError(
+            f"so101_rl is imported from {pkg}, which is not inside this checkout's {src}. The shared pixi editable "
+            "install points at another checkout/worktree; run `pixi install` (or `pip install -e .`) from this "
+            "checkout, or unset PYTHONPATH, before running the tests."
+        )
 
 
 def pytest_collection_modifyitems(config, items):

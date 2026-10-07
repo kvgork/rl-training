@@ -1,5 +1,9 @@
 """Object table shared memory (plan F9): perception writes, the policy/env reads. Seqlock'd, CRC32-checked.
 
+``xyz_base`` is the object's CENTROID in the base frame (for the die: ``HsvDepthDieTracker.centroid_base``, the
+deprojected top face minus half an edge along the table normal; the sim tracker and ``env/tasks.py`` use the
+same convention, integration 2026-10-06).
+
 Uses :class:`so101_rl.servo.shm.SeqlockBlock` (U0). The segment holds exactly one record; unlike the servo
 segment it has no header: the record layout is pinned by ``OBJECT_TABLE_DTYPE`` and attach validates the size.
 """
