@@ -362,3 +362,34 @@ without them and without `--attended`. H6 (register proof) is recommended.
   plan §10 decision).
 - **Shown-to-fail:** `pixi run sysid-fit ... --fixed damping,forcerange,frictionloss,delay_ticks` (delay held at 0)
   must exit 1 when the arm has a command delay (the synthetic twin fails at 1.5 %).
+
+## HS4 - Attended zero-shot reach eval on the real arm (MVP M7)
+
+Added 2026-10-08 (`plans/mvp-plan.md` M7, plan §10 D-ZEROSHOT). Attended Tier 0: a hand on the e-stop for the whole
+session. It does not go through the lab connector.
+
+- **Parts:** the arm on its clamp, foam under the reach space, the e-stop in hand. Optional: tape over the orange tip
+  marker.
+- **Needs:** H2, H3 (with FW1), H5 and H7 passed; the servo bus powered; the camera calibrated
+  (`pixi run camera-calibrate --method arm-shape` and `pixi run camera-overlay` passing); the sim exit gate signed
+  (`pixi run lab gate-sign <eval run>`). Dry run first against the sim servo: `pixi run -e cpu servo --backend
+  mujoco` in terminal 1, then the terminal-2 command below without `--attended` (exit 0).
+- **Procedure:**
+  1. Terminal 1 (the servo owns the bus): `pixi run servo --backend feetech --heartbeat-port <mcu port> --tick-log
+     runs/deploy/ticks-<ts>.bin --summary runs/deploy/servo-<ts>.json`. Do not press the reset button yet.
+  2. Terminal 2: `pixi run -e cpu deploy-policy --policy runs/lab/<eval run>/policy.pt --protocol zero-shot --seed 7
+     --attended`. Wait (~7 s) for "waiting for the servo to reach RUN".
+  3. Press the MCU reset button. The ladder runs 10 episodes at speed 0.5, 10 at 0.75, then 50 at 1.0. It climbs a
+     rung only if the finished rung had no trip and at least 8 of 10 successes; otherwise it stops (exit 1,
+     `halt_reason: rung_below_threshold` in `summary.json`): that is a result, not a fault.
+  4. On a trip or stall the ladder stops (exit 1): restart the servo (step 1, new tick-log name) and rerun step 2 as
+     `pixi run -e cpu deploy-policy --resume runs/deploy/<ts> --attended` (the run dir printed by the first run). It
+     keeps the finished episodes and continues the same goal list at the next episode; do not change `--policy`,
+     `--seed`, `--protocol` or `--rung-episodes` (refused). A trip in the 0.5 or 0.75 rung still counts in that
+     rung's advance check, so after the resume that rung is finished and the ladder stops there; a trip in the
+     full-speed rung is resumed to the end. A real servo started with `--no-mcu` is refused.
+  5. When done, Ctrl-C the servo (normal shutdown to rest).
+- **Artifact:** `runs/deploy/<ts>/{episodes.jsonl, summary.json}` and the servo tick log.
+- **Pass:** exit 0, and `summary.json` `verdict.finetune_eligible` true (Wilson 95 % lower bound >= 0.60 with n >= 50
+  on the full-speed rung). Fill the results table.
+- **Shown-to-fail:** step 2 without `--attended` against the feetech servo must refuse (exit 2) with no motion.
