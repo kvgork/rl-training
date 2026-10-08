@@ -51,11 +51,15 @@ __all__ = [
     "RolloutResult",
     "RolloutStatus",
     "VideoWriter",
+    "add_scene_markers",
     "build_render_model",
     "d435_camera_pose",
+    "draw_banner",
+    "draw_marker_overlay",
     "draw_overlay",
     "find_ffmpeg",
     "overlay_lines",
+    "project_points",
     "record_rollout",
 ]
 
@@ -68,8 +72,15 @@ class RolloutStatus:
     """Per-recorded-world status after a step (host arrays, length = number of recorded worlds)."""
 
     success: np.ndarray  # bool
-    ep_return: np.ndarray  # float
+    ep_return: np.ndarray  # float (must stop accumulating once the episode has ended)
     dr_stage: int = 0
+    # Optional episode semantics + goal, all per recorded world. ``terminated``/``truncated`` None = the env does not
+    # report episode ends and the clip simply runs for ``seconds`` (legacy behaviour).
+    terminated: np.ndarray | None = None  # bool, sticky: the world's episode ended with success
+    truncated: np.ndarray | None = None  # bool, sticky: the world's episode ended without success (TIMEOUT)
+    goal: np.ndarray | None = None  # [n, 3] world-frame desired goal (drawn in both views)
+    success_radius: float = 0.0  # m, ball around the goal (reach); 0 = none
+    zone_half: float | None = None  # m, die tasks: half edge of the square target zone (drawn instead of a ball)
 
 
 class RolloutEnv(Protocol):
@@ -151,6 +162,98 @@ def draw_overlay(frame: np.ndarray, lines: Sequence[str]) -> np.ndarray:
     return frame
 
 
+# --------------------------------------------------------------------------------------------- goal markers
+GOAL_RGB: Final[tuple[int, int, int]] = (0, 255, 0)
+TIP_RGB: Final[tuple[int, int, int]] = (255, 0, 255)
+HOLD_SECONDS: Final[float] = 1.0
+
+
+def _half_width(cam: Any, width: int, height: int) -> float:
+    """Half frustum width at the near plane; free cameras leave it 0 (the renderer derives it from the aspect)."""
+    return float(cam.frustum_width) or 0.5 * (cam.frustum_top - cam.frustum_bottom) * width / height
+
+
+def project_points(scene: Any, pts: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Pixel ``(x, y, depth_m)`` of world points ``pts [n, 3]`` for the camera of the LAST ``update_scene`` (read from
+    the scene's GL camera: position, forward, up and frustum, so it holds for fixed and free cameras alike)."""
+    cam = scene.camera[0]
+    # camera[0]/[1] are the left/right stereo eyes (offset by +-ipd/2 even when stereo is off): the image is the mean
+    pos = 0.5 * (np.asarray(cam.pos, float) + np.asarray(scene.camera[1].pos, float))
+    fwd, up = np.asarray(cam.forward, float), np.asarray(cam.up, float)
+    right = np.cross(fwd, up)
+    d = np.atleast_2d(pts).astype(float) - pos
+    z = d @ fwd
+    z_safe = np.where(np.abs(z) < 1e-9, 1e-9, z)
+    xn = (d @ right) / z_safe * cam.frustum_near
+    yn = (d @ up) / z_safe * cam.frustum_near
+    half_w = _half_width(cam, width, height)
+    left, right = cam.frustum_center - half_w, cam.frustum_center + half_w
+    px = (xn - left) / (right - left) * width
+    py = (cam.frustum_top - yn) / (cam.frustum_top - cam.frustum_bottom) * height
+    return np.stack([px, py, z], axis=1)
+
+
+def add_scene_markers(
+    scene: Any, goal: np.ndarray | None, tip: np.ndarray | None, success_radius: float = 0.0, zone_half: float | None = None
+) -> None:
+    """Append 3D marker geoms to ``scene``: a solid goal core + translucent success ball (or flat zone), a tip dot."""
+    import mujoco
+
+    def add(gtype: Any, size: Sequence[float], pos: np.ndarray, rgba: Sequence[float]) -> None:
+        if scene.ngeom >= scene.maxgeom:
+            return
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(g, gtype, np.asarray(size, float), np.asarray(pos, float), np.eye(3).ravel(), np.asarray(rgba, np.float32))
+        g.category = mujoco.mjtCatBit.mjCAT_DECOR
+        scene.ngeom += 1
+
+    if goal is not None:
+        g = np.asarray(goal, float)
+        add(mujoco.mjtGeom.mjGEOM_SPHERE, [0.006, 0, 0], g, [0, 1, 0, 1])
+        if zone_half:
+            add(mujoco.mjtGeom.mjGEOM_BOX, [zone_half, zone_half, 0.001], g, [0, 1, 0, 0.35])
+        elif success_radius > 0:
+            add(mujoco.mjtGeom.mjGEOM_SPHERE, [success_radius, 0, 0], g, [0, 1, 0, 0.3])
+    if tip is not None:
+        add(mujoco.mjtGeom.mjGEOM_SPHERE, [0.004, 0, 0], np.asarray(tip, float), [1, 0, 1, 1])
+
+
+def draw_marker_overlay(
+    frame: np.ndarray, scene: Any, goal: np.ndarray | None, tip: np.ndarray | None, success_radius: float = 0.0
+) -> np.ndarray:
+    """2D crosshair + success ring at the projected goal and a ring at the tip, drawn ON TOP (never occluded by the
+    arm). ``frame`` is one camera view (HxWx3 uint8), edited in place."""
+    import cv2
+
+    h, w = frame.shape[:2]
+    if goal is not None:
+        x, y, z = project_points(scene, np.asarray(goal), w, h)[0]
+        if z > 0:
+            c = (round(x), round(y))
+            if success_radius > 0:
+                cam = scene.camera[0]
+                rpx = success_radius / z * cam.frustum_near / (2 * _half_width(cam, w, h)) * w
+                cv2.circle(frame, c, max(3, round(rpx)), GOAL_RGB, 1, cv2.LINE_AA)
+            cv2.line(frame, (c[0] - 12, c[1]), (c[0] + 12, c[1]), GOAL_RGB, 1, cv2.LINE_AA)
+            cv2.line(frame, (c[0], c[1] - 12), (c[0], c[1] + 12), GOAL_RGB, 1, cv2.LINE_AA)
+            cv2.putText(frame, "GOAL", (c[0] + 8, c[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, GOAL_RGB, 1, cv2.LINE_AA)
+    if tip is not None:
+        x, y, z = project_points(scene, np.asarray(tip), w, h)[0]
+        if z > 0:
+            cv2.circle(frame, (round(x), round(y)), 4, TIP_RGB, 1, cv2.LINE_AA)
+    return frame
+
+
+def draw_banner(frame: np.ndarray, text: str, rgb: tuple[int, int, int]) -> np.ndarray:
+    """A solid coloured band with ``text`` across the bottom of ``frame`` (edited in place)."""
+    import cv2
+
+    h = frame.shape[0]
+    frame[h - 36 :] = (frame[h - 36 :] * 0.3 + np.asarray(rgb) * 0.7).astype(np.uint8)
+    cv2.putText(frame, text, (10, h - 11), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    return frame
+
+
 # --------------------------------------------------------------------------------------------- encoding
 def find_ffmpeg() -> str:
     """ffmpeg of the pixi env (next to the interpreter) if present, else PATH."""
@@ -225,6 +328,12 @@ def _free_camera() -> Any:
     return cam
 
 
+def _has_site(model: Any, name: str) -> bool:
+    import mujoco
+
+    return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) >= 0
+
+
 def record_rollout(
     env: RolloutEnv,
     policy: Callable[[torch.Tensor], torch.Tensor],
@@ -241,7 +350,9 @@ def record_rollout(
 ) -> RolloutResult:
     """Roll ``policy`` out on ``env`` for ``seconds * fps`` env steps, writing ``<env_step>_<world>.mp4`` per world.
 
-    One frame per env step (the env's policy tick), played at ``fps``. Raises on any renderer / ffmpeg failure; the
+    One frame per env step (the env's policy tick), played at ``fps``. Both views draw the goal (crosshair, success ring,
+    3D marker) and the gripper tip. When the env reports episode ends (``RolloutStatus.terminated``/``truncated``), a
+    world's clip stops at its end: last frame held ~1 s with a "SUCCESS at t=..." / "TIMEOUT at t=..." banner. Raises on any renderer / ffmpeg failure; the
     :class:`~so101_rl.viz.monitor.TrainingMonitor` is what swallows it (visualisation-only errors).
     """
     import mujoco
@@ -258,23 +369,48 @@ def record_rollout(
     try:
         for w in worlds:
             writers[w] = VideoWriter(out_dir / f"{int(env_step)}_{int(w)}.mp4", 2 * width, height, fps)
+        hold = max(1, round(HOLD_SECONDS * fps))
+        site = model.site("gripper_tip").id if _has_site(model, "gripper_tip") else -1
+        finished: set[int] = set()
+
+        def render_world(i: int, w: int, t: int, qpos: np.ndarray, st: RolloutStatus) -> np.ndarray:
+            data.qpos[:] = qpos[i]
+            mujoco.mj_forward(model, data)
+            goal = None if st.goal is None else np.asarray(st.goal[i], float)
+            tip = data.site_xpos[site].copy() if site >= 0 else None
+            views = []
+            for cam in (D435_CAM, free):
+                renderer.update_scene(data, camera=cam)
+                add_scene_markers(renderer.scene, goal, tip, st.success_radius, st.zone_half)
+                img = renderer.render().copy()
+                draw_marker_overlay(img, renderer.scene, goal, tip, st.success_radius)
+                views.append(img)
+            frame = np.concatenate(views, axis=1)
+            draw_overlay(frame, overlay_lines(env_step, w, t / fps, st.dr_stage, float(st.ep_return[i]), bool(st.success[i])))
+            return frame
+
         with torch.no_grad():
             obs = env.reset()
             for t in range(n_steps + 1):
                 qpos = env.qpos(worlds)
                 st = env.status(worlds)
                 for i, w in enumerate(worlds):
-                    data.qpos[:] = qpos[i]
-                    mujoco.mj_forward(model, data)
-                    renderer.update_scene(data, camera=D435_CAM)
-                    top = renderer.render().copy()
-                    renderer.update_scene(data, camera=free)
-                    side = renderer.render().copy()
-                    frame = np.concatenate([top, side], axis=1)
-                    draw_overlay(frame, overlay_lines(env_step, w, t / fps, st.dr_stage, float(st.ep_return[i]), bool(st.success[i])))
-                    writers[w].write(frame)
+                    if w in finished:
+                        continue
+                    frame = render_world(i, w, t, qpos, st)
+                    ended = st.terminated is not None and st.truncated is not None and bool(st.terminated[i] or st.truncated[i])
+                    if ended:  # freeze here: banner, hold ~1 s, stop this world's clip (no rolling on after the end)
+                        ok = bool(st.terminated[i])
+                        draw_banner(frame, f"{'SUCCESS' if ok else 'TIMEOUT'} at t={t / fps:.1f}s", (0, 150, 0) if ok else (200, 110, 0))
+                        for _ in range(hold):
+                            writers[w].write(frame)
+                        finished.add(w)
+                    else:
+                        writers[w].write(frame)
                     if keep_tb_frames and i == 0:
                         tb.append(frame[::2, ::2].copy())
+                if len(finished) == len(worlds):
+                    break
                 if t < n_steps:
                     obs = env.step(policy(obs))
     finally:
@@ -289,7 +425,7 @@ def record_rollout(
         if errs and sys.exc_info()[0] is None:
             raise errs[0]
     paths = [wr.path for wr in writers.values()]
-    return RolloutResult(paths, n_steps + 1, np.stack(tb) if tb else None)
+    return RolloutResult(paths, max((wr.frames for wr in writers.values()), default=0), np.stack(tb) if tb else None)
 
 
 class ReplayRolloutEnv:
