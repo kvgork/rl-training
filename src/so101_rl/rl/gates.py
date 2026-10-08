@@ -125,11 +125,14 @@ def _ik(fk: Any, start: np.ndarray, goals: np.ndarray, lo: np.ndarray, hi: np.nd
     return ti, np.linalg.norm(goals - fk_tip_batch(fk, ti), axis=1)
 
 
-def exclude_near_start(goals: np.ndarray, alt: np.ndarray, start_tip: np.ndarray, min_dist_m: float) -> np.ndarray:
-    """The batched env's reset rule (``BatchedGoalEnv``): a goal closer than ``min_dist_m`` to the start tip is
-    replaced by the second draw (no trivial episodes; L2 do-nothing = 0)."""
-    near = np.linalg.norm(goals - start_tip, axis=-1) < min_dist_m  # == env/goals.redraw_near_start_np
-    return np.where(near[..., None], alt, goals)
+def exclude_near_start(goals: np.ndarray, alt: np.ndarray, start_tip: np.ndarray, success_radius_m: float) -> np.ndarray:
+    """The envs' reset rule, applied per row through the one definition ``env/goals.redraw_near_start_np``: a goal
+    within ``GOAL_MIN_START_FACTOR`` success radii of its start tip takes the second draw ``alt`` (no trivial
+    episodes; L2 do-nothing = 0)."""
+    from so101_rl.env.goals import redraw_near_start_np
+
+    return np.stack([redraw_near_start_np(g, t, success_radius_m, lambda a=a: a)
+                     for g, a, t in zip(goals, alt, np.broadcast_to(start_tip, goals.shape), strict=True)])  # fmt: skip
 
 
 def l1_reach_cpu(
@@ -185,7 +188,7 @@ def l1_reach_cpu(
     off[:, 5] = 0
     start_tip = fk_tip_batch(fk, np.clip(home[None, :] + off, lo0, hi0))
     final = exclude_near_start(goals, np.asarray(sample_goals(len(goals), rng), np.float64), start_tip,
-                               2.0 * success_radius_m)  # fmt: skip
+                               success_radius_m)  # fmt: skip
     d0 = np.linalg.norm(start_tip - final, axis=1)
     frac0 = float((d0 <= success_radius_m).mean())
     rows.append(GateRow("L1", "start_not_success", frac0 == 0.0,

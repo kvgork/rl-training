@@ -8,11 +8,16 @@ and owns the run's ``status.json`` / ``usage.json`` / ``heartbeat`` while it liv
   capped at 30 min; thermal holds and stalls do not count.
 - **should_stop** is true on a pause/stop request in ``control.json``, SIGTERM, the run's own budget (progress
   time ≥ ``budget_min``), the wall deadline (budget + 60 min), or a thermal hold longer than 30 min.
-- **Thermal** (P8, GPU trainers only): the heartbeat blocks while the GPU is hot or NVML is silent (fail-closed);
-  the status shows ``paused`` with ``pause_reason`` ``thermal_hot`` / ``thermal_unknown`` meanwhile. The trainer's
-  own thermal pause (``on_metrics`` with ``thermal_paused`` = 1, then no heartbeats until ``thermal_paused`` = 0) is
-  a known pause, not a stall: ``paused`` / ``thermal_trainer``, no progress time, and the wall deadline moves by
-  the pause.
+- **Budget** has one owner per layer: the trainer gets the run's FULL ``budget_min`` (its checkpoint's ``train_s``
+  carries the history across resumes); the job's own check (progress time of all segments vs ``budget_min``) is the
+  lab's backstop. Passing the remainder would count the history twice (B1, 2026-10-08 review).
+- **Thermal** (P8, GPU trainers only): the job's guard is the ONE guard (``fastsac_sim`` runs with the trainer's own
+  pause off). The heartbeat blocks while the GPU is hot or NVML is silent (fail-closed); the status shows
+  ``paused`` with ``pause_reason`` ``thermal_hot`` / ``thermal_unknown`` meanwhile; a hold longer than 30 min stops
+  the run with a checkpoint (``stopped`` / ``thermal_timeout``, resumable). A trainer that still reports its own
+  pause (``on_metrics`` with ``thermal_paused`` = 1) is treated as a known pause, not a stall.
+- **Eval** runs evaluate the copy of the checkpoint in their own dir (``config.ckpt`` relative to it,
+  ``ckpt_sha256`` checked), so a later resume of the training run cannot change what was evaluated.
 - **Trainer outcome** -> state: ``completed`` -> completed; ``stopped`` / ``budget_exhausted`` -> stopped (or paused
   for an AI pause) with the job's stop reason; ``failed`` -> failed with the trainer's reason (untrusted text).
 """
@@ -211,8 +216,7 @@ class Job:
         self._signal_stop = True
 
     def _train(self) -> int:
-        cfg = dict(self.run["config"])
-        cfg["budget_min"] = max(self.remaining_s / 60.0, 1.0 / 60.0)  # the trainer's own budget: what is left
+        cfg = dict(self.run["config"])  # the FULL budget_min: the trainer's train_s carries the history (B1)
         resume = self.status.get("last_ckpt") if self.segment > 0 else None
         if self.remaining_s <= 0.0:
             out = TrainOutcome("budget_exhausted", self.last_step, resume, None)
@@ -247,14 +251,19 @@ class Job:
             runs.update_status(self.run_dir, state="stopped", active=False, stop_reason="thermal_timeout")
             runs.append_event(self.run_dir, "stopped", reason="thermal_timeout")
             return 0
+        ckpt = Path(cfg["ckpt"])
+        ckpt = ckpt if ckpt.is_absolute() else self.run_dir / ckpt
+        if cfg.get("ckpt_sha256") and runs.file_sha256(ckpt) != cfg["ckpt_sha256"]:
+            raise RuntimeError(f"the checkpoint copy {ckpt.name} does not match ckpt_sha256")
         t0 = self.clock()
-        r = self.trainer.evaluate(cfg["ckpt"], self.run["task"], episodes=int(cfg["episodes"]),
+        r = self.trainer.evaluate(str(ckpt), self.run["task"], episodes=int(cfg["episodes"]),
                                   dr_stage=cfg.get("dr_stage"), out_dir=self.run_dir, render=int(cfg.get("render", 0)))
         self.progress_s = self.clock() - t0  # an eval holds the GPU for its whole wall time
         self._write_usage(final=True)
         result = {"success_rate": r.success_rate, "wilson_lo": r.wilson_lo, "wilson_hi": r.wilson_hi,
                   "episodes": r.episodes, "numeric_gate_passed": r.numeric_gate_passed,
-                  "eval_json": r.eval_json, "policy": r.policy}
+                  "eval_json": r.eval_json, "policy": r.policy, "ckpt": str(ckpt),
+                  "source_ckpt": cfg.get("source_ckpt"), "ckpt_sha256": cfg.get("ckpt_sha256")}
         runs.atomic_write_json(self.run_dir / "result.json", result)
         runs.update_status(self.run_dir, state="completed", active=False)
         runs.append_event(self.run_dir, "eval_done", numeric_gate_passed=r.numeric_gate_passed,

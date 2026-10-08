@@ -183,7 +183,7 @@ class FakeTrainer:
             step = start
             while step < cfg["steps"]:
                 if hooks.should_stop():
-                    last_ckpt = self._ckpt(out_dir, step, hooks)
+                    last_ckpt = self._ckpt(out_dir, step, hooks, cfg)
                     return TrainOutcome("stopped", step, last_ckpt, str(metrics))
                 if cfg["crash_at"] >= 0 and step >= cfg["crash_at"]:
                     raise RuntimeError(f"fake crash at step {step}")
@@ -198,14 +198,14 @@ class FakeTrainer:
                     f.flush()
                     hooks.on_metrics(step, scalars)
                 if step % cfg["ckpt_every"] == 0:
-                    last_ckpt = self._ckpt(out_dir, step, hooks)
-        last_ckpt = self._ckpt(out_dir, step, hooks)
+                    last_ckpt = self._ckpt(out_dir, step, hooks, cfg)
+        last_ckpt = self._ckpt(out_dir, step, hooks, cfg)
         return TrainOutcome("completed", step, last_ckpt, str(metrics))
 
     @staticmethod
-    def _ckpt(out_dir: Path, step: int, hooks: Hooks) -> str:
+    def _ckpt(out_dir: Path, step: int, hooks: Hooks, cfg: dict[str, Any]) -> str:
         p = out_dir / f"ckpt_{step:09d}.json"
-        p.write_text(json.dumps({"env_step": step}))
+        p.write_text(json.dumps({"env_step": step, "success_rate": cfg["success_rate"]}))  # self-contained (S5)
         hooks.on_checkpoint(step, str(p))
         return str(p)
 
@@ -213,8 +213,7 @@ class FakeTrainer:
         self, ckpt: str, task: str, *, episodes: int, dr_stage: int | None, out_dir: Path, render: int
     ) -> EvalOutcome:
         src = json.loads(Path(ckpt).read_text())
-        run_cfg = json.loads((Path(ckpt).parent / "run.json").read_text())["config"]
-        rate = float(run_cfg.get("success_rate", 0.97))
+        rate = float(src.get("success_rate", 0.97))
         succ = round(rate * episodes)
         lo, hi = wilson(succ, episodes)
         sr = succ / episodes
@@ -238,7 +237,7 @@ class FastSacSimTrainer:
     capabilities = Capabilities(gpu=True, resumable=True, evaluates=True, exports=True, env_name="default",
                                 tasks=("reach",))
     params: ClassVar[dict[str, Param]] = {
-        "nworld": Param(int, 4096, 1, 65_536),
+        "nworld": Param(int, 1024, 1, 65_536),  # 8 grads / 1024 worlds = UTD 0.0078 >= the 0.005 review trigger
         "budget_min": Param(float, 60.0, 1.0, 360.0),
         "seed": Param(int, 0, 0, 2**31 - 1),
         "dr_max_stage": Param(int, 4, 0, 4),
@@ -260,8 +259,8 @@ class FastSacSimTrainer:
     def train(self, cfg: dict[str, Any], task: str, out_dir: Path, hooks: Hooks, resume: str | None) -> TrainOutcome:
         from so101_rl.rl import train_sim_sac as tss  # lazy: torch + warp live behind this import
 
-        try:
-            sim_cfg = tss.load_sim_sac_config({"task": task, **cfg})
+        try:  # the job owns the one thermal guard (P8): the trainer's own pause is off under the lab
+            sim_cfg = tss.load_sim_sac_config({"task": task, **cfg, "thermal_guard": False})
         except (TypeError, ValueError) as e:  # validate() already checked the lab's keys; this is a contract drift
             raise LabError("CONFIG_INVALID", f"train_sim_sac refused the config: {e}"[:300]) from None
         th = tss.TrainHooks(

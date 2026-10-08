@@ -11,7 +11,9 @@ Files per run (all JSON writes are atomic: tmp -> fsync -> ``os.replace`` -> fsy
 - ``metrics.csv``, ``heartbeat``, checkpoints: written by the job / trainer.
 
 The ledger (P6) is derived from the run dirs every time; ``ledger.json`` only keeps the attempts high-water mark,
-and a recomputation that yields fewer attempts than the mark writes ``HALT`` (a run dir went missing).
+and a recomputation that yields fewer attempts than the mark writes ``HALT`` (a run dir went missing). A run that
+can still continue (queued / running / paused / interrupted, or stopped by a thermal timeout) RESERVES its unused
+``budget_min``, so starting another run cannot spend GPU-h a resume will need (B2, 2026-10-08 review).
 """
 
 from __future__ import annotations
@@ -106,6 +108,14 @@ def flocked(path: Path) -> Iterator[None]:
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def canonical_sha256(obj: Any) -> str:
@@ -328,27 +338,45 @@ def read_usage(run_dir: Path) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------------------------- ledger (P6)
+def resumable(st: dict[str, Any]) -> bool:
+    """A run that may still continue: not ended, or stopped by a thermal timeout (P8: resumable)."""
+    state = st.get("state")
+    return state in ("queued", "running", "paused", "interrupted") or (
+        state == "stopped" and st.get("stop_reason") == "thermal_timeout"
+    )
+
+
 def ledger(root: Path) -> dict[str, dict[str, float]]:
-    """Per budget key: attempts used, GPU-h used by attempts, pooled probe GPU-h, eval GPU-h (recorded only).
+    """Per budget key: attempts used, GPU-h used by attempts, pooled probe GPU-h, eval GPU-h (recorded only), and the
+    GPU-h reserved by attempts / probes that can still continue (their unused ``budget_min``).
 
     Derived from every run dir; an attempt counts from creation (a refused or crashed attempt still counts).
     """
     out: dict[str, dict[str, float]] = {}
     for d in list_run_dirs(root):
-        run, usage = read_run(d), read_usage(d)
+        run, usage, st = read_run(d), read_usage(d), read_status(d)
         key = run.get("budget_key")
         if not key:
             continue
-        e = out.setdefault(key, {"attempts_used": 0, "gpu_h_used": 0.0, "probe_gpu_h_used": 0.0, "eval_gpu_h": 0.0})
+        e = out.setdefault(key, {"attempts_used": 0, "gpu_h_used": 0.0, "probe_gpu_h_used": 0.0, "eval_gpu_h": 0.0,
+                                 "gpu_h_reserved": 0.0, "probe_gpu_h_reserved": 0.0})
         gpu_h = float(usage.get("gpu_h") or 0.0)
         kind = run.get("kind")
+        reserve = 0.0
+        if kind in ("attempt", "probe") and resumable(st):
+            try:
+                reserve = max(0.0, float((run.get("config") or {}).get("budget_min") or 0.0) / 60.0 - gpu_h)
+            except (TypeError, ValueError):
+                reserve = 0.0
         if kind == "attempt":
-            if read_status(d).get("launch_failed"):
+            if st.get("launch_failed"):
                 continue  # the job never started: not an attempt
             e["attempts_used"] += 1
             e["gpu_h_used"] += gpu_h
+            e["gpu_h_reserved"] += reserve
         elif kind == "probe":
             e["probe_gpu_h_used"] += gpu_h
+            e["probe_gpu_h_reserved"] += reserve
         elif kind == "eval":
             e["eval_gpu_h"] += gpu_h
     return out
@@ -383,8 +411,12 @@ def checked_ledger(root: Path) -> dict[str, dict[str, float]]:
 
 
 def check_budget(led: dict[str, dict[str, float]], key: str, budget: Budget, kind: str, est_gpu_h: float) -> None:
-    """Refuse a start that would exceed P6. Evals are recorded but never refused for budget."""
-    e = led.get(key, {"attempts_used": 0, "gpu_h_used": 0.0, "probe_gpu_h_used": 0.0})
+    """Refuse a start that would exceed P6 (GPU-h used + reserved by resumable runs + this run's budget). Evals are
+    recorded but never refused for budget."""
+    e0 = led.get(key, {})
+    e = {"attempts_used": 0, "gpu_h_used": 0.0, "probe_gpu_h_used": 0.0, **e0}
+    e["gpu_h_used"] += float(e0.get("gpu_h_reserved", 0.0))
+    e["probe_gpu_h_used"] += float(e0.get("probe_gpu_h_reserved", 0.0))
     if kind == "attempt":
         if e["attempts_used"] + 1 > budget.max_attempts:
             raise LabError(
@@ -395,9 +427,9 @@ def check_budget(led: dict[str, dict[str, float]], key: str, budget: Budget, kin
         if e["gpu_h_used"] + est_gpu_h > budget.gpu_h_max + 1e-9:
             raise LabError(
                 "BUDGET_EXHAUSTED", "this attempt would exceed the GPU-h budget",
-                details={"budget_key": key, "gpu_h_used": round(e["gpu_h_used"], 3), "requested": est_gpu_h,
-                         "gpu_h_max": budget.gpu_h_max},
-                hint="request a smaller budget_min",
+                details={"budget_key": key, "gpu_h_used_or_reserved": round(e["gpu_h_used"], 3),
+                         "requested": est_gpu_h, "gpu_h_max": budget.gpu_h_max},
+                hint="request a smaller budget_min, or stop a paused/interrupted run to release its reservation",
             )
     elif kind == "probe":
         if est_gpu_h * 60 > budget.probe_max_min + 1e-9:
@@ -408,9 +440,24 @@ def check_budget(led: dict[str, dict[str, float]], key: str, budget: Budget, kin
         if e["probe_gpu_h_used"] + est_gpu_h > budget.probe_gpu_h_max + 1e-9:
             raise LabError(
                 "BUDGET_EXHAUSTED", "the pooled probe GPU-h are used up",
-                details={"budget_key": key, "probe_gpu_h_used": round(e["probe_gpu_h_used"], 3),
+                details={"budget_key": key, "probe_gpu_h_used_or_reserved": round(e["probe_gpu_h_used"], 3),
                          "probe_gpu_h_max": budget.probe_gpu_h_max},
             )
+
+
+def check_resume_budget(led: dict[str, dict[str, float]], key: str, budget: Budget, kind: str) -> None:
+    """Refuse a resume when used + reserved GPU-h (the resuming run's own remainder is in the reservation) exceed
+    P6, e.g. a run that overran or runs created before the reservation existed."""
+    e = led.get(key, {})
+    used, cap = ("gpu_h", budget.gpu_h_max) if kind == "attempt" else ("probe_gpu_h", budget.probe_gpu_h_max)
+    total = float(e.get(f"{used}_used", 0.0)) + float(e.get(f"{used}_reserved", 0.0))
+    if total > cap + 1e-9:
+        raise LabError(
+            "BUDGET_EXHAUSTED", "resuming would exceed the GPU-h budget",
+            details={"budget_key": key, "gpu_h_used": round(float(e.get(f"{used}_used", 0.0)), 3),
+                     "gpu_h_reserved": round(float(e.get(f"{used}_reserved", 0.0)), 3), "gpu_h_max": cap},
+            hint="stop this run; the budget is set in plan §10 P6",
+        )
 
 
 def budget_dict(b: Budget) -> dict[str, Any]:

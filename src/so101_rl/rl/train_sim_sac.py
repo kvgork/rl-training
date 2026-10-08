@@ -11,16 +11,29 @@ CURRENT DR stage (``eval_sim.run_episodes``), a checkpoint ``ckpt_<step>.pt`` + 
 (``review.json``; printed and logged, never switching anything) and the widening rule
 (``sim.domain_rand.next_stage``: one stage up at >= 70 % eval success, up to ``dr_max_stage``).
 
+Eval cost: an eval is also deferred until this segment's eval time is at most ``eval_max_fraction`` (10 %) of its
+training time (the next eval, assumed as long as the last one, waits until it fits); ``eval_frac`` in ``metrics.csv`` is the measured
+fraction (the first eval of a segment is never deferred). Only the last ``keep_ckpts`` (3) numbered checkpoints are kept, plus ``ckpt_last.pt`` and
+``ckpt_best.pt`` (a hard link to the numbered checkpoint with the best ``(dr_stage, eval success)``).
+
+``train_success_rate`` is NOT a success rate of the policy: it is the fraction of the episodes that ENDED in the log
+window that succeeded, with the stochastic (exploring) policy. Successful episodes end early, so it overstates
+success (completion bias), and exploration noise passing through the 15 mm ball counts too. Judge the policy by
+``eval_success_rate`` (deterministic, one episode per world).
+
 Status: ``completed`` = the numeric exit gate passed at the final DR stage (``stop_at_gate``) or ``max_env_steps``
 reached; ``budget_exhausted`` = ``budget_min`` minutes of training time used (thermal pauses excluded, evals
-included; the budget spans resumes); ``stopped`` = ``hooks.should_stop()`` (checkpoint, then return);
-``failed`` = a non-finite loss (the last good checkpoint is kept) or a thermal pause longer than
-``thermal_max_pause_min``. Exceptions (CUDA OOM included) are NOT caught (L12).
+included). The budget spans resumes and has ONE owner: the checkpoint's ``train_s`` carries the history, so a
+resume passes the run's FULL ``budget_min`` (the lab job does; never the remainder). ``metrics.csv`` rows after the
+resumed checkpoint's ``env_step`` are dropped on resume. ``stopped`` = ``hooks.should_stop()`` or a thermal pause
+longer than ``thermal_max_pause_min`` (checkpoint, then return; resumable); ``failed`` = a non-finite loss (the last
+good checkpoint is kept). Exceptions (CUDA OOM included) are NOT caught (L12).
 
-Thermal (plan §10 P8): the GPU core temperature is read through NVML (``pynvml``) every ``THERMAL_POLL_S``; >= 85 °C
-pauses training, <= 75 °C resumes. A missing sample is fail-closed: it pauses like a hot one (the 6th consecutive
-missing sample is flagged ``thermal_needs_human`` in the metrics). ``heartbeat`` is progress-coupled, so it is not
-called while paused; ``on_metrics`` reports ``thermal_paused`` = 1 when a pause starts.
+Thermal (plan §10 P8), standalone CLI only (``thermal_guard``; the lab job owns the one thermal guard and turns this
+one off): the GPU core temperature is read through NVML (``pynvml``) every ``THERMAL_POLL_S``; >= 85 °C pauses
+training, <= 75 °C resumes. A missing sample is fail-closed: it pauses like a hot one (the 6th consecutive missing
+sample is flagged ``thermal_needs_human`` in the metrics). ``heartbeat`` is progress-coupled, so it is not called
+while paused; ``on_metrics`` reports ``thermal_paused`` = 1 when a pause starts.
 
 ``metrics.csv`` is always written (header at start). The CLI exits 1 when ``metrics.csv`` has < 3 data rows or no
 checkpoint exists (L12), 0 otherwise.
@@ -29,11 +42,15 @@ checkpoint exists (L12), 0 otherwise.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import dataclasses
 import itertools
 import json
 import math
+import os
+import re
+import shutil
 import signal
 import sys
 import time
@@ -71,8 +88,9 @@ METRICS_FIELDS: Final[tuple[str, ...]] = (
     "env_step", "wall_s", "train_s", "env_steps_per_s", "grads_per_s", "dr_stage", "train_success_rate",
     "train_episodes", "mean_return", "critic_loss", "actor_loss", "alpha", "entropy", "q_mean", "q_max",
     "action_saturation", "eval_success_rate", "eval_wilson_lo", "eval_final_err_p50", "eval_final_err_p90",
-    "vram_mb", "gpu_temp_c", "thermal_paused_s", "review_triggers", "viz_disabled",
+    "vram_mb", "gpu_temp_c", "thermal_paused_s", "review_triggers", "viz_disabled", "eval_frac",
 )  # fmt: skip
+_NUMBERED_CKPT: Final[re.Pattern[str]] = re.compile(r"^ckpt_(\d+)\.pt$")
 
 
 @dataclass(frozen=True)
@@ -102,6 +120,9 @@ class SimSacConfig:
     vram_fraction: float = 0.6
     thermal_max_pause_min: float = 60.0
     tensorboard: bool = True
+    eval_max_fraction: float = 0.1  # defer an eval until evals are <= this fraction of the training time
+    keep_ckpts: int = 3  # numbered checkpoints kept (plus ckpt_last.pt and ckpt_best.pt)
+    thermal_guard: bool = True  # the trainer's own NVML pause; False under the lab (the job owns the guard)
 
 
 _REQUIRED: Final[tuple[str, ...]] = ("task", "nworld", "budget_min", "seed")
@@ -112,7 +133,8 @@ _TYPES: Final[dict[str, tuple[type, bool]]] = {  # name -> (type, nullable)
     "stop_at_gate": (bool, False), "replay_capacity": (int, False), "batch_size": (int, False),
     "grad_steps_per_env_step": (int, False), "warmup_steps": (int, False), "lr": (float, False),
     "gamma": (float, True), "calibration": (str, True), "sim_params": (str, False), "vram_fraction": (float, False),
-    "thermal_max_pause_min": (float, False), "tensorboard": (bool, False),
+    "thermal_max_pause_min": (float, False), "tensorboard": (bool, False), "eval_max_fraction": (float, False),
+    "keep_ckpts": (int, False), "thermal_guard": (bool, False),
 }  # fmt: skip
 
 
@@ -194,7 +216,7 @@ def _check_ranges(c: SimSacConfig, where: str) -> None:
     if not 0 <= c.dr_start_stage <= c.dr_max_stage <= last:
         raise bad(f"need 0 <= dr_start_stage <= dr_max_stage <= {last}")
     for k in ("eval_every_steps", "eval_episodes", "log_every_steps", "replay_capacity", "batch_size",
-              "grad_steps_per_env_step"):  # fmt: skip
+              "grad_steps_per_env_step", "keep_ckpts"):  # fmt: skip
         if getattr(c, k) < 1:
             raise bad(f"{k} must be >= 1")
     if c.warmup_steps < 0 or (c.max_env_steps is not None and c.max_env_steps < 0):
@@ -205,6 +227,8 @@ def _check_ranges(c: SimSacConfig, where: str) -> None:
         raise bad("lr and gamma must be in (0, 1)")
     if not 0 < c.vram_fraction <= 1 or not c.thermal_max_pause_min > 0:
         raise bad("vram_fraction must be in (0, 1], thermal_max_pause_min > 0")
+    if not 0 < c.eval_max_fraction <= 1:
+        raise bad("eval_max_fraction must be in (0, 1]")
 
 
 # ------------------------------------------------------------------------------------------------ thermal
@@ -305,6 +329,46 @@ class _Csv:
         self._f.close()
 
 
+def _truncate_metrics(path: Path, env_step: int) -> None:
+    """On resume: keep only the rows up to the checkpoint's ``env_step`` (later rows belong to the abandoned
+    continuation) and rewrite the file with the current header."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    def step(r: Mapping[str, Any]) -> float:
+        try:
+            return float(r.get("env_step") or "nan")
+        except ValueError:
+            return math.nan
+
+    keep = [r for r in rows if step(r) <= env_step]
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(METRICS_FIELDS), extrasaction="ignore")
+        w.writeheader()
+        w.writerows(keep)
+    tmp.replace(path)
+
+
+def _prune_ckpts(out_dir: Path, keep: int) -> None:
+    """Delete all but the ``keep`` highest-step ``ckpt_<step>.pt`` (``ckpt_last`` / ``ckpt_best`` are not numbered)."""
+    numbered = sorted((int(m.group(1)), p) for p in out_dir.iterdir() if (m := _NUMBERED_CKPT.match(p.name)))
+    for _, p in numbered[:-keep] if keep > 0 else numbered:
+        p.unlink(missing_ok=True)
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    try:
+        os.link(src, tmp)
+    except OSError:
+        shutil.copy2(src, tmp)
+    tmp.replace(dst)
+
+
 def _save(path: Path, obj: dict[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
     torch.save(obj, tmp)
@@ -324,6 +388,8 @@ def run_training(
         ck = eval_sim.load_checkpoint(Path(resume))
         if ck["task"] != cfg.task:
             raise ValueError(f"resume: checkpoint task {ck['task']!r} != {cfg.task!r}")
+    if ck is not None:
+        _truncate_metrics(metrics_csv, int(ck["env_step"]))
     csvw = _Csv(metrics_csv, append=ck is not None)
     try:
         return _train(cfg, out_dir, hooks, ck, csvw)
@@ -372,7 +438,7 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
     so101_cfg = getattr(env, "cfg", None)
     mon = TrainingMonitor(VizConfig(live_viewer=False, video_every_min=0.0, tensorboard=cfg.tensorboard),
                           getattr(env, "ws", None), out_dir, task=cfg.task, render_cfg=so101_cfg)  # fmt: skip
-    guard = ThermalGuard(read_gpu_temp_c)
+    guard = ThermalGuard(read_gpu_temp_c) if cfg.thermal_guard else None
     history: list[dict[str, float]] = []
     review: list[dict[str, Any]] = []
     last_ckpt: Path | None = (out_dir / "ckpt_last.pt") if (out_dir / "ckpt_last.pt").exists() and ck is not None else None
@@ -385,6 +451,14 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
     next_log = env_step + cfg.log_every_steps
     next_eval = env_step + cfg.eval_every_steps
     next_thermal = 0.0
+    eval_s = 0.0  # this segment's eval time (eval_frac); the time cap below spans the segment
+    eval_ok_at = train_s0  # train_s at which the next eval may run (eval_max_fraction)
+    best_path, best_key = out_dir / "ckpt_best.json", None
+    if ck is not None and best_path.exists():
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+            b = json.loads(best_path.read_text())
+            best_key = (int(b["dr_stage"]), float(b["success_rate"]))
+    seg_train_s0 = train_s0
     n = int(env.nworld)
     # per-window accumulators (device)
     acc: dict[str, torch.Tensor] = {}
@@ -406,8 +480,16 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
             "sim_params_release": meta["env"].get("sim_params_release"), "git_sha": meta["git_sha"],
             "last_eval": last_eval or {}, "camera_pose_method": meta["env"].get("camera_pose_method", "none"),
         }  # fmt: skip
+        nonlocal best_key
         if numbered:
-            _save(out_dir / f"ckpt_{env_step}.pt", d)
+            num = out_dir / f"ckpt_{env_step}.pt"
+            _save(num, d)
+            key = (int(env.dr_stage), float((last_eval or {}).get("success_rate", -1.0)))
+            if last_eval and (best_key is None or key >= best_key):
+                best_key = key
+                _link_or_copy(num, out_dir / "ckpt_best.pt")
+                best_path.write_text(json.dumps({"env_step": env_step, "dr_stage": key[0], "success_rate": key[1]}))
+            _prune_ckpts(out_dir, cfg.keep_ckpts)
         _save(out_dir / "ckpt_last.pt", d)
         last_ckpt = out_dir / "ckpt_last.pt"
         if hooks.on_checkpoint is not None:
@@ -426,7 +508,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
             "dr_stage": int(env.dr_stage), "train_success_rate": float(ep_succ) / done if done else None,
             "train_episodes": int(done), "mean_return": float(ep_ret_sum) / done if done else None,
             "vram_mb": round(torch.cuda.max_memory_allocated(dev) / 2**20, 1) if dev.type == "cuda" else 0.0,
-            "gpu_temp_c": guard.last_c, "thermal_paused_s": round(paused_s, 1), **{k: round(v, 6) for k, v in m.items()},
+            "gpu_temp_c": guard.last_c if guard is not None else None, "thermal_paused_s": round(paused_s, 1),
+            "eval_frac": round(eval_s / max(train_s - seg_train_s0, 1e-9), 4), **{k: round(v, 6) for k, v in m.items()},
         }  # fmt: skip
         if ev is not None:
             row.update({"eval_success_rate": ev["success_rate"], "eval_wilson_lo": ev["wilson_lo"],
@@ -482,15 +565,15 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
                 status, reason = "stopped", "should_stop() returned True"
                 break
             now = time.monotonic()
-            if now >= next_thermal:
+            if guard is not None and now >= next_thermal:
                 next_thermal = now + THERMAL_POLL_S
                 if guard.sample():
                     res = _thermal_pause(guard, stop_sig, hooks, env_step, cfg.thermal_max_pause_min)
                     paused_s += res[1]
                     win_t += res[1]  # pause time is not throughput time
-                    if res[0] != "resumed":
+                    if res[0] != "resumed":  # never "failed": a thermal timeout is a resumable stop (P8)
                         status, reason = ("stopped", "should_stop() during a thermal pause") if res[0] == "stopped" else (
-                            "failed", f"thermal pause longer than {cfg.thermal_max_pause_min} min")  # fmt: skip
+                            "stopped", f"thermal_timeout: thermal pause longer than {cfg.thermal_max_pause_min} min")  # fmt: skip
                         break
                     next_thermal = time.monotonic() + THERMAL_POLL_S
             if train_s >= budget_s:
@@ -529,11 +612,15 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
             if hooks.heartbeat is not None:
                 hooks.heartbeat(env_step)
             ev = None
-            if env_step >= next_eval:
+            if env_step >= next_eval and train_s >= eval_ok_at:
                 next_eval += cfg.eval_every_steps * max(1, (env_step - next_eval) // cfg.eval_every_steps + 1)
                 t_e = time.monotonic()
                 ev = run_eval()
-                train_s += time.monotonic() - t_e
+                dt_e = time.monotonic() - t_e
+                train_s += dt_e
+                eval_s += dt_e
+                # cumulative, counting the next eval (assumed as long as this one): eval_s <= f train_s after it
+                eval_ok_at = seg_train_s0 + (eval_s + dt_e) / cfg.eval_max_fraction - dt_e
             if ev is not None or env_step >= next_log:
                 next_log = env_step + cfg.log_every_steps
                 m = emit_row(ev)

@@ -100,7 +100,8 @@ def test_ledger_counts_attempts_probes_evals(tmp_path):
         u["gpu_h"] = h
         runs.atomic_write_json(d / "usage.json", u)
     led = runs.ledger(tmp_path)["fake.reach"]
-    assert led == {"attempts_used": 1, "gpu_h_used": 1.5, "probe_gpu_h_used": 0.1, "eval_gpu_h": 0.2}
+    assert led == {"attempts_used": 1, "gpu_h_used": 1.5, "probe_gpu_h_used": 0.1, "eval_gpu_h": 0.2,
+                   "gpu_h_reserved": 0.0, "probe_gpu_h_reserved": 0.0}  # budgets already used up: nothing reserved
 
 
 def test_budget_attempts_cap_and_gpu_h():

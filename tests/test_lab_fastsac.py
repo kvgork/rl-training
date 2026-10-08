@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from so101_rl.lab import runs
 from so101_rl.lab.api import Lab
@@ -116,17 +117,35 @@ def test_fastsac_stop_request_maps_to_stopped_with_checkpoint(toy, tmp_path):
 
 
 def test_trainer_failure_reason_lands_in_status(toy, tmp_path, monkeypatch):
-    toy_mod = toy
-    monkeypatch.setattr(toy_mod, "read_gpu_temp_c", lambda: None)  # fail-closed thermal, then a pause timeout
-    monkeypatch.setattr(toy_mod.time, "sleep", lambda s: None)
-    real_load = toy_mod.load_sim_sac_config
-    monkeypatch.setattr(toy_mod, "load_sim_sac_config", lambda raw: real_load({**raw, "thermal_max_pause_min": 1e-6}))
+    from so101_rl.rl import fast_sac
+
+    orig = fast_sac.FastSAC.update
+
+    def bad(self, batch):  # a non-finite loss: the trainer's "failed" with its own reason
+        out = orig(self, batch)
+        out["critic_loss"] = torch.tensor(float("nan"))
+        return out
+
+    monkeypatch.setattr(fast_sac.FastSAC, "update", bad)
     d = _run(tmp_path, TINY)
     assert Job(d, use_nvml=False).run_segment() == 1
     st = runs.read_status(d)
-    assert st["state"] == "failed" and "thermal pause longer than" in st["error"]
-    kinds = [e["kind"] for e in runs.read_events(d, last=100)]
-    assert "thermal_hold" in kinds  # the trainer's pause report reached the job
+    assert st["state"] == "failed" and "non-finite" in st["error"]
+
+
+def test_under_the_lab_the_trainer_never_runs_its_own_thermal_guard(toy, tmp_path, monkeypatch):
+    """S3: one thermal guard (the job's). NVML silent for the trainer would pause it forever; under the lab the
+    trainer never samples it, and the run completes."""
+    calls = {"n": 0}
+
+    def silent():
+        calls["n"] += 1
+
+    monkeypatch.setattr(toy, "read_gpu_temp_c", silent)
+    d = _run(tmp_path, TINY)
+    assert Job(d, use_nvml=False).run_segment() == 0
+    assert runs.read_status(d)["state"] == "completed" and calls["n"] == 0
+    assert "thermal_hold" not in [e["kind"] for e in runs.read_events(d, last=100)]
 
 
 def test_trainer_thermal_pause_is_a_known_pause_not_a_stall(tmp_path):
@@ -220,3 +239,50 @@ def test_fastsac_reach_probe_through_the_lab_api(tmp_path):
             st = runs.read_status(d)
             if st.get("active") and pid_alive(st.get("pid"), st.get("pid_start")):
                 os.kill(st["pid"], signal.SIGKILL)
+
+
+# ------------------------------------------------------------------------------------------------ 2026-10-08 review
+@pytest.mark.regression
+def test_resume_after_half_the_budget_continues_and_stops_at_the_total_budget_b1(toy, tmp_path):
+    """B1: pause at ~50 % of budget_min, resume: the second segment trains (before the fix the trainer got the
+    remainder AND counted its checkpoint's train_s, so it stopped at once) and the run ends at the TOTAL budget."""
+    budget_s = 6.0
+    cfg = {**get_trainer("fastsac_sim").validate({**TINY, "max_env_steps": None}, "reach"), "budget_min": budget_s / 60}
+    with runs.registry_lock(tmp_path):
+        d, _ = runs.create_run(tmp_path, trainer="fastsac_sim", task="reach", kind="probe", config=cfg,
+                               budget_key="reach", idempotency_key="b1")  # fmt: skip
+    j = Job(d, use_nvml=False)
+    orig = j.should_stop
+
+    def pause_at_half():
+        if j.progress_s >= 0.5 * budget_s and not j.stop_reason:
+            j.stop_reason = "ai_pause"
+        return orig()
+
+    j.should_stop = pause_at_half
+    assert j.run_segment() == 0
+    st0 = runs.read_status(d)
+    assert st0["state"] == "paused"
+    runs.update_status(d, segment=1, state="queued")
+    assert Job(d, use_nvml=False).run_segment() == 0
+    st = runs.read_status(d)
+    assert st["env_step"] > st0["env_step"] + 32 * 10, "the resumed segment must make progress"
+    assert st["state"] == "stopped" and st["stop_reason"] == "budget_exhausted"
+    from so101_rl.rl import eval_sim
+
+    train_s = float(eval_sim.load_checkpoint(Path(st["last_ckpt"]))["train_s"])
+    gpu_s = runs.read_usage(d)["gpu_h"] * 3600
+    assert 0.6 * budget_s <= train_s <= 1.2 * budget_s + 1.0
+    assert gpu_s <= 1.2 * budget_s + 1.0
+
+
+@pytest.mark.regression
+def test_default_lab_config_does_not_trip_the_utd_review_trigger_s2():
+    """S2: 8 grads per vector step over the default nworld must be >= 0.005 grads/transition."""
+    from so101_rl.rl import train_sim_sac as tss
+
+    cfg = tss.load_sim_sac_config({"task": "reach", **get_trainer("fastsac_sim").validate({}, "reach")})
+    assert cfg.nworld == 1024 and cfg.thermal_guard is True  # the trainer's own default; the lab turns it off
+    trig = tss.review_triggers([{"alpha": 0.02}], train_h=0.0,
+                               n_updates_per_transition=cfg.grad_steps_per_env_step / cfg.nworld)  # fmt: skip
+    assert not any("UTD" in t for t in trig)

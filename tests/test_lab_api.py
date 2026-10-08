@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +16,7 @@ from so101_rl.lab.api import Lab, clean, envelope
 from so101_rl.lab.cli import CHECKLIST, gate_sign
 from so101_rl.lab.errors import LabError
 from so101_rl.lab.launcher import Launcher, pid_alive
+from so101_rl.lab.trainers import get_trainer
 
 SLOW = {"steps": 1_000_000, "step_s": 0.01, "ckpt_every": 20}
 
@@ -252,3 +254,87 @@ def test_failed_resume_launch_keeps_the_run_resumable(lab, monkeypatch):
     st = lab.get_run(rid)["status"]
     assert st["state"] == "interrupted" and not st["active"]
     assert runs.ledger(lab.root)["fake.reach"]["attempts_used"] == 1  # the attempt does not vanish
+
+
+# ------------------------------------------------------------------------------------------------ 2026-10-08 review
+def _attempt(lab, key, *, budget_min, gpu_h, state, **status):
+    """An attempt run dir in ``state`` with ``gpu_h`` used (no process): the ledger's view of an earlier run."""
+    with runs.registry_lock(lab.root):
+        d, _ = runs.create_run(lab.root, trainer="fake", task="reach", kind="attempt",
+                               config=get_trainer("fake").validate({"budget_min": budget_min, "steps": 10, "step_s": 0.0},
+                                                                   "reach"),
+                               budget_key="fake.reach", idempotency_key=key)  # fmt: skip
+    ck = d / "ckpt_000000005.json"
+    ck.write_text('{"env_step": 5}')
+    runs.update_status(d, state=state, active=False, segment=1, last_ckpt=str(ck), env_step=5, **status)
+    u = runs.read_usage(d)
+    u["gpu_h"] = gpu_h
+    runs.atomic_write_json(d / "usage.json", u)
+    return d
+
+
+@pytest.mark.regression
+def test_paused_attempt_reserves_its_unused_budget_b2(lab):
+    """B2: A paused at 1 h of a 5 h budget reserves 4 h; B asking 2 h would make 7 > 6 GPU-h: refused. Before the
+    fix only the 1 h used counted, B started, and A's resume later overran P6."""
+    _attempt(lab, "a", budget_min=300.0, gpu_h=1.0, state="paused", pause_reason="ai")
+    assert _code(lab.start_run, "fake", "reach", {"steps": 2, "budget_min": 120.0}, "b") == "BUDGET_EXHAUSTED"
+    led = runs.ledger(lab.root)["fake.reach"]
+    assert led["gpu_h_used"] == pytest.approx(1.0) and led["gpu_h_reserved"] == pytest.approx(4.0)
+    runs.check_budget(led, "fake.reach", runs.BUDGETS["reach"], "attempt", 1.0)  # 1 + 4 + 1 = 6: allowed
+
+
+@pytest.mark.regression
+def test_resume_is_refused_when_it_would_exceed_the_gpu_h_budget_b2(lab):
+    """The reviewer's sequence: pause A at 1 h, B ran 2 h meanwhile, resume A (4 h left) -> 7 > 6 GPU-h: refused."""
+    a = _attempt(lab, "a", budget_min=300.0, gpu_h=1.0, state="paused", pause_reason="ai")
+    _attempt(lab, "b", budget_min=120.0, gpu_h=2.0, state="completed")
+    assert _code(lab.control_run, a.name, "resume") == "BUDGET_EXHAUSTED"
+    assert runs.read_status(a)["state"] == "paused"  # untouched, still resumable after a human decision
+
+
+@pytest.mark.regression
+def test_resume_is_refused_while_halted_b2(lab):
+    a = _attempt(lab, "a", budget_min=10.0, gpu_h=0.01, state="paused", pause_reason="ai")
+    runs.atomic_write_json(lab.root / "HALT", {"reason": "test"})
+    assert _code(lab.control_run, a.name, "resume") == "HALTED"
+    assert runs.read_status(a)["state"] == "paused"
+
+
+@pytest.mark.regression
+def test_thermal_timeout_stop_is_resumable_and_reserves_budget(lab):
+    """S3/P8: a thermal timeout ends ``stopped`` with a checkpoint and can be resumed (it keeps its reservation)."""
+    a = _attempt(lab, "a", budget_min=300.0, gpu_h=1.0, state="stopped", stop_reason="thermal_timeout")
+    assert runs.ledger(lab.root)["fake.reach"]["gpu_h_reserved"] == pytest.approx(4.0)
+    assert lab.control_run(a.name, "resume")["accepted"]
+    st = lab.get_run(a.name, wait_s=30)["status"]
+    assert st["state"] == "completed" and st["segment"] == 2
+    b = _attempt(lab, "b", budget_min=10.0, gpu_h=0.01, state="stopped", stop_reason="user_stop")
+    assert _code(lab.control_run, b.name, "resume") == "STATE_CONFLICT"
+
+
+@pytest.mark.regression
+def test_eval_run_keeps_its_own_copy_of_the_checkpoint_s5(lab):
+    """S5: the eval dir holds the evaluated checkpoint; rewriting the training run's checkpoint afterwards does not
+    change what run.json points at."""
+    r = lab.start_run("fake", "reach", {"steps": 40, "step_s": 0.0, "success_rate": 0.98}, "t")
+    rid = r["run_id"]
+    lab.get_run(rid, wait_s=30)
+    src = runs.read_status(lab.root / rid)["last_ckpt"]
+    before = Path(src).read_text()
+    e = lab.evaluate_policy(rid, "e1", episodes=1000)
+    assert lab.get_run(e["run_id"], wait_s=30)["status"]["state"] == "completed"
+    ed = lab.root / e["run_id"]
+    cfg = runs.read_run(ed)["config"]
+    assert cfg["ckpt"] == "evaluated_ckpt.json" and cfg["source_ckpt"] == src
+    assert cfg["ckpt_sha256"] == runs.file_sha256(ed / "evaluated_ckpt.json")
+    res = runs.read_json(ed / "result.json")
+    assert res["ckpt"] == str(ed / "evaluated_ckpt.json") and res["numeric_gate_passed"] is True
+    Path(src).write_text('{"env_step": 999}')  # the training run moves on (in place, worst case)
+    assert (ed / "evaluated_ckpt.json").read_text() == before
+
+
+def test_metrics_carry_column_notes_for_the_biased_train_success(lab):
+    from so101_rl.lab.api import COLUMN_NOTES
+
+    assert "overstates" in COLUMN_NOTES["train_success_rate"]

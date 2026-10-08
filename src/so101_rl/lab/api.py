@@ -11,6 +11,7 @@ import csv
 import math
 import re
 import secrets
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,9 +26,16 @@ MAX_AI_PAUSES = 2  # P7: the AI may pause and resume a sim attempt at most twice
 MAX_WAIT_S = 300
 METRIC_ROWS = 20
 METRIC_COLS = 8
-# the columns an AI needs to judge a fastsac_sim run (train_sim_sac.METRICS_FIELDS has 25); others: the first 8
+# the columns an AI needs to judge a fastsac_sim run (train_sim_sac.METRICS_FIELDS has 26); others: the first 8
 KEY_METRIC_COLS = ("env_step", "train_s", "dr_stage", "train_success_rate", "mean_return", "critic_loss",
                    "eval_success_rate", "eval_wilson_lo")  # fmt: skip
+# what a column does NOT mean (returned with the metrics, so an AI is not misled)
+COLUMN_NOTES = {
+    "train_success_rate": "NOT the policy's success rate: the fraction of episodes that ENDED in the log window that "
+    "succeeded, with the exploring policy. Successful episodes end early, so it overstates success; judge by "
+    "eval_success_rate (deterministic, one episode per world).",
+    "eval_success_rate": "deterministic policy, one episode per world, at the current dr_stage; only on eval rows.",
+}
 LAUNCH_GRACE_S = 60.0
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
@@ -150,6 +158,7 @@ class Lab:
                 "name": name, "description": desc, "trainers": [t for t, p in TRAINERS.items() if name in p.capabilities.tasks],
                 "budget": {**runs.budget_dict(b), "budget_key": key, "attempts_used": int(e.get("attempts_used", 0)),
                            "gpu_h_used": round(float(e.get("gpu_h_used", 0.0)), 3),
+                           "gpu_h_reserved": round(float(e.get("gpu_h_reserved", 0.0)), 3),
                            "probe_gpu_h_used": round(float(e.get("probe_gpu_h_used", 0.0)), 3)},
             })
         return {"ok": True, "tasks": tasks, "trainers": [describe(t) for t in TRAINERS.values()],
@@ -293,7 +302,8 @@ class Lab:
             return v if math.isfinite(v) else None
 
         return {"columns": header, "n_rows": len(body), "stride": stride,
-                "rows": [[f(r[i]) if i < len(r) else None for i in cols] for r in picked]}
+                "rows": [[f(r[i]) if i < len(r) else None for i in cols] for r in picked],
+                "notes": {k: v for k, v in COLUMN_NOTES.items() if k in header}}
 
     def _latest_eval(self, run_id: str) -> dict[str, Any] | None:
         best = None
@@ -356,9 +366,9 @@ class Lab:
 
     def _resume(self, run_dir: Path, st: dict[str, Any], run: dict[str, Any], reason: str | None) -> dict[str, Any]:
         state = st.get("state")
-        if st.get("active") or state not in ("paused", "interrupted"):
-            raise LabError("STATE_CONFLICT", "only a paused or interrupted run can be resumed",
-                           details={"state": state, "allowed": ["paused", "interrupted"]})
+        if st.get("active") or state not in ("paused", "interrupted", "stopped") or not runs.resumable(st):
+            raise LabError("STATE_CONFLICT", "only a paused, interrupted or thermal-timeout-stopped run can be resumed",
+                           details={"state": state, "allowed": ["paused", "interrupted", "stopped/thermal_timeout"]})
         if run.get("kind") == "eval":
             raise LabError("STATE_CONFLICT", "an eval run cannot be resumed; start a new evaluation")
         if not st.get("last_ckpt"):
@@ -367,8 +377,13 @@ class Lab:
         if used_h * 60.0 >= float(run["config"].get("budget_min", 0.0)):
             raise LabError("BUDGET_EXHAUSTED", "this run has used its budget_min",
                            details={"gpu_h_used": round(used_h, 4), "budget_min": run["config"].get("budget_min")})
+        runs.check_halt(self.root)  # B2: a resume is a start: HALT and the ledger apply
+        budget = runs.BUDGETS.get(run.get("task", ""))
+        if budget is not None:
+            runs.check_resume_budget(runs.checked_ledger(self.root), run.get("budget_key", ""), budget, run.get("kind", ""))
         self._refuse_if_busy()
-        runs.update_status(run_dir, state="queued", segment=int(st.get("segment") or 0) + 1, pause_reason=None)
+        runs.update_status(run_dir, state="queued", segment=int(st.get("segment") or 0) + 1, pause_reason=None,
+                           stop_reason=None)
         runs.append_event(run_dir, "resumed", reason=reason)
         new = self._launch(run_dir)
         return {"ok": True, "run_id": run_dir.name, "state": new.get("state"), "accepted": True,
@@ -405,10 +420,17 @@ class Lab:
                 raise LabError("STATE_CONFLICT", "the run has no checkpoint", details={"state": st.get("state")})
             runs.check_halt(self.root)
             self._refuse_if_busy()
-            cfg = {**config, "ckpt": st["last_ckpt"]}
+            src_ckpt = Path(st["last_ckpt"])
+            if not src_ckpt.is_file():
+                raise LabError("STATE_CONFLICT", "the run's checkpoint file is missing", details={"state": st.get("state")})
+            # S5: the eval dir gets its own copy of the checkpoint (~20 MB; a copy, not a hard link, so an in-place
+            # rewrite of the source cannot change it), so run.json stays reproducible after the training run resumes
+            local = "evaluated_ckpt" + src_ckpt.suffix
+            cfg = {**config, "ckpt": local, "source_ckpt": str(src_ckpt), "ckpt_sha256": runs.file_sha256(src_ckpt)}
             run_dir, _ = runs.create_run(self.root, trainer=t.name, task=run["task"], kind="eval", config=cfg,
                                          budget_key=run["budget_key"], idempotency_key=idempotency_key,
                                          extra=extra, request_sha=req)
+            shutil.copy2(src_ckpt, run_dir / local)
             new = self._launch(run_dir)
         return {"ok": True, "run_id": run_dir.name, "state": new.get("state"), "source_run": run_id}
 

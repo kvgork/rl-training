@@ -185,7 +185,7 @@ def test_thermal_missing_samples_fail_closed(toy, tmp_path, monkeypatch):
     monkeypatch.setattr(train_sim_sac.time, "monotonic", lambda: real() + clock["t"])
     seen = []
     res = run_training(_cfg(thermal_max_pause_min=1.0), tmp_path, hooks=TrainHooks(on_metrics=lambda s, m: seen.append(dict(m))))
-    assert res.status == "failed" and "thermal" in res.reason
+    assert res.status == "stopped" and "thermal_timeout" in res.reason  # S3: a timeout is a resumable stop
     assert res.env_steps == 0  # never trained without a temperature reading
     assert any(m.get("thermal_needs_human") == 1.0 for m in seen)
 
@@ -242,3 +242,54 @@ def test_smoke_reach_gpu(tmp_path):
     assert d["policy_input_dim"] == 24 and d["act_dim"] == 6
     ev = eval_sim.evaluate(res.last_ckpt, "reach", episodes=64, dr_stage=4, out_dir=tmp_path / "eval", render=1)
     assert ev.eval_json.exists() and not ev.numeric_gate_passed and len(ev.renders) == 1 and ev.renders[0].exists()
+
+
+# ------------------------------------------------------------------------------------------------ 2026-10-08 review
+@pytest.mark.regression
+def test_only_the_last_k_numbered_checkpoints_are_kept_plus_last_and_best_s1(toy, tmp_path):
+    res = run_training(_cfg(eval_every_steps=32 * 10, eval_episodes=16, eval_max_fraction=1.0), tmp_path)
+    assert res.status == "completed"
+    numbered = sorted(int(p.stem.split("_")[1]) for p in tmp_path.glob("ckpt_[0-9]*.pt"))
+    assert numbered == [32 * 100, 32 * 110, 32 * 120]
+    assert (tmp_path / "ckpt_last.pt").exists() and (tmp_path / "ckpt_best.pt").exists()
+    best = eval_sim.load_checkpoint(tmp_path / "ckpt_best.pt")
+    evals = [r for r in _rows(res.metrics_csv) if r["eval_success_rate"]]
+    assert best["last_eval"]["success_rate"] == max(float(r["eval_success_rate"]) for r in evals)
+
+
+@pytest.mark.regression
+def test_eval_time_is_capped_to_the_eval_fraction_s1(toy, tmp_path, monkeypatch):
+    """S1: with an eval as slow as ~a third of the training, evals are deferred so they stay <= ~10 % of train_s."""
+    import time as _time
+
+    real = eval_sim.run_episodes
+
+    def slow(*a, **kw):
+        _time.sleep(0.3)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(eval_sim, "run_episodes", slow)
+    res = run_training(_cfg(eval_every_steps=32 * 2, eval_episodes=16, max_env_steps=None, budget_min=0.1), tmp_path)
+    rows = _rows(res.metrics_csv)
+    n_eval = sum(1 for r in rows if r["eval_success_rate"])
+    frac = float(rows[-1]["eval_frac"])
+    assert n_eval >= 1 and frac <= 0.1 + 0.3 / 6.0 + 0.02, (n_eval, frac)  # one eval may straddle the end
+
+
+@pytest.mark.regression
+def test_resume_truncates_metrics_after_the_checkpoint_s4(toy, tmp_path):
+    """S4: resuming from a checkpoint older than the last metrics row drops the later rows (no duplicate steps)."""
+    first = run_training(_cfg(max_env_steps=32 * 100), tmp_path)
+    assert first.status == "completed"
+    older = tmp_path / f"ckpt_{32 * 80}.pt"
+    assert older.exists() and int(_rows(first.metrics_csv)[-1]["env_step"]) == 32 * 100
+    run_training(_cfg(max_env_steps=32 * 120), tmp_path, resume=older)
+    steps = [int(r["env_step"]) for r in _rows(tmp_path / "metrics.csv")]
+    assert steps == sorted(steps) and len(steps) == len(set(steps)), steps
+
+
+@pytest.mark.regression
+def test_thermal_guard_off_never_samples(toy, tmp_path, monkeypatch):
+    """S3: ``thermal_guard`` False (the lab) = no NVML reads and no pause in the trainer."""
+    monkeypatch.setattr(train_sim_sac, "read_gpu_temp_c", lambda: pytest.fail("sampled"))
+    assert run_training(_cfg(thermal_guard=False), tmp_path).status == "completed"
