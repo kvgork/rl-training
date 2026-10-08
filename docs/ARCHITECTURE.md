@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.19 (2026-10-08). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.20 (2026-10-08). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -382,6 +382,17 @@ These are ordered from the outermost layer to the innermost.
      - The first heartbeat after ARM sets the sequence baseline, and every later one must be +1 mod 256.
      - A gap, a repeated seq or a bad complement latches the MCU with reason 3.
      - The MCU **boots LATCHED** with reason 6 (MCU_RESET) after every reset, whether from power, the hardware WDT or USB re-enumeration (status `0x62`). Only the physical button re-enables power.
+     - **Arm timeout (FW1):**
+       - DISARMED → LATCHED with reason 8 (status `0x82`) after 120 000 ms in DISARMED without an accepted ARM.
+       - The timer is wrap-safe (`ticks_diff`) and uses `>=`. It is checked together with the heartbeat timeout, before the button rows and before any frame of the loop tick.
+       - A button press therefore means "arm within 2 minutes". Serial traffic never moves the window.
+       - A later 500 ms press re-enters DISARMED (`0x80`, reason kept) and restarts the window.
+       - `FakeMcu` mirrors this (`REASON_ARM_TIMEOUT`, `ARM_TIMEOUT_MS`).
+       - The host decodes reason names via `McuStatus.reason_name`; an unknown nibble becomes `UNKNOWN_<n>`.
+     - **Two timers, two origins:**
+       - The servo's `--arm-timeout-s` (CLI default `None`; a session unit passes 110) bounds the servo's own wait from servo start.
+       - The MCU's 120 s runs from DISARMED entry and bounds a press nobody arms.
+       - The human is asked to press only once the servo is waiting.
      - Trip reasons:
 
        | Code | Reason |
@@ -393,6 +404,7 @@ These are ordered from the outermost layer to the innermost.
        | 5 | TEST |
        | 6 | MCU_RESET |
        | 7 | WELD |
+       | 8 | ARM_TIMEOUT (DISARMED ≥ 120 000 ms from entry without an accepted ARM; FW1) |
      - A partial heartbeat frame is dropped after 100 ms.
      - **Host side** (`SerialHeartbeatLink`):
        - A heartbeat counts as delivered only once all 3 bytes are out. A partial write returns NOT_DELIVERED, and the next send with the same seq completes the tail.
@@ -557,3 +569,4 @@ Bump the version line at the top and add an entry below.
 | 0.17 | 2026-10-07 | **Gripper floor check active** (plan §10 2026-10-06 + 2026-10-07 "Gripper floor clearance"). §5/§6: the lowest of 169 mesh-derived wrist/gripper points (`so101_kinematics.yaml` `floor_points`, ≤ 0.5 mm above the exact mesh) must stay ≥ table + 1 mm (`box.gripper_floor_clearance_m`), BOX_PRESENT for the points at 2 mm (`box.gripper_present_tolerance_m`); the tip box is unchanged. Identical in `safety/fk`+`pipeline` and `sim/batched_servo` (`So101FK.tip_and_floor_z` / `in_box_gripper`), previewed by `sysid.check_plan_in_box`. Die reach on the exact mesh: margin 1.38 / 1.41 mm. Layer B: all three strict xfails under 2e-3 rad (the seq7b pending cap is gone). §6: start floor described as 3 cm above the table (plan §10 2026-10-07). |
 | 0.18 | 2026-10-07 | **Camera parity unit SUC** (plan §10 2026-10-06 "Camera parity", `plans/camera-parity-plan.md`). §4: `calib/camera.yaml` + `calib/distractors.yaml`; `servo/probe.py`; `perception/{camera_calib,camera_intrinsics,table_plane,arm_registration,camera_calibrate,camera_overlay,distractors}.py`; `sim/{d435,arm_cloud}.py`; dependency arrows (`sim → perception.camera_calib`; the calibration tools → `servo.probe` + `sim`). §3: the one-shot probe tools and their port-lock rule. §5: the camera parity block (single source, schema, provisional status, MuJoCo intrinsics and frame conversion, MSAA off, parity numbers, probe, arm-shape gate, overlay, distractors); FS6 on the real camera with camera-pose DR, depth-sensor occlusion, slab occluders incl. base and tray, distractors; the scene has no MJCF camera; the die-centroid conversion along the viewing ray and the border rule; videos show `d435_color`. §8: tasks `joint-probe`, `camera-intrinsics`, `camera-calibrate`, `camera-overlay`, `camera-distractors`. `calib/sim_params.yaml` release 0 regenerated (the scene MJCF lost its camera). |
 | 0.19 | 2026-10-08 | **Camera parity verification fixes.** §5: provisional camera pose refused by `BatchedGoalEnv` unless `allow_provisional_camera` (run metadata records pose method + `camera.yaml` sha256, `CameraCalib.source_sha256` / `pose_meta`); arm-shape gate minimums (`n_inliers`, visible samples, 6-DOF ICP iterations) in `report.json`; probe: byte-level write spy, `SerialException` → `ProbeRefused`, `--reads >= 1`, wall-clock timeout; `SimDieTracker.in_view` uses the projected half-blob width as the image margin (matches the real border cut); the single-source test also catches int intrinsics literals and 4×4 pose literals; tracker parity also at 45° die yaw. |
+| 0.20 | 2026-10-08 | FW1 firmware arm timeout (plan §10 P4, P12; `plans/reviews/2026-10-07-fw1-review.md`). §6 layer 2: trip reason 8 ARM_TIMEOUT (DISARMED ≥ 120 s from entry without ARM → LATCHED, 0x82; a press re-enters DISARMED and restarts the window); host decoding via `McuStatus.reason_name`; the two-timer rule. HARDWARE_CHECKLIST H3 step 10. |
