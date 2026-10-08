@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "so101-lab": {
+      "type": "stdio",
+      "command": "pixi",
+      "args": ["run", "--frozen", "-e", "cpu", "lab-mcp"]
+    }
+  }
+}
