@@ -91,6 +91,13 @@ Sim-first track (`plans/sim-track-implementation-plan.md`; GPU tasks in the `def
   passes); `pixi run train-sim-sac --task reach --nworld 1024 --budget-min 60` FastSAC on the batched env;
   `pixi run eval-sim --ckpt <ckpt> --task reach --episodes 1000 --dr-stage 4 [--gate]` the sim eval and numeric exit
   gate; `pixi run export-policy --ckpt <ckpt> --out <file>` the deployable policy.
+- `pixi run -e cpu deploy-policy --policy <export> --protocol zero-shot [--attended] [--shm-name N]` (MVP M7) runs the
+  exported policy at 10 Hz against an ALREADY-RUNNING servo (it never starts one and never opens a serial port):
+  episodes end at success / 100 steps / a trip, speed ladder 0.5 → 0.75 → 1.0 (10, 10, 50 episodes), Wilson 95 % per
+  rung, the fine-tune verdict (lower bound ≥ 0.60 at full speed); `runs/deploy/<ts>/{episodes.jsonl,summary.json}`.
+  The real arm (the servo's `--backend feetech`) needs `--attended`; `--protocol single --episodes N --speed-scale S`
+  for a quick run. Start it BEFORE the servo reaches RUN (sim: start deploy-policy first; arm: start the servo, then
+  deploy-policy, then press the reset button).
 - `pixi run -e cpu lab-mcp` the stdio MCP server of the training lab (registered in `.mcp.json`; six sim-only tools; each
   run is a transient `systemd --user` unit that outlives the client); `pixi run -e cpu lab status | stop <run> |
   gate-sign <run>` the human CLI.
