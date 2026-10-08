@@ -4,7 +4,8 @@ the episode-end rule are one definition (``env/tasks.py``), driven through both 
 * Action mapping: ``tasks.action_to_delta_np`` == ``tasks.action_to_delta_torch`` bit for bit, including ±inf, 1e3,
   NaN and the values on a .5 rounding boundary where a float32 product rounds differently from the float64 one; the
   two envs apply the same deltas for the same actions (GPU).
-* Episode end: a success predicate on a tripped step is never a success (trip-on-success: truncated only), and a
+* Episode end: a success predicate on a tripped step is never a success (trip-on-success: a terminal trip,
+  ``terminated`` AND ``truncated``, ``tripped``, reward = ``trip_penalty``; plan §10 2026-10-08), and a
   success on the step-limit step is ``terminated`` AND ``truncated`` in both envs (GPU).
 """
 
@@ -76,10 +77,11 @@ def test_real_env_applies_the_mapping_for_special_values(cfg, calibration):
             env.reset(seed=0, options={"goal": np.array([0.30, 0.15, 0.25])})  # far: no success
             _o, _r, terminated, truncated, info = env.step(row)
             if np.isnan(row).any():
-                assert info["trips"] & TripCause.NAN and truncated and not terminated
+                assert info["trips"] & TripCause.NAN and truncated and terminated  # a terminal trip
+                assert info["tripped"] and not info["is_success"] and _r == REACH.trip_penalty
                 assert not info["applied_delta_ticks"].any()
             else:
-                assert info["trips"] == 0 and not truncated
+                assert info["trips"] == 0 and not truncated and not terminated and not info["tripped"]
                 np.testing.assert_array_equal(info["applied_delta_ticks"], want)
         finally:
             env.close()
@@ -134,35 +136,38 @@ def test_both_envs_apply_the_same_deltas_and_trips(scene, cfg, calibration):
         assert bool(b_trunc[i]) == truncated, i
 
 
-def _real_episode_end(cfg, cal, task, action) -> tuple[bool, bool, bool]:
+def _real_episode_end(cfg, cal, task, action) -> tuple[bool, bool, bool, bool, float]:
+    """(terminated, truncated, success, tripped, reward) of the first step with the predicate holding."""
     env = _real(cfg, cal, task)
     try:
         obs, _ = env.reset(seed=0)
         env.reset(seed=0, options={"goal": obs["achieved_goal"].astype(np.float64)})  # predicate holds at once
-        _o, _r, terminated, truncated, info = env.step(action)
-        return bool(terminated), bool(truncated), bool(info["is_success"])
+        _o, r, terminated, truncated, info = env.step(action)
+        return bool(terminated), bool(truncated), bool(info["is_success"]), bool(info["tripped"]), float(r)
     finally:
         env.close()
 
 
-def _batched_episode_end(scene, cfg, cal, task, action) -> tuple[bool, bool, bool]:
+def _batched_episode_end(scene, cfg, cal, task, action) -> tuple[bool, bool, bool, bool, float]:
     env = _batched(scene, cfg, cal, task, 2)
     try:
         _obs, _priv, achieved, _des = env.reset(phase_randomise=False)
         env.goal.copy_(achieved)  # predicate holds at once
         st = env.step(torch.as_tensor(np.tile(action, (2, 1)), device=env.device))
-        return bool(st.terminated[0]), bool(st.truncated[0]), bool(st.info["success"][0])
+        return (bool(st.terminated[0]), bool(st.truncated[0]), bool(st.info["success"][0]), bool(st.info["tripped"][0]),
+                float(st.reward[0]))  # fmt: skip
     finally:
         env.close()
 
 
 @gpu
-def test_trip_on_success_is_truncated_not_terminated_in_both_envs(scene, cfg, calibration):
-    """The tip sits on the goal (predicate true) but the step trips (NaN): no success in either env."""
+def test_trip_on_success_is_a_terminal_trip_not_a_success_in_both_envs(scene, cfg, calibration):
+    """The tip sits on the goal (predicate true) but the step trips (NaN): no success in either env; the step is a
+    terminal trip (terminated AND truncated) that pays ``trip_penalty`` (plan §10 2026-10-08 "Trip penalty")."""
     action = np.array([np.nan, 0, 0, 0, 0, 0], np.float32)
     real = _real_episode_end(cfg, calibration, REACH, action)
     batched = _batched_episode_end(scene, cfg, calibration, REACH, action)
-    assert real == batched == (False, True, False), (real, batched)
+    assert real == batched == (True, True, False, True, REACH.trip_penalty), (real, batched)
 
 
 @gpu
@@ -171,7 +176,8 @@ def test_success_on_the_step_limit_is_terminated_and_truncated_in_both_envs(scen
     action = np.zeros(6, np.float32)
     real = _real_episode_end(cfg, calibration, task, action)
     batched = _batched_episode_end(scene, cfg, calibration, task, action)
-    assert real == batched == (True, True, True), (real, batched)
+    assert real[:4] == batched[:4] == (True, True, True, False), (real, batched)
+    assert real[4] == batched[4] > -1.0  # the ordinary success-step reward, no penalty
 
 
 @gpu
@@ -179,4 +185,5 @@ def test_success_without_trip_or_limit_is_terminated_only_in_both_envs(scene, cf
     action = np.zeros(6, np.float32)
     real = _real_episode_end(cfg, calibration, REACH, action)
     batched = _batched_episode_end(scene, cfg, calibration, REACH, action)
-    assert real == batched == (True, False, True), (real, batched)
+    assert real[:4] == batched[:4] == (True, False, True, False), (real, batched)
+    assert real[4] == batched[4] > -1.0

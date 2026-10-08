@@ -81,7 +81,8 @@ class ToyBatchedReachEnv:
         terminated = success
         truncated = self.episode_step >= self.episode_steps
         final_obs, final_priv, desired = self._obs(), self.pos.clone(), self.goal.clone()
-        info = {"success": success, "episode_step": self.episode_step.clone(), "final_dist": dist}
+        info = {"success": success, "tripped": torch.zeros_like(success), "episode_step": self.episode_step.clone(),
+                "final_dist": dist}
         obs, priv, ach, _ = self.reset(terminated | truncated)
         return ToyStep(obs=obs, priv=priv, achieved=ach, desired=desired, reward=reward, terminated=terminated,
                        truncated=truncated, final_obs=final_obs, final_priv=final_priv, final_achieved=final_priv,

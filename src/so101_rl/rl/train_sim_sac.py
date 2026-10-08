@@ -594,9 +594,9 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
             done = st.terminated | st.truncated
             ret_run += st.reward.float()
             ep_done += done.sum()
-            ep_succ += st.terminated.sum()
+            ep_succ += st.info["success"].sum()  # terminated also covers a terminal trip
             ep_ret_sum += torch.where(done, ret_run, torch.zeros_like(ret_run)).sum()
-            mon.on_step(env_step + n, success=st.terminated, ep_return=ret_run)  # before the done worlds' reset
+            mon.on_step(env_step + n, success=st.info["success"], ep_return=ret_run)  # before the done worlds' reset
             ret_run.masked_fill_(done, 0.0)
             rew_abs_max = torch.maximum(rew_abs_max, st.reward.abs().max())
             obs, priv = st.obs, st.priv

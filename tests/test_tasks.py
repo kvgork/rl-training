@@ -272,3 +272,52 @@ def test_goal_bounds_inside_box_and_radius(cfg):
     # the bounds are not degenerate: samples spread over the region
     assert np.ptp(g[:, 0]) > 0.15 and np.ptp(g[:, 1]) > 0.3 and np.ptp(g[:, 2]) > 0.15
     assert not gb.contains_np(np.array([0.33, 0.0, 0.1]))  # inside the box, but within the margin of x = 0.34
+
+
+# ---- trip penalty (plan §10 2026-10-08 "Trip penalty": a policy-caused trip is terminal with a fixed penalty)
+def test_trip_penalty_is_worse_than_any_trip_free_episode():
+    import dataclasses
+
+    from so101_rl.env.reward import RewardSpecError, validate_trip_penalty, worst_step_reward
+
+    for t in (REACH, DIE_TO_ZONE):
+        worst = worst_step_reward(t.reward, max_dist_m=t.max_dist_m)
+        # box diagonal (+ 5 mm BOX_PRESENT tolerance per face) / 0.30 + success 1 + time 0.05
+        assert worst == pytest.approx(-(t.max_dist_m / 0.30 + 1.05))
+        assert t.trip_penalty < 0 and t.trip_penalty <= t.episode_steps * worst
+        # the undiscounted bound also beats the worst DISCOUNTED continuation, for every gamma < 1
+        assert t.trip_penalty < worst / (1 - t.gamma)
+    assert REACH.max_dist_m == pytest.approx(np.linalg.norm([0.27, 0.45, 0.305]))
+    with pytest.raises(RewardSpecError, match="not worse"):
+        dataclasses.replace(REACH, trip_penalty=-10.0)
+    with pytest.raises(RewardSpecError, match="< 0"):
+        validate_trip_penalty(REACH.reward, 0.0, episode_steps=1, max_dist_m=0.0)
+    with pytest.raises(RewardSpecError, match="< 0"):
+        validate_trip_penalty(REACH.reward, float("nan"), episode_steps=1, max_dist_m=0.0)
+    # a shorter episode only relaxes the bound; a longer one needs a larger penalty
+    dataclasses.replace(REACH, episode_steps=10)
+    with pytest.raises(RewardSpecError, match="not worse"):
+        dataclasses.replace(REACH, episode_steps=200)
+
+
+def test_step_reward_penalises_terminal_trips_only_np_and_torch_agree():
+    from so101_rl.env.tasks import TERMINAL_TRIPS, step_reward_np, step_reward_torch, tripped_from_info
+    from so101_rl.safety.types import TripCause
+
+    assert TERMINAL_TRIPS == int(TripCause.NAN | TripCause.RANGE | TripCause.BOX_PRESENT | TripCause.STUCK)
+    d = np.array([0.2, 0.0, 0.1])
+    trips = [0, int(TripCause.NAN), int(TripCause.RANGE), int(TripCause.BOX_PRESENT), int(TripCause.STUCK),
+             int(TripCause.THERMAL), int(TripCause.JOINT_LIMIT | TripCause.TRACKING),
+             int(TripCause.STALE_CMD | TripCause.STUCK)]  # fmt: skip
+    ach = np.tile(d, (len(trips), 1))  # every step sits exactly on its goal: the success predicate holds
+    infos = [{"trips": t} for t in trips]
+    want_trip = np.array([False, True, True, True, True, False, False, True])
+    np.testing.assert_array_equal(tripped_from_info(infos), want_trip)
+    r = step_reward_np(ach, ach, REACH, info=infos)  # HER: desired = achieved
+    np.testing.assert_array_equal(r, np.where(want_trip, np.float32(REACH.trip_penalty), reward_np(ach, ach, REACH)))
+    assert r.dtype == np.float32 and (r <= 0).all()
+    rt = step_reward_torch(torch.as_tensor(ach), torch.as_tensor(ach), REACH, trips=torch.tensor(trips))
+    np.testing.assert_array_equal(rt.numpy(), r)
+    assert float(step_reward_np(d, d, REACH, info={"trips": int(TripCause.NAN)})) == REACH.trip_penalty
+    with pytest.raises(KeyError):
+        step_reward_np(d, d, REACH, info={})  # a missing trip field is never "no trip"

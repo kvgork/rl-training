@@ -9,7 +9,8 @@ re-implements a safety check: it writes joint DELTAS and reads back what the ser
   servo publishes a record of a NEWER tick (bounded); a servo that stops ticking or publishes an old record
   raises :class:`ServoStateStale`. ``reset(q0)`` ramps to ``q0`` through the normal command path: a HOLD
   command, then RUN deltas of at most ``max_ticks_per_tick`` per joint (interpolated by the servo over 3 ticks:
-  never a jump), until ``|target - q0| <= 2`` and ``|target - present| < 5`` on every joint with a good bus read
+  never a jump) along the lift-then-return path of ``env/reset_path.py`` (the tip first away from the box walls
+  and up, then to ``q0``; plan §10 2026-10-08), until ``|target - q0| <= 2`` and ``|target - present| < 5`` on every joint with a good bus read
   for 2 consecutive policy ticks. It refuses (:class:`ServoNotRunning`) a servo outside RUN/HOLD: clearing a
   trip needs a fresh servo process or a human, never the policy.
 * :class:`SimBackend` -- the parity reference rig (demoted, not the training env): the SAME ``ServoCore`` +
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, Self, runtime_c
 import numpy as np
 
 from so101_rl.config import N_JOINTS, MotorCalibration, So101Config, load_calibration
+from so101_rl.env.reset_path import densify, plan_reset_path
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.types import SmState
 from so101_rl.servo.shm import CmdMode, LocalIpc, ServoShm, new_cmd, new_state
@@ -236,7 +238,8 @@ class ShmBackend:
             clock.sleep_until(clock.monotonic_ns() + self.poll_interval_ns)  # a FakeClock advances, never hangs
 
     def reset(self, q0_ticks: np.ndarray | None) -> None:
-        """HOLD, then a ramp of RUN deltas (<= ``max_ticks_per_tick`` per joint per command) toward ``q0_ticks``.
+        """HOLD, then a ramp of RUN deltas (<= ``max_ticks_per_tick`` per joint per command) to ``q0_ticks`` along
+        :func:`~so101_rl.env.reset_path.plan_reset_path` (lift away from the box walls, then return).
 
         ``None``: HOLD and resume RUN where the arm is (zero delta). Raises :class:`ServoNotRunning` if the servo
         is not in RUN/HOLD, :class:`ResetFailed` on a trip during the ramp or if it does not converge in time."""
@@ -262,12 +265,16 @@ class ShmBackend:
         if np.any(q0 < lo) or np.any(q0 > hi):
             raise ValueError(f"q0_ticks {q0.tolist()} outside the joint limits")
         goal0 = st["goal_ticks"][0].astype(np.int64)
-        dist = int(np.max(np.abs(q0 - goal0) / np.maximum(step, 1)))
-        max_steps = 2 * dist + 30  # 2x the ramp length plus settling (3 s)
+        # lift, then return (plan §10 2026-10-08): a path that never pushes the tip into a box wall
+        path = densify(goal0, plan_reset_path(self._fk, self.cfg, goal0, q0), step)
+        max_steps = 2 * len(path) + 30  # 2x the path length plus settling (3 s)
+        k = 0
         settled = 0
         for _ in range(max_steps):
             goal = st["goal_ticks"][0].astype(np.int64)
-            delta = np.clip(q0 - goal, -step, step)
+            if k < len(path) - 1 and np.all(np.abs(path[k] - goal) <= RESET_TARGET_TOL_TICKS):
+                k += 1  # the servo took this waypoint: the next one (a clamped goal stays on it -> STUCK halts)
+            delta = np.clip(path[k] - goal, -step, step)
             self.send_delta(delta.astype(np.float32), int(st["seq"][0]), self.episode)
             self.wait_policy_tick()
             self._check_runnable(st, "during the reset ramp", trip_is_fatal=True)
