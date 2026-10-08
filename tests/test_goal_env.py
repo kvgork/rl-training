@@ -209,7 +209,7 @@ def test_info_applied_delta_equals_the_state_record(reach_env):
             assert key in info
 
 
-def test_nan_action_truncates_with_a_nan_trip_and_never_moves_the_goal(reach_env, cfg):
+def test_nan_action_is_a_terminal_trip_with_the_penalty_and_never_moves_the_goal(reach_env, cfg):
     reach_env.reset(seed=0)
     reach_env.step(np.zeros(6, np.float32))
     core, bus = reach_env.backend.core, reach_env.backend.bus
@@ -217,13 +217,14 @@ def test_nan_action_truncates_with_a_nan_trip_and_never_moves_the_goal(reach_env
     target = core._target.copy()
     n = len(bus.written_goals)
     _obs, reward, terminated, truncated, info = reach_env.step(np.array([np.nan, 0, 0, 0, 0, 0], np.float32))
-    assert truncated and not terminated and not info["is_success"]
+    # plan §10 2026-10-08 "Trip penalty": terminal (no bootstrap), never a success, fixed penalty
+    assert truncated and terminated and info["tripped"] and not info["is_success"]
+    assert reward == REACH.trip_penalty
     assert info["trip"] & TripCause.NAN and info["sm_state"] == SmState.SAFE_STOPPING
     assert np.array_equal(core.pipeline.goal, goal)  # the NaN delta never reached the goal
     assert not info["applied_delta_ticks"].any()
     first = bus.written_goals[n].astype(int)  # the first goal written after the NaN: the safe-stop ramp, not a jump
     assert np.abs(first - target.astype(int)).max() <= cfg.safe_state.ramp_ticks_per_tick
-    assert np.isfinite(reward) and reward < 0
     with pytest.raises(RuntimeError, match="reset"):
         reach_env.step(np.zeros(6, np.float32))
     reach_env.reset(seed=0)  # a fresh servo core (the sim's "fresh process")
@@ -262,14 +263,39 @@ def test_compute_reward_is_tasks_reward_np_vectorised_and_matches_step(reach_env
     np.testing.assert_allclose(relabelled, -REACH.reward.term("time").weight, rtol=1e-6)
 
 
+def test_her_never_relabels_a_trip_as_a_success(reach_env):
+    """Plan §10 2026-10-08 "Trip penalty": HER relabels the goal of a stored terminal-trip transition to its own
+    achieved goal (where the success predicate holds); compute_reward still pays trip_penalty, never 0 / success."""
+    reach_env.reset(seed=0)
+    ok_obs, _r, _te, _tr, ok_info = reach_env.step(np.zeros(6, np.float32))
+    trip_obs, trip_r, terminated, _tr, trip_info = reach_env.step(np.array([np.nan, 0, 0, 0, 0, 0], np.float32))
+    assert terminated and trip_info["tripped"] and trip_r == REACH.trip_penalty
+    ach = np.array([ok_obs["achieved_goal"], trip_obs["achieved_goal"]])
+    infos = np.array([ok_info, trip_info], dtype=object)
+    relabelled = reach_env.compute_reward(ach, ach, infos)  # HER "future"/"final": desired = achieved
+    assert relabelled[0] == np.float32(-REACH.reward.term("time").weight)  # the ordinary step becomes a success
+    assert relabelled[1] == np.float32(REACH.trip_penalty)  # the trip never does
+    assert reach_env.compute_reward(trip_obs["achieved_goal"], trip_obs["achieved_goal"], trip_info) == REACH.trip_penalty
+    for bits in (TripCause.RANGE, TripCause.BOX_PRESENT, TripCause.STUCK):  # every terminal trip cause, any goal
+        info = {**ok_info, "trips": int(bits)}
+        assert reach_env.compute_reward(ach[0], ach[0], info) == REACH.trip_penalty
+    for bits in (TripCause.THERMAL, TripCause.STALE_CMD, TripCause.JOINT_LIMIT):  # not policy-caused: no penalty
+        info = {**ok_info, "trips": int(bits)}
+        assert reach_env.compute_reward(ach[0], ach[0], info) == np.float32(-REACH.reward.term("time").weight)
+    with pytest.raises(KeyError):
+        reach_env.compute_reward(ach[0], ach[0], {k: v for k, v in ok_info.items() if k != "trips"})  # never "no trip"
+
+
 def test_die_compute_reward_uses_the_stored_visibility(die_env):
     die_env.reset(seed=0)
     z = DIE_TO_ZONE.zone.goal_xyz().astype(np.float32)
-    seen = die_env.compute_reward(z, z, {"tracker_visible": True})
-    unseen = die_env.compute_reward(z, z, {"tracker_visible": False})
+    seen = die_env.compute_reward(z, z, {"tracker_visible": True, "trips": 0})
+    unseen = die_env.compute_reward(z, z, {"tracker_visible": False, "trips": 0})
     assert seen > unseen  # an invisible die in the zone is UNKNOWN, never success
     with pytest.raises(KeyError):
-        die_env.compute_reward(z, z, {})  # never defaults to visible
+        die_env.compute_reward(z, z, {"trips": 0})  # never defaults to visible
+    tripped = die_env.compute_reward(z, z, {"tracker_visible": True, "trips": int(TripCause.BOX_PRESENT)})
+    assert tripped == DIE_TO_ZONE.trip_penalty  # a die in the zone on a trip step is no success either
 
 
 # ---------------------------------------------------------------------------------------------------- success

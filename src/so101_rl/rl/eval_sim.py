@@ -58,7 +58,7 @@ GATE_MIN_WILSON_LO: Final[float] = 0.93
 GATE_MIN_EPISODES: Final[int] = 1000
 GATE_FINAL_STAGE: Final[int] = 4  # the last entry of sim/domain_rand.REACH_DR_STAGES (test-enforced)
 TASKS: Final[tuple[str, ...]] = ("reach",)  # MVP: reach only (die_to_zone deferred, plans/mvp-plan.md)
-# per-cause counts of the episodes ended by an emulated trip (eval.json ``trip_causes``; batched_env.TRUNCATING_TRIPS)
+# per-cause counts of the episodes ended by an emulated trip (eval.json ``trip_causes``; env.tasks.TERMINAL_TRIPS)
 TRIP_CAUSES: Final[tuple[tuple[str, TripCause], ...]] = (
     ("nan", TripCause.NAN), ("range", TripCause.RANGE), ("box_present", TripCause.BOX_PRESENT), ("stuck", TripCause.STUCK),
 )
@@ -187,13 +187,13 @@ def run_episodes(env: Any, policy: Callable[[torch.Tensor], torch.Tensor], episo
             live = ~done
             r_acc += torch.where(live, st.reward.float(), torch.zeros_like(r_acc))
             end = live & (st.terminated | st.truncated)
-            s_ep |= end & st.terminated
+            s_ep |= end & st.info["success"]  # terminated also covers a terminal trip (plan §10 2026-10-08)
             fe = (st.final_achieved - st.desired).norm(dim=1)
             e_ep = torch.where(end, fe, e_ep)
             l_ep = torch.where(end, torch.full_like(l_ep, t + 1), l_ep)
-            tripped = end & st.truncated & ~st.terminated & (t + 1 < horizon)  # truncated early: an emulated trip
+            tripped = end & st.info["tripped"]
             t_ep |= tripped
-            step_trips = getattr(st, "info", {}).get("trips")
+            step_trips = st.info.get("trips")
             if step_trips is not None:
                 c_ep = torch.where(tripped, step_trips.to(torch.int64), c_ep)
             done |= end
@@ -277,8 +277,8 @@ class _RenderEnv:
             self.env.__dict__.pop("reset", None)
         live = ~(self._succ | self._trunc)
         self._ret += torch.where(live, st.reward.float(), torch.zeros_like(self._ret))
-        self._succ |= live & st.terminated
-        self._trunc |= live & st.truncated & ~st.terminated
+        self._succ |= live & st.info["success"]
+        self._trunc |= live & (st.terminated | st.truncated) & ~st.info["success"]
         return policy_input(self.env, st.obs)
 
     def qpos(self, worlds: Sequence[int]) -> np.ndarray:

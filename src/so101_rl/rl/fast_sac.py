@@ -7,7 +7,8 @@
 - **Critics**: ``n_critics`` asymmetric Q-nets on ``concat(obs, priv, action)`` (privileged sim state is critic-only),
   ``Linear -> LayerNorm -> ReLU`` blocks, polyak target copies.
 - **Targets**: ``y = r + gamma^n (1 - terminated) (min Q'(s', a') - alpha log pi(a'|s'))``. ``truncated`` does NOT
-  zero the bootstrap: a step-limit or trip end is not a terminal state (``next_obs`` is the pre-reset observation).
+  zero the bootstrap: a step-limit end is not a terminal state (``next_obs`` is the pre-reset observation). A
+  policy-caused trip IS terminal: the env sets ``terminated`` and pays ``task.trip_penalty`` (plan §10 2026-10-08).
 - **alpha**: auto-tuned toward ``target_entropy``, ``log_alpha`` clamped to ``log_alpha_bounds``.
 
 :meth:`FastSAC.update` returns detached device tensors (no host sync); the caller reads them at log time.
@@ -155,7 +156,7 @@ class FastSAC:
     @torch.no_grad()
     def td_target(self, batch: Batch) -> torch.Tensor:
         """``r + gamma^n (1 - terminated) (min Q'(s', a') - alpha log pi(a'|s'))``; ``truncated`` is ignored on purpose
-        (a step-limit / trip end bootstraps from the pre-reset ``next_obs``)."""
+        (a step-limit end bootstraps from the pre-reset ``next_obs``; a terminal trip arrives as ``terminated``)."""
         a2, logp2 = self.actor.sample(batch.next_obs)
         q2 = self.critic_target(torch.cat([batch.next_obs, batch.next_priv, a2], dim=-1)).min(dim=0).values
         return batch.rew + batch.n_step_discount * (1.0 - batch.terminated) * (q2 - self.alpha * logp2)

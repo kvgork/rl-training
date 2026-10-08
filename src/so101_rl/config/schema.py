@@ -208,6 +208,10 @@ class TaskConfig:
     """The configurable part of an FS4 task (``tasks.<name>`` in so101.yaml); the rest is frozen in env/tasks.py."""
 
     reward: RewardSpec
+    # reward of a step that ends in a policy-caused trip (NAN, RANGE, BOX_PRESENT, STUCK); that step is terminal
+    # (plan §10 2026-10-08 "Trip penalty"). < 0; env.reward.validate_trip_penalty proves it is worse than any
+    # trip-free episode of the task
+    trip_penalty: float
     max_height_m: float | None = None  # die: centroid at most this far above the goal (plan §10 2026-10-06)
     settle_mm: float | None = None  # die: tracker displacement between the debounce steps (plan §10 2026-10-06)
 

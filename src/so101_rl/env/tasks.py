@@ -23,10 +23,19 @@
   steps (die 2, reach 1). The die task also needs the die **settled**: the tracker position moved at most
   ``settle_m`` (3 mm) between consecutive counted steps, else the count restarts at 1. A slide through the zone
   (0.05 m/s = 5 mm per 10 Hz step) or a nudge out of it never terminates.
-- **Episode end** (both envs): ``terminated`` = debounced success, where the predicate only counts on a step with a
-  good read and no trip (a trip or stale read resets the debounce count); ``truncated`` = step limit OR trip OR
-  stalled servo, independently of ``terminated`` (on the step-limit step both may be true; a learner zeroes the
-  bootstrap on ``terminated`` only).
+- **Episode end** (both envs): ``terminated`` = debounced success OR a **terminal trip** (:data:`TERMINAL_TRIPS`:
+  NAN, RANGE, BOX_PRESENT, STUCK; plan §10 2026-10-08 "Trip penalty"), where the success predicate only counts on a
+  step with a good read and no trip (a trip or stale read resets the debounce count); ``truncated`` = step limit OR
+  any trip OR stalled servo, independently of ``terminated`` (on a terminal-trip step or the step-limit step both
+  may be true; a learner zeroes the bootstrap on ``terminated`` only). ``terminated`` is therefore NOT success:
+  read ``info["success"]`` (batched) / ``info["is_success"]`` (real env); ``info["tripped"]`` flags a terminal trip.
+- **Trip penalty**: a terminal-trip step pays ``spec.trip_penalty`` (config ``tasks.<name>.trip_penalty``) INSTEAD
+  of the step reward, whatever the goal (:func:`step_reward_np` / :func:`step_reward_torch`; the trip bits come from
+  the stored transition's ``info["trips"]``, so HER relabelling never turns a trip into a success). The value is
+  proven worse than any trip-free continuation by :func:`~so101_rl.env.reward.validate_trip_penalty` (horizon x the
+  worst step reward at the largest possible distance, :attr:`TaskSpec.max_dist_m`). Other faults (THERMAL,
+  protection bits, STALE_CMD, a servo leaving RUN, a stalled read) are not the policy's doing: they truncate
+  without penalty, as before.
 - **Action mapping** (:func:`action_to_delta_np` / :func:`action_to_delta_torch`, the F7 rule, the only
   [-1, 1] -> ticks scaling): ``delta = float32(rint(float64(clip(float32(a), -1, 1)) * max_delta_ticks))``. ±inf
   clips to ±1, NaN passes through unchanged so the servo's sanitizer trips on it; rint is half-to-even in float64.
@@ -48,12 +57,24 @@ from so101_rl.config.loader import load_tasks_config
 from so101_rl.config.schema import RewardSpec, TasksConfig, WorkspaceBox
 
 from .obs import DIE_OBS, REACH_OBS, PolicyObsLayout
-from .reward import evaluate_np, evaluate_torch, terms_np, terms_torch, validate_reward_spec
+from .reward import (
+    evaluate_np,
+    evaluate_torch,
+    terms_np,
+    terms_torch,
+    validate_reward_spec,
+    validate_trip_penalty,
+)
 
 if TYPE_CHECKING:
     import torch
 
 DIE_HALF_EDGE_M: Final[float] = 0.008  # 16 mm die (sim/model.py DIE_EDGE_M / 2; test-enforced)
+# The policy-caused trips (D-TRIPS: the ones the batched sim emulates; STUCK since plan §10 2026-10-08): the step is
+# terminal and pays ``trip_penalty`` (plan §10 2026-10-08 "Trip penalty"). Same set in sim and on the arm.
+# = TripCause.NAN | RANGE | STUCK | BOX_PRESENT, spelled as bits because env/tasks.py never imports safety/ (D-DEPS);
+# tests/test_tasks.py pins it to safety.types.TripCause.
+TERMINAL_TRIPS: Final[int] = 1 | 2 | 128 | 32768
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -125,14 +146,24 @@ class TaskSpec:
     success_debounce_steps: int  # reach 1; die 2 (consecutive steps with the predicate true)
     settle_m: float | None  # die: max tracker displacement between consecutive counted steps (0.003); reach: None
     reward: RewardSpec  # config tasks.<name>.reward; validated on construction (env/reward.py)
+    trip_penalty: float  # config tasks.<name>.trip_penalty: reward of a terminal-trip step (validated on construction)
     goal_bounds: GoalBounds
     zone: ZoneSpec | None
     die_start: DieStartSpec | None
     start_pose: Literal["home", "random_in_box"]
     reset_settle_steps: int = 0  # die task: physics steps after placing the die (0 = place at rest)
 
+    @property
+    def max_dist_m(self) -> float:
+        """Upper bound of ``|achieved - desired|`` on a trip-free step: the diagonal of the workspace box widened by
+        the BOX_PRESENT tolerance on every face (the tip can be at most that far out without tripping; goals lie
+        inside the box). The die task assumes the tracked die stays in the same box (die task deferred, MVP)."""
+        b, tol = self.goal_bounds.box, self.goal_bounds.box.present_tolerance_m
+        return float(np.linalg.norm([hi - lo + 2.0 * tol for lo, hi in (b.x, b.y, b.z)]))
+
     def __post_init__(self) -> None:
         validate_reward_spec(self.reward)
+        validate_trip_penalty(self.reward, self.trip_penalty, episode_steps=self.episode_steps, max_dist_m=self.max_dist_m)
         if self.success_debounce_steps < 1:
             raise ValueError(f"success_debounce_steps must be >= 1, got {self.success_debounce_steps}")
         if self.settle_m is not None and (self.success_debounce_steps < 2 or not self.settle_m > 0):
@@ -157,6 +188,7 @@ def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
             success_debounce_steps=1,
             settle_m=None,
             reward=tc.reward,
+            trip_penalty=tc.trip_penalty,
             goal_bounds=GoalBounds(box=WorkspaceBox()),  # schema defaults == so101.yaml box (test-enforced)
             zone=None,
             die_start=None,
@@ -178,6 +210,7 @@ def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
             success_debounce_steps=2,
             settle_m=tc.settle_mm / 1000.0,
             reward=tc.reward,
+            trip_penalty=tc.trip_penalty,
             goal_bounds=GoalBounds(box=WorkspaceBox()),
             zone=zone,
             # NEEDS H9: placeholder start well
@@ -253,6 +286,25 @@ def visible_from_info(info: object, spec: TaskSpec) -> np.ndarray | None:
     if isinstance(info, dict):
         return np.asarray(bool(info["tracker_visible"]))
     return np.array([bool(i["tracker_visible"]) for i in info], dtype=bool)
+
+
+def tripped_from_info(info: object) -> np.ndarray:
+    """Terminal-trip flag of the stored transition(s), bool[...]: ``info["trips"] & TERMINAL_TRIPS != 0``.
+
+    ``info`` is one dict or a sequence/array of dicts (HER). A missing ``"trips"`` key is an error, never "no trip":
+    a relabelled trip must never be scored as an ordinary (possibly successful) step."""
+    if isinstance(info, Mapping):
+        return np.asarray((int(info["trips"]) & TERMINAL_TRIPS) != 0)
+    return np.array([(int(i["trips"]) & TERMINAL_TRIPS) != 0 for i in info], dtype=bool)
+
+
+def step_reward_np(
+    achieved: np.ndarray, desired: np.ndarray, spec: TaskSpec, *, visible: np.ndarray | None = None, info: object
+) -> np.ndarray:
+    """The reward of a stored transition (SB3 HER ``compute_reward``), float32[...]: ``spec.trip_penalty`` on a
+    terminal-trip step whatever the goal, else :func:`reward_np`. ``info`` is required (the trip bits)."""
+    r = reward_np(achieved, desired, spec, visible=visible, info=info)
+    return np.where(tripped_from_info(info), np.float32(spec.trip_penalty), r).astype(np.float32)
 
 
 def _need_positions(spec: TaskSpec, achieved: object, prev_achieved: object) -> None:
@@ -339,6 +391,22 @@ def reward_terms_torch(
     dist = (achieved.to(torch.float64) - desired.to(torch.float64)).norm(dim=-1)
     pred = success_torch(achieved, desired, spec, visible=visible)
     return terms_torch(spec.reward, dist=dist, success=pred, info=info)
+
+
+def step_reward_torch(
+    achieved: torch.Tensor,
+    desired: torch.Tensor,
+    spec: TaskSpec,
+    *,
+    trips: torch.Tensor,
+    visible: torch.Tensor | None = None,
+    info: Mapping[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Tensor twin of :func:`step_reward_np`: ``trips`` int64[...] (the step's trip bits) selects the penalty."""
+    import torch
+
+    r = reward_torch(achieved, desired, spec, visible=visible, info=info)
+    return torch.where((trips & TERMINAL_TRIPS) != 0, torch.full_like(r, spec.trip_penalty), r)
 
 
 def debounce_torch(

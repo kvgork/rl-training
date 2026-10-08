@@ -31,6 +31,11 @@ With ``time`` every non-terminal step is <= -w_time < 0, so the terminal state (
 to be and the fastest settled finish is optimal.
 :func:`validate_reward_spec` proves that for any configured combination; ``TaskSpec`` runs it on construction.
 
+Trip penalty (plan §10 2026-10-08): a step that trips NAN / RANGE / BOX_PRESENT / STUCK is terminal and pays the
+task's fixed ``trip_penalty`` instead of these terms (``env/tasks.py`` ``step_reward_*``). :func:`validate_trip_penalty`
+proves it is < 0 and at most ``episode_steps`` x :func:`worst_step_reward` (the undiscounted worst trip-free rest of
+an episode), so tripping never beats any trip-free behaviour, for any discount.
+
 ``info`` (numpy): a mapping, or a sequence of mappings (HER passes the stored transitions' infos); ``info``
 (torch): a mapping of tensors (the batched env). A term that needs an ``info`` key raises ``KeyError`` when it is
 missing: it never defaults. Terms with weight 0 are skipped (and need no ``info``).
@@ -60,6 +65,8 @@ __all__ = [
     "terms_np",
     "terms_torch",
     "validate_reward_spec",
+    "validate_trip_penalty",
+    "worst_step_reward",
 ]
 
 
@@ -217,6 +224,44 @@ def validate_reward_spec(spec: RewardSpec) -> RewardBounds:
     if max_step >= 0.0:  # unreachable with the rules above; kept as the stated invariant
         raise RewardSpecError(f"reward can be non-negative on a non-terminal step: max step reward {max_step}")
     return RewardBounds(max_step=max_step, max_unsuccessful_step=-(s.weight + tm.weight))
+
+
+def worst_step_reward(spec: RewardSpec, *, max_dist_m: float) -> float:
+    """The lowest step reward ``spec`` can pay when ``|achieved - desired| <= max_dist_m``: every term at its
+    infimum, ``distance`` at ``-max_dist_m / scale_m`` and ``action_l2`` at -1 (both envs clip ``applied_action`` to
+    [-1, 1])."""
+    total = 0.0
+    for t in spec.terms:
+        if t.name == "distance":
+            v = -max_dist_m / float(t.scale_m)  # type: ignore[arg-type]  # validate_reward_spec: scale_m > 0
+        elif t.name == "action_l2":
+            v = -1.0
+        else:
+            v = REWARD_TERMS[t.name].inf
+        if not math.isfinite(v):
+            raise RewardSpecError(f"reward term {t.name!r} has no finite worst value: add it to worst_step_reward")
+        total += t.weight * v
+    return total
+
+
+def validate_trip_penalty(spec: RewardSpec, trip_penalty: float, *, episode_steps: int, max_dist_m: float) -> float:
+    """Prove that a trip is worse than any trip-free outcome (plan §10 2026-10-08 "Trip penalty").
+
+    A trip step is terminal and pays ``trip_penalty`` instead of the step reward. The rest of a trip-free episode
+    has at most ``episode_steps`` steps, each paying at least :func:`worst_step_reward`, so
+    ``trip_penalty <= episode_steps * worst_step_reward`` makes tripping strictly no better than the worst possible
+    continuation, for any discount ``gamma <= 1`` (the bound is undiscounted, so it does not depend on the learner).
+    Also ``trip_penalty < 0`` (rewards stay non-positive). Returns the bound; raises :class:`RewardSpecError`.
+    """
+    if not (math.isfinite(trip_penalty) and trip_penalty < 0.0):
+        raise RewardSpecError(f"trip_penalty must be finite and < 0, got {trip_penalty}")
+    bound = episode_steps * worst_step_reward(spec, max_dist_m=max_dist_m)
+    if trip_penalty > bound:
+        raise RewardSpecError(
+            f"trip_penalty {trip_penalty} is not worse than the worst trip-free return {bound:.2f} "
+            f"({episode_steps} steps x worst step {bound / episode_steps:.3f} at |achieved - desired| <= {max_dist_m:.3f} m)"
+        )
+    return bound
 
 
 def _active(spec: RewardSpec) -> Sequence[RewardTermSpec]:

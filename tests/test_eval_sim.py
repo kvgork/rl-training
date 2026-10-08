@@ -110,9 +110,11 @@ def test_render_env_freezes_return_and_flags_after_end():
         def step(self, action):
             self.t += 1
             self.reset(torch.ones(2, dtype=torch.bool))  # the real env auto-resets inside step
+            success = torch.tensor([self.t >= 3, False])
             return types.SimpleNamespace(
                 reward=torch.full((2,), -1.0), obs=torch.zeros(2, 4),
-                terminated=torch.tensor([self.t >= 3, False]), truncated=torch.tensor([False, self.t >= 5]),
+                terminated=success, truncated=torch.tensor([False, self.t >= 5]),
+                info={"success": success, "tripped": torch.zeros(2, dtype=torch.bool)},
             )
 
     e = E()

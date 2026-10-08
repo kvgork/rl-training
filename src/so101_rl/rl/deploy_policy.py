@@ -20,7 +20,7 @@ scales the delta magnitude; the env then clips and maps it).
   of the tip. A sim twin with the same seed, config and calibration therefore gets the same pairs; which member of
   a pair is used can differ between sim and real only when the first draw is near that radius. The pairs are in
   ``summary.json`` (``goals``), the goal used and ``goal_redrawn`` per episode in ``episodes.jsonl``.
-* **Episode end:** at success (``terminated``; the env sends HOLD, no further RUN command until the next reset), at
+* **Episode end:** at success (``info["is_success"]``; the env sends HOLD, no further RUN command until the next reset), at
   the 100-step limit, or when the servo left RUN for a non-success reason (a trip, whatever its ``fault_bits``) or
   stalled (``truncated``). Between episodes ``ShmBackend.reset`` (HOLD, then a bounded ramp to the start pose).
 * **Real or sim:** decided from the servo that owns the shm segment: its single-instance lock file names the pid,
@@ -398,7 +398,7 @@ def _run_episode(env: Any, policy: Any, speed: float, *, goals: GoalList, index:
             tripped = True
         stalled = stalled or bool(info.get("servo_stalled", False))
         if terminated or truncated:
-            success = bool(terminated)
+            success = bool(info["is_success"])  # terminated also covers a terminal trip (plan §10 2026-10-08)
             break
     tripped = tripped or (not success and sm != int(SmState.RUN))
     err = float(np.linalg.norm(obs["achieved_goal"].astype(float) - obs["desired_goal"].astype(float)))

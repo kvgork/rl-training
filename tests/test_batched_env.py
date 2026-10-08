@@ -8,6 +8,7 @@ import torch
 
 from so101_rl.config import N_JOINTS, load_calibration, load_config
 from so101_rl.env.obs import DIE_OBS, PRIV_OBS, REACH_OBS
+from so101_rl.env.reward import RewardSpecError
 from so101_rl.env.tasks import DIE_TO_ZONE, REACH
 from so101_rl.safety.types import TripCause
 from so101_rl.sim.model import load_model
@@ -229,13 +230,21 @@ def test_die_task_success_requires_visible_in_zone(scene, mcfg, mcal):
 
 
 @gpu
-def test_trip_on_nan_action_truncates(scene, mcfg, mcal):
+def test_trip_on_nan_action_is_terminal_with_the_penalty(scene, mcfg, mcal):
+    """Plan §10 2026-10-08 "Trip penalty": the trip step is terminal (no bootstrap) AND truncated, never a success,
+    and pays ``trip_penalty``; the other worlds' step is unchanged (ordinary reward, not done)."""
     env = _env(scene, mcfg, mcal, n=4)
     env.reset(phase_randomise=False)
+    env.goal.fill_(5.0)  # unreachable: no success anywhere
     a = torch.zeros(4, 6, device=env.device)
     a[1, 3] = float("nan")
     st = env.step(a)
     assert st.truncated.tolist() == [False, True, False, False]
+    assert st.terminated.tolist() == [False, True, False, False]
+    assert st.info["tripped"].tolist() == [False, True, False, False]
+    assert not st.info["success"].any()
+    assert float(st.reward[1]) == REACH.trip_penalty
+    assert (st.reward[[0, 2, 3]] > REACH.trip_penalty).all() and (st.reward[[0, 2, 3]] < -1.0).all()
     assert int(st.info["trips"][1]) & int(TripCause.NAN)
     assert (st.info["applied_delta_ticks"][1] == 0).all()
     assert int(env.episode_step[1]) == 0  # auto-reset
@@ -320,9 +329,12 @@ def test_randomizer_must_match_the_env(scene, mcfg, mcal):
 
 
 def test_dataclass_replace_keeps_reward_validation():
-    """The parity tests run REACH with a longer episode via dataclasses.replace: still a valid TaskSpec."""
-    t = dataclasses.replace(REACH, episode_steps=10**6)
+    """The parity tests run REACH with a longer episode via dataclasses.replace: still a valid TaskSpec, provided the
+    trip penalty grows with the horizon (plan §10 2026-10-08 "Trip penalty": worse than any trip-free episode)."""
+    t = dataclasses.replace(REACH, episode_steps=10**6, trip_penalty=-1e7)
     assert t.episode_steps == 10**6 and t.reward == REACH.reward
+    with pytest.raises(RewardSpecError, match="trip_penalty"):
+        dataclasses.replace(REACH, episode_steps=10**6)
     assert N_JOINTS == 6
 
 
