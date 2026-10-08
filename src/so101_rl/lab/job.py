@@ -9,7 +9,12 @@ and owns the run's ``status.json`` / ``usage.json`` / ``heartbeat`` while it liv
 - **should_stop** is true on a pause/stop request in ``control.json``, SIGTERM, the run's own budget (progress
   time ≥ ``budget_min``), the wall deadline (budget + 60 min), or a thermal hold longer than 30 min.
 - **Thermal** (P8, GPU trainers only): the heartbeat blocks while the GPU is hot or NVML is silent (fail-closed);
-  the status shows ``paused`` with ``pause_reason`` ``thermal_hot`` / ``thermal_unknown`` meanwhile.
+  the status shows ``paused`` with ``pause_reason`` ``thermal_hot`` / ``thermal_unknown`` meanwhile. The trainer's
+  own thermal pause (``on_metrics`` with ``thermal_paused`` = 1, then no heartbeats until ``thermal_paused`` = 0) is
+  a known pause, not a stall: ``paused`` / ``thermal_trainer``, no progress time, and the wall deadline moves by
+  the pause.
+- **Trainer outcome** -> state: ``completed`` -> completed; ``stopped`` / ``budget_exhausted`` -> stopped (or paused
+  for an AI pause) with the job's stop reason; ``failed`` -> failed with the trainer's reason (untrusted text).
 """
 
 from __future__ import annotations
@@ -66,6 +71,7 @@ class Job:
         self._usage_written = self.t_start
         self.stop_reason: str | None = None
         self._signal_stop = False
+        self._trainer_hold_t: float | None = None  # clock() when the trainer reported thermal_paused = 1
         cfg = self.run.get("config", {})
         self.budget_s = float(cfg.get("budget_min", 0.0)) * 60.0 if self.run.get("kind") != "eval" else 0.0
         remaining = self.budget_s - self.prior_gpu_h * 3600.0
@@ -129,7 +135,29 @@ class Job:
         )
 
     def on_metrics(self, env_step: int, scalars: dict[str, float]) -> None:
+        paused = scalars.get("thermal_paused")
+        if paused is not None:
+            self._trainer_thermal(env_step, paused >= 0.5, bool(scalars.get("thermal_needs_human", 0.0)))
+            return  # a pause report is not progress (and must not block in the job's own thermal wait)
         self.heartbeat(env_step)
+
+    def _trainer_thermal(self, env_step: int, paused: bool, needs_human: bool) -> None:
+        """The trainer's own thermal pause (``train_sim_sac``): a known pause, not a stall."""
+        now = self.clock()
+        if paused:
+            if self._trainer_hold_t is None:
+                self._trainer_hold_t = now
+                runs.update_status(self.run_dir, state="paused", pause_reason="thermal_trainer", hold="trainer")
+                runs.append_event(self.run_dir, "thermal_hold", reason="trainer", env_step=int(env_step))
+            if needs_human:
+                runs.append_event(self.run_dir, "needs_human", reason="gpu_temperature_unobservable")
+            return
+        if self._trainer_hold_t is not None:
+            self.deadline += now - self._trainer_hold_t  # the pause does not eat the wall deadline
+            self._trainer_hold_t = None
+            self.last_hb_t = now  # the pause is not progress-holding time
+            runs.update_status(self.run_dir, state="running", pause_reason=None, hold=None)
+            runs.append_event(self.run_dir, "thermal_release", reason="trainer", env_step=int(env_step))
 
     def on_checkpoint(self, env_step: int, path: str) -> None:
         runs.update_status(self.run_dir, last_ckpt=str(path), env_step=int(env_step))
@@ -206,10 +234,11 @@ class Job:
             else:
                 fields.update(state="stopped", stop_reason=reason, pause_reason=None)
         else:
-            fields.update(state="failed", error=f"trainer returned {out.status!r}"[:200])
+            fields.update(state="failed", error=f"trainer returned {out.status!r}: {out.reason}"[:500])
         st = runs.update_status(self.run_dir, **fields)
         runs.append_event(self.run_dir, st["state"], env_step=int(out.env_steps),
-                          reason=st.get("stop_reason") or st.get("pause_reason"))
+                          reason=st.get("stop_reason") or st.get("pause_reason"),
+                          trainer_status=out.status, trainer_reason=out.reason[:300])
         return 1 if st["state"] == "failed" else 0
 
     def _evaluate(self) -> int:
@@ -233,11 +262,36 @@ class Job:
         return 0
 
 
+def check_import_root(repo: str | None) -> str | None:
+    """None when ``so101_rl`` is imported from ``<repo>/src`` (the launcher's ``SO101_LAB_REPO``), else the error.
+
+    The pixi editable install is shared by every checkout; the launcher pins ``PYTHONPATH=<repo>/src``, and this
+    check makes a job that would still run another checkout's code fail loudly instead."""
+    import so101_rl
+
+    pkg = Path(so101_rl.__file__).resolve().parent
+    if not repo:
+        return f"SO101_LAB_REPO is not set (jobs are started by so101_rl.lab.launcher); so101_rl is from {pkg}"
+    src = (Path(repo) / "src").resolve()
+    if not pkg.is_relative_to(src):
+        return f"so101_rl is imported from {pkg}, not from the launching checkout's {src}"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser(prog="so101_rl.lab.job", description=__doc__.splitlines()[0])
     p.add_argument("run_dir", type=Path)
     a = p.parse_args(argv)
+    err = check_import_root(os.environ.get("SO101_LAB_REPO"))
+    if err is not None:
+        log.error("refusing to run: %s", err)
+        try:
+            runs.update_status(a.run_dir.resolve(), state="failed", active=False, error=f"import pinning: {err}"[:500])
+            runs.append_event(a.run_dir.resolve(), "failed", error="import_pinning")
+        except Exception:  # noqa: BLE001 - the refusal itself must not be masked
+            log.error("could not record the refusal: %s", traceback.format_exc())
+        return 3
     return Job(a.run_dir.resolve()).run_segment()
 
 

@@ -6,9 +6,13 @@
 - ``subprocess``: the fallback when ``systemd --user`` is unavailable (and in tests): a detached child
   (``start_new_session``, stdin from /dev/null, stdio to ``job.log``, a minimal environment).
 
+Import pinning: every job gets ``PYTHONPATH=<repo>/src`` and ``SO101_LAB_REPO=<repo>`` (``<repo>`` = the checkout
+this launcher was imported from), so it runs THIS checkout's code wherever the shared pixi editable install points;
+the job refuses to start when ``so101_rl`` still comes from elsewhere (``so101_rl.lab.job.check_import_root``).
+
 Liveness is re-checked by unit name (``systemctl --user show``) or by pid + process start time (pid reuse safe).
 Environment overrides: ``SO101_LAB_LAUNCHER`` = ``auto|systemd|subprocess``; ``SO101_LAB_PYTHON`` = a python
-executable used instead of ``pixi run ... python`` (tests; its ``PYTHONPATH`` is passed on).
+executable used instead of ``pixi run ... python`` (tests).
 """
 
 from __future__ import annotations
@@ -114,11 +118,10 @@ class Launcher:
         self.python: list[str] | None = list(python) if python else ([env_py] if env_py else None)
 
     def env(self, root: Path, unit: str | None) -> dict[str, str]:
-        e = {"PYTHONNOUSERSITE": "1", "SO101_LAB_RUNS": str(root)}
+        e = {"PYTHONNOUSERSITE": "1", "SO101_LAB_RUNS": str(root), "PYTHONPATH": str(REPO_ROOT / "src"),
+             "SO101_LAB_REPO": str(REPO_ROOT)}
         if unit:
             e["SO101_LAB_UNIT"] = unit
-        if self.python and os.environ.get("PYTHONPATH"):
-            e["PYTHONPATH"] = os.environ["PYTHONPATH"]
         return e
 
     def launch(self, run_dir: Path, argv: Sequence[str], *, root: Path) -> LaunchInfo:

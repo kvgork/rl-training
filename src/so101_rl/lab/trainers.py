@@ -52,6 +52,7 @@ class TrainOutcome:
     env_steps: int
     last_ckpt: str | None
     metrics_csv: str | None
+    reason: str = ""  # the trainer's own words for why it ended (``TrainResult.reason``); untrusted text
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,8 @@ class FastSacSimTrainer:
         "dr_max_stage": Param(int, 4, 0, 4),
         "eval_every_steps": Param(int, 200_000, 1_000, 100_000_000),
         "eval_episodes": Param(int, 1000, 1, 10_000),
+        "log_every_steps": Param(int, 50_000, 1_000, 100_000_000),
+        "max_env_steps": Param(int, None, 1, 10_000_000_000),  # None: the time budget ends the run
     }
 
     def available(self) -> bool:
@@ -257,11 +260,19 @@ class FastSacSimTrainer:
     def train(self, cfg: dict[str, Any], task: str, out_dir: Path, hooks: Hooks, resume: str | None) -> TrainOutcome:
         from so101_rl.rl import train_sim_sac as tss  # lazy: torch + warp live behind this import
 
-        sim_cfg = tss.load_sim_sac_config({"task": task, **cfg})
-        th = tss.TrainHooks(on_metrics=hooks.on_metrics, on_checkpoint=hooks.on_checkpoint,
-                            should_stop=hooks.should_stop, heartbeat=hooks.heartbeat)
+        try:
+            sim_cfg = tss.load_sim_sac_config({"task": task, **cfg})
+        except (TypeError, ValueError) as e:  # validate() already checked the lab's keys; this is a contract drift
+            raise LabError("CONFIG_INVALID", f"train_sim_sac refused the config: {e}"[:300]) from None
+        th = tss.TrainHooks(
+            on_metrics=lambda step, scalars: hooks.on_metrics(int(step), dict(scalars)),
+            on_checkpoint=lambda step, path: hooks.on_checkpoint(int(step), str(path)),
+            should_stop=hooks.should_stop,
+            heartbeat=lambda step: hooks.heartbeat(int(step)),
+        )
         r = tss.run_training(sim_cfg, out_dir, hooks=th, resume=Path(resume) if resume else None)
-        return TrainOutcome(str(r.status), int(r.env_steps), _s(r.last_ckpt), _s(r.metrics_csv))
+        return TrainOutcome(str(r.status), int(r.env_steps), _s(r.last_ckpt), _s(r.metrics_csv),
+                            str(getattr(r, "reason", "")))
 
     def evaluate(
         self, ckpt: str, task: str, *, episodes: int, dr_stage: int | None, out_dir: Path, render: int
