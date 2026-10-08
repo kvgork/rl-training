@@ -46,6 +46,10 @@ MAX_PLANE_HEIGHT_MM = 5.0
 MAX_PLANE_TILT_DEG = 2.0
 MAX_TIP_PX = 8.0
 ABOVE_TABLE_M = 0.008
+MIN_INLIERS = 1000  # scene arm points within GATE_TRIM_M of the visible model: an RMS over fewer points proves little
+MIN_VISIBLE_SAMPLES = 500  # visible model surface samples per observation (a sliver of overlap cannot pin 6 DOF)
+MIN_ICP_ITERS = 3  # 6-DOF ICP Gauss-Newton steps taken (or converged: step < ICP_CONVERGED after >= 1 step)
+ICP_CONVERGED = 1e-6
 
 
 @dataclass
@@ -71,6 +75,12 @@ class ArmShapeResult:
     uncertainty_rot_deg: float
     seeds: list[dict] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    visible_samples: list[int] = field(default_factory=list)  # visible model samples per observation at the final pose
+    icp6_iterations: int = 0
+    icp6_converged: bool = False
+    min_inliers: int = MIN_INLIERS
+    min_visible_samples: int = MIN_VISIBLE_SAMPLES
+    min_icp_iters: int = MIN_ICP_ITERS
 
     @property
     def passed(self) -> bool:
@@ -85,6 +95,9 @@ class ArmShapeResult:
             "plane_height_err_mm": self.plane_height_err_mm,
             "plane_tilt_err_deg": self.plane_tilt_err_deg,
             "tip_px_err": self.tip_px_err,
+            "visible_samples": self.visible_samples,
+            "icp6_iterations": self.icp6_iterations,
+            "icp6_converged": self.icp6_converged,
             "uncertainty": {"trans_mm": self.uncertainty_trans_mm, "rot_deg": self.uncertainty_rot_deg},
             "gate": {
                 "rms_mm<=": MAX_RMS_MM,
@@ -92,6 +105,9 @@ class ArmShapeResult:
                 "plane_height_mm<=": MAX_PLANE_HEIGHT_MM,
                 "plane_tilt_deg<=": MAX_PLANE_TILT_DEG,
                 "tip_px<=": MAX_TIP_PX,
+                "n_inliers>=": self.min_inliers,
+                "visible_samples_per_obs>=": self.min_visible_samples,
+                "icp6_iterations>=": self.min_icp_iters,
             },
             "passed": self.passed,
             "failures": self.failures,
@@ -156,6 +172,7 @@ class ArmShapeRegistration:
             raise ValueError("need at least one observation")
         self.obs, self.plane, self.intr, self.table_z = obs, plane, intr, float(table_z_m)
         self.rng = np.random.default_rng(seed)
+        self.icp6_iterations, self.icp6_converged = 0, False
         # levelled scene points (plane frame with x = y = yaw = 0): above the table only
         self.T0 = plane_constrained_pose(plane.normal_up, plane.height_m, self.table_z, 0.0, 0.0, 0.0)
         self.scene: list[np.ndarray] = []
@@ -267,16 +284,25 @@ class ArmShapeRegistration:
         return x, y, yaw
 
     def icp_6dof(self, T: np.ndarray, *, iters: int = 30, trims: tuple[float, float] = (0.015, 0.008)) -> np.ndarray:
+        """Point-to-plane ICP in 6 DOF. ``self.icp6_iterations`` / ``icp6_converged`` record what ran: 0 iterations
+        means the correspondence set was empty at the start (the pose returned is the input, unrefined)."""
         T = T.copy()
+        self.icp6_iterations, self.icp6_converged = 0, False
         for it in range(iters):
             trim = trims[0] if it < iters // 2 else trims[1]
             s, m, n = self._gather(T, trim)
             if len(s) < 30:
                 break
             T = self._step6(T, s, m, n) @ T
-            if self._last_step < 1e-6:
+            self.icp6_iterations += 1
+            if self._last_step < ICP_CONVERGED:
+                self.icp6_converged = True
                 break
         return T
+
+    def visible_counts(self, T: np.ndarray) -> list[int]:
+        """Visible model surface samples per observation under ``T``."""
+        return [int(visible_model(T, o.model_pts, o.model_nrm, self.intr).sum()) for o in self.obs]
 
     def _step6(self, T: np.ndarray, s: np.ndarray, m: np.ndarray, n: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
         """One Gauss-Newton point-to-plane step: returns dT (applied on the left, base frame)."""
@@ -350,7 +376,15 @@ class ArmShapeRegistration:
         return worst
 
     # ---------------------------------------------------------------- driver
-    def run(self, *, bootstrap: int = 20, keep_seeds: int = 6) -> ArmShapeResult:
+    def run(
+        self,
+        *,
+        bootstrap: int = 20,
+        keep_seeds: int = 6,
+        min_inliers: int = MIN_INLIERS,
+        min_visible_samples: int = MIN_VISIBLE_SAMPLES,
+        min_icp_iters: int = MIN_ICP_ITERS,
+    ) -> ArmShapeResult:
         seeds = self.coarse(keep=keep_seeds)
         if not seeds:
             raise ValueError("no seed: no scene points above the table near any arm hypothesis")
@@ -371,7 +405,18 @@ class ArmShapeRegistration:
         dt = math.degrees(math.acos(float(np.clip(up6 @ self.plane.normal_up, -1, 1))))
         tip = self.tip_error_px(T)
         ut, ur = self.bootstrap(T, n=bootstrap) if bootstrap else (math.nan, math.nan)
+        vis_counts = self.visible_counts(T)
+        iters6, conv6 = self.icp6_iterations, self.icp6_converged
         fails = []
+        if not nin >= min_inliers:
+            fails.append(f"only {nin} scene points match the arm model (< {min_inliers}): too little overlap to trust the RMS")
+        low = [i for i, c in enumerate(vis_counts) if c < min_visible_samples]
+        if low:
+            fails.append(f"visible model samples {vis_counts} (observations {low} < {min_visible_samples}): arm out of view / occluded")
+        if not (iters6 >= min_icp_iters or (conv6 and iters6 >= 1)):
+            # without the 6-DOF refinement T is still the plane-constrained pose, which satisfies the plane check by
+            # construction: the plane-vs-6DOF comparison below would pass trivially
+            fails.append(f"6-DOF ICP ran {iters6} iteration(s) (< {min_icp_iters}, not converged): the plane check is vacuous")
         if not rms <= MAX_RMS_MM:
             fails.append(f"ICP RMS {rms:.2f} mm > {MAX_RMS_MM} mm")
         if not cov >= MIN_COVERAGE:
@@ -385,4 +430,7 @@ class ArmShapeRegistration:
         if not tip <= MAX_TIP_PX:
             fails.append(f"FK tip reprojects {tip:.1f} px from the arm > {MAX_TIP_PX} px")
         seeds_json = [{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in r.items()} for r in refined]
-        return ArmShapeResult(T, rms, cov, nin, dh, dt, tip, ut, ur, seeds_json, fails)
+        return ArmShapeResult(
+            T, rms, cov, nin, dh, dt, tip, ut, ur, seeds_json, fails, vis_counts, iters6, conv6,
+            min_inliers, min_visible_samples, min_icp_iters,
+        )  # fmt: skip

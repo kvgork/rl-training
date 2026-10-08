@@ -620,21 +620,26 @@ class SimDieTracker:
         cov = self.covered_fraction(die, jaw_centers, jaw_half, jaw_rot)
         return self._tip_in_front(die, tip) | (cov > self.noise.occlusion_fraction)
 
-    def _in_image(self, p: torch.Tensor) -> torch.Tensor:
+    def _in_image(self, p: torch.Tensor, margin_px: torch.Tensor | float = 0.0) -> torch.Tensor:
+        """Projected point inside the image(s). ``margin_px`` (scalar or ``[N, ...]``) shrinks the COLOUR image on all
+        four sides: the real tracker rejects a blob that touches the image border (``HsvDepthDieTracker.detect``), so
+        a die is visible only while its centre is at least the projected half-blob width from the border."""
         ok = torch.ones(p.shape[:-1], dtype=torch.bool, device=self.device)
-        for pose in self._poses():
+        for k, pose in enumerate(self._poses()):
             uv, z = self._project(p, pose)
             cm = pose[2]
-            ok &= (z > 0) & (uv[..., 0] >= 0) & (uv[..., 0] <= cm.width - 1) & (uv[..., 1] >= 0)
-            ok &= uv[..., 1] <= cm.height - 1
+            m = margin_px if k == 0 else 0.0
+            ok &= (z > 0) & (uv[..., 0] >= m) & (uv[..., 0] <= cm.width - 1 - m) & (uv[..., 1] >= m)
+            ok &= uv[..., 1] <= cm.height - 1 - m
         return ok
 
     def in_view(self, die_xyz_true: torch.Tensor) -> torch.Tensor:
-        """bool[N]: projected centre inside the colour (and depth) image, in front of the camera, die on the table
-        region."""
+        """bool[N]: projected centre inside the colour (and depth) image by at least the projected half-blob width
+        (the real tracker drops a blob cut by the border), in front of the camera, die on the table region."""
         die = die_xyz_true.float()
         table_ok = (die[:, :2].abs() <= TABLE_HALF_M).all(dim=-1) & (die[:, 2] >= TABLE_Z_M)
-        return self._in_image(die) & table_ok
+        half_blob = 0.5 * self.die_area_px(die).clamp_min(0.0).sqrt()
+        return self._in_image(die, half_blob) & table_ok
 
     def die_area_px(self, die_xyz_true: torch.Tensor) -> torch.Tensor:
         """float[N]: the die's blob area in the colour image, face-up cube axis-aligned with the base frame:

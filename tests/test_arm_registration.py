@@ -84,6 +84,63 @@ def test_wrong_joint_angles_fail_the_gate(scene):
     assert not res.passed
 
 
+@pytest.mark.parametrize("joint,delta", [(1, 70), (2, -70)], ids=["shoulder+70", "elbow-70"])
+def test_small_joint_error_fails_the_gate(scene, joint, delta):
+    """Shown to fail: a 70-tick (~6 deg) error on one big joint, everything else perfect, must not pass. (A wrist-flex
+    error of the same size is NOT reliably caught by this gate; that is a known blind spot, see ARCHITECTURE.)"""
+    c0, _, model, rgb, frames = scene
+    bad = TICKS.copy()
+    bad[joint] += delta
+    res, _, _ = calibrate(model, CAL, c0, [Capture(rgb, frames, bad)], TABLE_Z_M, bootstrap=0)
+    assert not res.passed, res.to_json()["gate"]
+    assert res.n_inliers >= 1000 and min(res.visible_samples) >= 500  # it failed on the fit, not on a vacuous input
+
+
+def test_report_carries_the_new_gates_on_a_passing_run(scene):
+    c0, _, model, rgb, frames = scene
+    res, _, _ = calibrate(model, CAL, c0, [Capture(rgb, frames, TICKS)], TABLE_Z_M, bootstrap=0)
+    rep = res.to_json()
+    assert res.passed, res.failures
+    assert rep["gate"]["n_inliers>="] == 1000 and rep["gate"]["visible_samples_per_obs>="] == 500
+    assert rep["gate"]["icp6_iterations>="] == 3
+    assert rep["n_inliers"] >= 1000 and all(c >= 500 for c in rep["visible_samples"]) and rep["icp6_iterations"] >= 3
+
+
+def test_tiny_overlap_fails_the_gate(scene):
+    """Shown to fail: only a 12x12 px patch of the arm is left in the depth (all other arm pixels are holes): a handful
+    of points cannot certify a calibration, whatever the RMS over them says."""
+    c0, T_true, model, rgb, frames = scene
+    pts, pix = depth_to_points(np.median(frames, axis=0), c0.color)
+    p_base = pts @ T_true[:3, :3].T + T_true[:3, 3]
+    arm = p_base[:, 2] > TABLE_Z_M + 0.012
+    v, u = pix[arm].T
+    cu, cv = int(np.median(u)), int(np.median(v))
+    mask = np.zeros(frames.shape[1:], bool)
+    mask[v, u] = True
+    keep = np.zeros_like(mask)
+    keep[cv - 6 : cv + 6, cu - 6 : cu + 6] = True
+    sparse = frames.copy()
+    sparse[:, mask & ~keep] = 0.0
+    res, _, _ = calibrate(model, CAL, c0, [Capture(rgb, sparse, TICKS)], TABLE_Z_M, bootstrap=0)
+    assert not res.passed
+    assert res.n_inliers < 1000
+    assert any("too little overlap" in f for f in res.failures), res.failures
+
+
+def test_plane_check_is_not_vacuous_when_icp_did_not_run(scene):
+    """With no 6-DOF iteration the pose is still the plane-constrained one and the plane check agrees with itself by
+    construction: the gate must report that instead of passing."""
+    from so101_rl.perception.arm_registration import ArmShapeRegistration
+    from so101_rl.perception.camera_calibrate import observations
+
+    c0, _, model, rgb, frames = scene
+    obs, plane = observations(model, CAL, c0, [Capture(rgb, frames, TICKS)])
+    reg = ArmShapeRegistration(obs, plane, c0.color, TABLE_Z_M, seed=0)
+    reg.icp_6dof = lambda T, **kw: (setattr(reg, "icp6_iterations", 0), setattr(reg, "icp6_converged", False), T)[2]
+    res = reg.run(bootstrap=0)
+    assert not res.passed and any("6-DOF ICP ran 0" in f for f in res.failures), res.failures
+
+
 def _fake_main(tmp_path, scene, ticks, probe_exc=None):
     c0, _, _, rgb, frames = scene
     cam_yaml = tmp_path / "camera.yaml"

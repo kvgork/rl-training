@@ -210,10 +210,14 @@ def _configs(model, n=20):
     return out[:n]
 
 
-def test_tracker_parity_on_the_calibrated_pose():
+@pytest.mark.parametrize("yaw_deg", [0.0, 45.0], ids=["yaw0", "yaw45"])
+def test_tracker_parity_on_the_calibrated_pose(yaw_deg):
     """The real HsvDepthDieTracker on the sim RGB-D render (colour + depth aligned to colour, from d435_color) and
     SimDieTracker (colour + depth sensor, no noise): visibility agrees in >= 18 of 20 configurations, the centroid
-    within 3 mm wherever both see the die."""
+    within 3 mm wherever both see the die. The die is yawed 0 and 45 deg about the table normal: the blob (hence the
+    border cut) is widest at 45 deg, and the sim visibility must not depend on the yaw."""
+    half = math.radians(yaw_deg) / 2
+    die_quat = (math.cos(half), 0, 0, math.sin(half))
     model, data = load_model()
     r = _renderer(model, 640, 480)
     real = HsvDepthDieTracker.from_camera_calib(CALIB)
@@ -225,7 +229,7 @@ def test_tracker_parity_on_the_calibrated_pose():
     try:
         for q, xy in _configs(model):
             data.qpos[:6] = q
-            data.qpos[die_q : die_q + 7] = (xy[0], xy[1], DIE_Z, 1, 0, 0, 0)
+            data.qpos[die_q : die_q + 7] = (xy[0], xy[1], DIE_Z, *die_quat)
             mujoco.mj_forward(model, data)
             r.update_scene(data, camera=COLOR_CAM)
             rgb = r.render().copy()

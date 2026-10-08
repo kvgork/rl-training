@@ -154,3 +154,77 @@ def test_checked_ticks_refuses_wrong_homing_and_torque_on_for_hand_moves(tmp_pat
     assert checked_ticks(on).tolist() == TICKS  # one pose: the arm is not moved
     with pytest.raises(ProbeRefused, match="torque must be off"):
         checked_ticks(on, require_torque_off=True)
+
+
+# ---- byte-level spy, serial errors, --reads 0, wall-clock timeout (verification-review NITs) ---------------------
+def _spy_on_port_handler(monkeypatch):
+    """Patch ``scservo_sdk.PortHandler`` so nothing touches a device: open/close succeed, every transmitted packet is
+    recorded, nothing ever answers (every read times out)."""
+    import scservo_sdk as scs
+
+    sent: list[bytes] = []
+    monkeypatch.setattr(scs.PortHandler, "openPort", lambda self: True)
+    monkeypatch.setattr(scs.PortHandler, "closePort", lambda self: None)
+    monkeypatch.setattr(scs.PortHandler, "setBaudRate", lambda self, b: True)
+    monkeypatch.setattr(scs.PortHandler, "clearPort", lambda self: None)
+    monkeypatch.setattr(scs.PortHandler, "readPort", lambda self, n: [])
+    monkeypatch.setattr(scs.PortHandler, "writePort", lambda self, packet: (sent.append(bytes(packet)), len(packet))[1])
+    return sent
+
+
+def test_every_transmitted_instruction_byte_is_ping_read_or_sync_read(monkeypatch):
+    sent = _spy_on_port_handler(monkeypatch)
+    ids = tuple(CAL[n].id for n in JOINT_NAMES)
+    link = ScsReadOnlyLink("/dev/null-not-opened", ids)
+    link.open()
+    link.ping_all()
+    link.read_block(__import__("so101_rl.servo.bus", fromlist=["BlockRead"]).BlockRead())
+    link.read_u16(31)
+    link.read_u8(40)
+    link.close()
+    assert sent, "the spy saw no packet: it is not wired to the transmit path"
+    for pkt in sent:
+        assert pkt[:2] == b"\xff\xff"
+        assert pkt[4] in {0x01, 0x02, 0x82}, f"instruction byte {pkt[4]:#x} in {pkt.hex()}"
+    assert {p[4] for p in sent} >= {0x01, 0x82}  # PING and SYNC_READ both exercised
+
+
+def test_the_byte_spy_catches_a_write_instruction(monkeypatch):
+    """Shown-to-fail twin: a WRITE (0x03) / SYNC_WRITE (0x83) packet through the same port handler is caught."""
+    import scservo_sdk as scs
+
+    sent = _spy_on_port_handler(monkeypatch)
+    ph, port = scs.PacketHandler(0), scs.PortHandler("/dev/null-not-opened")
+    ph.write1ByteTxOnly(port, 1, 40, 0)  # torque off: a register write
+    assert sent and sent[0][4] not in {0x01, 0x02, 0x82}
+
+
+def test_serial_exception_on_open_is_a_probe_refusal(monkeypatch):
+    import scservo_sdk as scs
+    import serial
+
+    def boom(self):
+        raise serial.SerialException("could not open port /dev/ttyACM0: [Errno 13] Permission denied")
+
+    monkeypatch.setattr(scs.PortHandler, "openPort", boom)
+    with pytest.raises(ProbeRefused, match="Permission denied"):
+        ScsReadOnlyLink("/dev/ttyACM0", (1, 2, 3, 4, 5, 6)).open()
+
+
+def test_reads_zero_is_rejected_cleanly(tmp_path, capsys):
+    with pytest.raises(SystemExit) as e:
+        probe_mod.main(["--reads", "0", "--port", _port(tmp_path), "--calibration", str(Path(__file__).parent / "data" / "so101_follower.calib.json")])
+    assert e.value.code == 2
+    assert "--reads must be >= 1" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="n_reads"):
+        probe_joints(CAL, port=_port(tmp_path), n_reads=0, link_factory=lambda p, i: BusReadAdapter(_fake(), i))
+
+
+def test_probe_has_a_wall_clock_timeout(tmp_path, monkeypatch):
+    clock = iter(range(0, 1000, 5))  # every monotonic() call advances 5 s
+    monkeypatch.setattr(probe_mod.time, "monotonic", lambda: float(next(clock)))
+    bus = _fake()
+    with pytest.raises(ProbeRefused, match="timed out"):
+        probe_joints(CAL, port=_port(tmp_path), timeout_s=7.0, link_factory=lambda p, i: BusReadAdapter(bus, i))
+    with pytest.raises(ValueError, match="timeout_s"):
+        probe_joints(CAL, port=_port(tmp_path), timeout_s=0, link_factory=lambda p, i: BusReadAdapter(bus, i))

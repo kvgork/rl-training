@@ -41,6 +41,7 @@ Distortion: every consumer uses the pinhole model, so the loader refuses non-zer
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import math
 import os
 import tempfile
@@ -142,6 +143,7 @@ class CameraCalib:
     pose: CameraPose | None
     table_plane: TablePlane | None
     version: int = CAMERA_YAML_VERSION
+    source_sha256: str = ""  # sha256 of the camera.yaml bytes this was loaded from ("" = built in memory)
 
     # ---------------------------------------------------------------- poses
     def require_pose(self, *, calibrated: bool = False) -> CameraPose:
@@ -177,6 +179,15 @@ class CameraCalib:
         if pose.calibrated:
             t, r = max(t, pose.trans_mm), max(r, pose.rot_deg)
         return t / 1000.0, math.radians(r)
+
+    def pose_meta(self) -> dict[str, Any]:
+        """Identifies the camera calibration a run used (env metadata / run info): pose method, date, file hash."""
+        pose = self.pose
+        return {
+            "camera_pose_method": None if pose is None else pose.method,
+            "camera_pose_date": None if pose is None else pose.date,
+            "camera_yaml_sha256": self.source_sha256 or None,
+        }
 
     def with_pose(self, pose: CameraPose, table_plane: TablePlane | None = None) -> CameraCalib:
         return replace(self, pose=pose, table_plane=table_plane if table_plane is not None else self.table_plane)
@@ -327,7 +338,10 @@ def load_camera_calib(path: Path | str | None = None, *, require_calibrated: boo
         raise FileNotFoundError(
             f"{p} missing: run `pixi run camera-intrinsics --serial <serial> --out {p}` (plan C.1)"
         )
-    calib = parse_camera_calib(yaml.safe_load(p.read_text()), str(p))
+    raw = p.read_bytes()
+    calib = replace(
+        parse_camera_calib(yaml.safe_load(raw.decode()), str(p)), source_sha256=hashlib.sha256(raw).hexdigest()
+    )
     if require_calibrated:
         calib.require_pose(calibrated=True)
     return calib

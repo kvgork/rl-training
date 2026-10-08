@@ -6,17 +6,19 @@ moved, and nothing is ever written to a servo:
 
 * **No write path, structurally.** The probe talks to the bus through :class:`ReadOnlyLink`, whose whole surface
   is ``open`` / ``close`` / ``ping_all`` / ``read_block`` / ``read_u16`` / ``read_u8``. The real link
-  (:class:`ScsReadOnlyLink`) is built directly on ``scservo_sdk``'s ``PortHandler`` + PING + ``GroupSyncRead``
-  (instruction SYNC_READ); it never imports lerobot (whose ``disconnect()`` disables torque by default, a register
+  (:class:`ScsReadOnlyLink`) is built directly on ``scservo_sdk``'s ``PortHandler`` + PING (0x01) + READ (0x02) /
+  ``GroupSyncRead`` (SYNC_READ, 0x82): those three instructions and no others; it never imports lerobot (whose ``disconnect()`` disables torque by default, a register
   write) and never calls a write instruction. ``tests/test_probe.py`` checks the source for write calls and runs
-  the probe on a ``FakeBus`` that records every goal and torque write: zero.
+  the probe on a ``FakeBus`` that records every goal and torque write: zero, and spies on
+  ``PortHandler.writePort`` to assert every transmitted instruction byte is in {1, 2, 0x82}.
 * **Never next to the servo process.** The probe takes the same ``SerialPortLock`` the servo process holds for its
   bus port (``servo.shm.serial_lock_path``, keyed on the resolved device path). If the servo holds it, the probe
   refuses (:class:`ProbeRefused`); while the probe holds it, a servo start fails with exit 4.
 * **Torque is reported, never changed.** ``Torque_Enable`` (address 40) is read back and returned.
 
 Usage: ``python -m so101_rl.servo.probe [--port /dev/ttyACM0] [--calibration PATH] [--reads 5]`` (pixi task
-``joint-probe``) prints the ticks, the joint angles and the homing-offset check as JSON.
+``joint-probe``) prints the ticks, the joint angles and the homing-offset check as JSON. ``--reads`` must be >= 1;
+``--timeout`` bounds the whole probe in wall-clock seconds.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +44,7 @@ ADDR_TORQUE_ENABLE = 40  # 1 byte
 _SIGN_BIT_POS = 15
 _SIGN_BIT_HOMING = 11
 _OFF = {"pos": 0, "vel": 2, "load": 4, "volt": 6, "temp": 7, "status": 9, "moving": 10}
+DEFAULT_TIMEOUT_S = 10.0  # wall-clock bound on the whole probe (ping + reads); a wedged bus must not hang the operator
 MAX_SPREAD_TICKS = 3  # present-position spread over the reads above which the arm is "moving"
 
 
@@ -83,11 +87,21 @@ class ScsReadOnlyLink:
 
     def open(self) -> None:
         import scservo_sdk as scs
+        import serial
 
         port = scs.PortHandler(self._port_name)
-        if not port.openPort():
+        try:
+            opened = port.openPort()
+        except (serial.SerialException, OSError) as e:  # no such device, permission denied, port busy
+            raise ProbeRefused(f"cannot open {self._port_name}: {e}") from e
+        if not opened:
             raise ProbeRefused(f"cannot open {self._port_name}")
-        if not port.setBaudRate(self._baud):
+        try:
+            baud_ok = port.setBaudRate(self._baud)
+        except (serial.SerialException, OSError) as e:
+            port.closePort()
+            raise ProbeRefused(f"cannot set {self._baud} baud on {self._port_name}: {e}") from e
+        if not baud_ok:
             port.closePort()
             raise ProbeRefused(f"cannot set {self._baud} baud on {self._port_name}")
         self._scs, self._port, self._ph = scs, port, scs.PacketHandler(0)
@@ -217,11 +231,20 @@ def probe_joints(
     n_reads: int = 5,
     link_factory: Callable[[str, tuple[int, ...]], ReadOnlyLink] | None = None,
     require_still: bool = True,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> ProbeResult:
     """Ping and block-read the six motors (see the module docstring). Raises :class:`ProbeRefused` when the servo
     process owns ``port``, a motor does not answer, a read fails, or (``require_still``) the arm moves."""
     if n_reads < 1:
         raise ValueError("n_reads must be >= 1")
+    if not timeout_s > 0:
+        raise ValueError("timeout_s must be > 0")
+    deadline = time.monotonic() + float(timeout_s)
+
+    def _check_deadline(what: str) -> None:
+        if time.monotonic() > deadline:
+            raise ProbeRefused(f"probe timed out after {timeout_s:g} s ({what})")
+
     ids = tuple(calibration[n].id for n in JOINT_NAMES)
     try:
         lock = SerialPortLock(port)
@@ -232,6 +255,7 @@ def probe_joints(
         link.open()
         try:
             pings = link.ping_all()
+            _check_deadline("ping")
             silent = [i for i in ids if not pings.get(i, False)]
             if silent:
                 raise ProbeRefused(f"motors {silent} do not answer a ping (servo power off?)")
@@ -241,8 +265,10 @@ def probe_joints(
                 if not link.read_block(b):
                     raise ProbeRefused("block read failed")
                 blocks.append(b)
+                _check_deadline(f"block read {len(blocks)}/{n_reads}")
             raw_h = link.read_u16(ADDR_HOMING_OFFSET)
             raw_t = link.read_u8(ADDR_TORQUE_ENABLE)
+            _check_deadline("register reads")
         finally:
             link.close()
     finally:
@@ -290,12 +316,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m so101_rl.servo.probe", description=__doc__.split("\n")[0])
     ap.add_argument("--port", default=None, help="default: so101.yaml port")
     ap.add_argument("--calibration", default=None, help="default: so101.yaml calibration_path")
-    ap.add_argument("--reads", type=int, default=5)
+    ap.add_argument("--reads", type=int, default=5, help="block reads to take (>= 1)")
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="wall-clock bound for the probe, s")
     args = ap.parse_args(argv)
+    if args.reads < 1:
+        ap.error("--reads must be >= 1")
     cfg = load_config(calibration=load_calibration(Path(args.calibration)) if args.calibration else None)
     cal = load_calibration(Path(args.calibration or cfg.calibration_path).expanduser())
     try:
-        res = probe_joints(cal, port=args.port or cfg.port, n_reads=args.reads)
+        res = probe_joints(cal, port=args.port or cfg.port, n_reads=args.reads, timeout_s=args.timeout)
     except ProbeRefused as e:
         print(f"probe refused: {e}", file=sys.stderr)
         return 2

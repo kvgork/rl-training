@@ -320,3 +320,27 @@ def test_area_band_matches_the_real_tracker_and_applies_without_distractors():
     tip, c, h = _away(1)
     tr.update(near, tip, c, h, 1, out)
     assert not bool(out.visible[0])
+
+
+def test_die_cut_by_the_image_border_is_invisible_like_on_the_real_tracker():
+    """The real HsvDepthDieTracker drops a blob that touches the image border; the sim tracker must call a die
+    invisible while its centre is closer to the border than the projected half-blob width (not only when the centre
+    leaves the image)."""
+    tr, _ = _tracker()
+    xs = torch.linspace(-0.3, 0.6, 91)
+    ys = torch.linspace(-0.45, 0.45, 91)
+    die = torch.stack(torch.meshgrid(xs, ys, indexing="ij"), -1).reshape(-1, 2)
+    die = torch.cat([die, torch.full((len(die), 1), DIE_Z)], dim=-1)
+    uv, z = tr._project(die)
+    half = 0.5 * tr.die_area_px(die).sqrt()
+    edge_dist = torch.minimum(
+        torch.minimum(uv[:, 0], CAM.width - 1 - uv[:, 0]), torch.minimum(uv[:, 1], CAM.height - 1 - uv[:, 1])
+    )
+    sees = tr._in_image(die)  # centre-in-image only (the old criterion)
+    table = (die[:, :2].abs() <= 0.45).all(-1)
+    cut = sees & (z > 0) & (edge_dist < half - 0.5) & table
+    inside = sees & (z > 0) & (edge_dist > half + 0.5) & table
+    assert cut.sum() > 0 and inside.sum() > 0, "grid must contain both cases"
+    vis = tr.in_view(die)
+    assert not vis[cut].any()
+    assert vis[inside & (die[:, :2].abs() <= 0.30).all(-1)].all()
