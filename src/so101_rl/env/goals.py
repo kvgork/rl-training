@@ -4,8 +4,16 @@ The bounds are the task's :class:`~so101_rl.env.tasks.GoalBounds` (``REACH.goal_
 shrunk by ``margin_m``, z above the kinematic floor and at most ``radius_max_m`` from the base. On top of the
 bounds the sampler rejects goals the arm cannot reach: a reachability table is built once from the FK of
 uniformly sampled joint configurations inside the joint limits (voxels of ``voxel_m``; a goal is kept when its
-voxel holds at least one FK sample). The table is deterministic in (bounds, limits, chain, seed) and cached per
-process, so ``So101GoalEnv`` and ``BatchedGoalEnv`` built from the same config share one table object.
+voxel holds at least one FK sample), **trimmed by ``erode_layers`` (1) voxel layer** (plan §10 2026-10-08 "Reach
+episode length and goal set"): a voxel is kept only when all 26 voxels around it are FK-reachable too, so a goal
+on the ragged rim of the workspace is not sampled. The erosion runs on the FK samples of the bounds padded by
+``erode_layers + 1`` voxels, so only the reachability rim is trimmed, not the faces of the goal box. The table is
+deterministic in (bounds, limits, chain, seed) and cached per process, so ``So101GoalEnv`` and
+``BatchedGoalEnv`` built from the same config share one table object.
+
+Near-start redraw (:func:`redraw_near_start_np` / :func:`redraw_near_start_torch`, both envs): a reach goal closer
+than ``GOAL_MIN_START_FACTOR`` (2) success radii to the start tip is replaced by one more draw (no trivial episodes;
+L1 ``start_not_success`` / L2 ``do_nothing`` in ``rl/gates.py``).
 
 Two front ends over the same set (integration 2026-10-06; SU1's interim torch voxel grid is gone):
 
@@ -16,6 +24,7 @@ Two front ends over the same set (integration 2026-10-06; SU1's interim torch vo
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 import numpy as np
@@ -28,14 +37,49 @@ from .tasks import GoalBounds
 if TYPE_CHECKING:
     import torch
 
-__all__ = ["FALLBACK_GOAL", "BoxGoalSampler", "FixedGoalSampler", "GoalSampler", "fk_tip_batch"]
+__all__ = [
+    "FALLBACK_GOAL",
+    "GOAL_MIN_START_FACTOR",
+    "BoxGoalSampler",
+    "FixedGoalSampler",
+    "GoalSampler",
+    "fk_tip_batch",
+    "redraw_near_start_np",
+    "redraw_near_start_torch",
+]
 
-REACH_TABLE_SAMPLES: Final[int] = 500_000
+REACH_TABLE_SAMPLES: Final[int] = 4_000_000  # dense enough that the erosion trims the rim, not sampling holes
+TABLE_CHUNK: Final[int] = 500_000
 VOXEL_M: Final[float] = 0.01
+ERODE_LAYERS: Final[int] = 1
+GOAL_MIN_START_FACTOR: Final[float] = 2.0  # reach goals start at least 2 success radii from the start tip
 TORCH_CANDIDATES: Final[int] = 32  # per world and call of ``sample_torch``
 FALLBACK_GOAL: Final[tuple[float, float, float]] = (0.20, 0.0, 0.15)  # FK-reachable, inside REACH.goal_bounds
 _KEY_OFFSET: Final[int] = 1 << 20
 _TABLE_CACHE: dict[tuple, np.ndarray] = {}  # reachability tables are deterministic in their inputs
+_NEIGHBOURS: Final[tuple[int, ...]] = tuple(  # key offsets of the 26 voxels around one (the 3x3x3 erosion element)
+    (dx << 42) + (dy << 21) + dz for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1) if (dx, dy, dz) != (0, 0, 0)
+)
+
+
+def redraw_near_start_np(goal: np.ndarray, start_tip: np.ndarray, success_radius_m: float,
+                         redraw: Callable[[], np.ndarray]) -> np.ndarray:  # fmt: skip
+    """The near-start rule of the real env: ``goal`` closer than ``GOAL_MIN_START_FACTOR`` success radii to
+    ``start_tip`` is replaced by ``redraw()`` (once; the second draw is kept whatever it is)."""
+    if np.linalg.norm(np.asarray(goal, np.float64) - np.asarray(start_tip, np.float64)) < (
+        GOAL_MIN_START_FACTOR * success_radius_m
+    ):
+        return np.asarray(redraw(), np.float64)
+    return np.asarray(goal, np.float64)
+
+
+def redraw_near_start_torch(g1: torch.Tensor, g2: torch.Tensor, start_tip: torch.Tensor,
+                            success_radius_m: float) -> torch.Tensor:  # fmt: skip
+    """The same rule per world for the batched env: rows of ``g1`` near ``start_tip`` take the second draw ``g2``."""
+    import torch
+
+    near = (g1 - start_tip).norm(dim=1) < GOAL_MIN_START_FACTOR * success_radius_m
+    return torch.where(near[:, None], g2, g1)
 
 
 @runtime_checkable
@@ -89,6 +133,7 @@ class BoxGoalSampler:
         seed: int,
         table_samples: int = REACH_TABLE_SAMPLES,
         voxel_m: float = VOXEL_M,
+        erode_layers: int = ERODE_LAYERS,
     ) -> None:
         self.bounds = bounds
         self.voxel_m = float(voxel_m)
@@ -96,15 +141,12 @@ class BoxGoalSampler:
         hi = np.asarray(limits.max_ticks, dtype=np.int64)
         chain = fk._chain
         ck = (
-            repr(bounds), lo.tobytes(), hi.tobytes(), int(seed), int(table_samples), self.voxel_m,
+            repr(bounds), lo.tobytes(), hi.tobytes(), int(seed), int(table_samples), self.voxel_m, int(erode_layers),
             fk._signs.tobytes(), chain.base_T.tobytes(), chain.parent_T.tobytes(), chain.tip_T.tobytes(),
         )
         keys = _TABLE_CACHE.get(ck)
         if keys is None:
-            rng = np.random.default_rng(seed)
-            ticks = rng.integers(lo, hi + 1, size=(int(table_samples), len(lo)))
-            xyz = fk_tip_batch(fk, ticks)
-            keys = np.unique(self._key(xyz[bounds.contains_np(xyz)]))
+            keys = self._build_table(bounds, fk, lo, hi, int(seed), int(table_samples), int(erode_layers))
             if keys.size == 0:
                 raise ValueError("no FK-reachable point lies inside the goal bounds")
             keys.flags.writeable = False
@@ -114,6 +156,28 @@ class BoxGoalSampler:
         fb = np.asarray(FALLBACK_GOAL)[None]
         if not (bounds.contains_np(fb).all() and self.reachable(fb).all()):
             raise ValueError(f"FALLBACK_GOAL {FALLBACK_GOAL} is outside these goal bounds or not FK-reachable")
+
+    def _build_table(self, bounds: GoalBounds, fk: So101FK, lo: np.ndarray, hi: np.ndarray, seed: int, n: int,
+                     erode_layers: int) -> np.ndarray:  # fmt: skip
+        """Sorted unique voxel keys: FK samples inside ``bounds``, minus the ``erode_layers`` outer layers of the
+        reachable set (3x3x3 erosion on the samples of the bounds padded by ``erode_layers + 1`` voxels)."""
+        pad = (erode_layers + 1) * self.voxel_m
+        plo, phi, prad = bounds.lo - pad, bounds.hi + pad, bounds.radius_max_m + pad
+        rng = np.random.default_rng(seed)
+        inside, near = [], []
+        for i in range(0, n, TABLE_CHUNK):
+            xyz = fk_tip_batch(fk, rng.integers(lo, hi + 1, size=(min(TABLE_CHUNK, n - i), len(lo))))
+            inside.append(self._key(xyz[bounds.contains_np(xyz)]))
+            padded = np.all((xyz >= plo) & (xyz <= phi), axis=-1) & (np.linalg.norm(xyz, axis=-1) <= prad)
+            near.append(self._key(xyz[padded]))
+        keys = np.unique(np.concatenate(inside))
+        reach = np.unique(np.concatenate(near))
+        for _ in range(erode_layers):
+            interior = np.ones(reach.size, dtype=bool)
+            for off in _NEIGHBOURS:
+                interior &= np.isin(reach + off, reach, assume_unique=True)
+            reach = reach[interior]
+        return keys[np.isin(keys, reach, assume_unique=True)]
 
     @property
     def keys(self) -> np.ndarray:

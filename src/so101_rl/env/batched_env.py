@@ -66,7 +66,7 @@ import numpy as np
 import torch
 
 from so101_rl.config import CENTER_TICK, JOINT_NAMES, N_JOINTS, TICKS_PER_REV, MotorCalibration, So101Config
-from so101_rl.env.goals import BoxGoalSampler
+from so101_rl.env.goals import BoxGoalSampler, redraw_near_start_torch
 from so101_rl.env.obs import PRIV_OBS, DieObsT, build_policy_obs_torch
 from so101_rl.env.tasks import (
     DIE_HALF_EDGE_M,
@@ -99,7 +99,6 @@ _RAD_PER_TICK = 2.0 * math.pi / TICKS_PER_REV
 TRUNCATING_TRIPS = int(TripCause.NAN | TripCause.RANGE | TripCause.BOX_PRESENT)  # D-TRIPS
 GRIPPER = N_JOINTS - 1
 _START_TRIES = 8
-GOAL_MIN_START_FACTOR = 2.0  # reach goals start at least 2 success radii from the start tip (rl/gates.py L2)
 _WELL_HALF_M = 0.0115  # flat floor of the start well (assets/so101/so101_rl_scene.xml tray), half width
 
 
@@ -486,8 +485,7 @@ class BatchedGoalEnv:
             # success radius of the start tip is replaced by a second draw
             g1, g2 = self._sample_goals(), self._sample_goals()
             tip0 = self.chain.fk_tip(present, self._xyz).float()
-            near = (g1 - tip0).norm(dim=1) < GOAL_MIN_START_FACTOR * self.task.success_radius_m
-            goals = torch.where(near[:, None], g2, g1)
+            goals = redraw_near_start_torch(g1, g2, tip0, self.task.success_radius_m)  # env/goals.py, as So101GoalEnv
         else:
             goals = self._zone_goal.expand(n, -1)
         self.goal.copy_(torch.where(mask[:, None], goals, self.goal))

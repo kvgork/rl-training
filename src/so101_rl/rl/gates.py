@@ -128,7 +128,7 @@ def _ik(fk: Any, start: np.ndarray, goals: np.ndarray, lo: np.ndarray, hi: np.nd
 def exclude_near_start(goals: np.ndarray, alt: np.ndarray, start_tip: np.ndarray, min_dist_m: float) -> np.ndarray:
     """The batched env's reset rule (``BatchedGoalEnv``): a goal closer than ``min_dist_m`` to the start tip is
     replaced by the second draw (no trivial episodes; L2 do-nothing = 0)."""
-    near = np.linalg.norm(goals - start_tip, axis=-1) < min_dist_m
+    near = np.linalg.norm(goals - start_tip, axis=-1) < min_dist_m  # == env/goals.redraw_near_start_np
     return np.where(near[..., None], alt, goals)
 
 

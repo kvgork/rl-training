@@ -22,7 +22,7 @@ from typing import Any, ClassVar, Protocol
 from so101_rl.lab.errors import LabError
 from so101_rl.lab.runs import REPO_ROOT
 
-TASKS: dict[str, str] = {"reach": "Move the gripper tip to a goal in the workspace box (FS4 REACH, 15 mm, 50 steps)."}
+TASKS: dict[str, str] = {"reach": "Move the gripper tip to a goal in the workspace box (FS4 REACH, 15 mm, 100 steps)."}
 EXIT_GATE = {"success_min": 0.95, "wilson_lo_min": 0.93, "episodes_min": 1000}  # D-EXIT-GATE (numeric part)
 
 

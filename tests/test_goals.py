@@ -7,7 +7,15 @@ import numpy as np
 import pytest
 import torch
 
-from so101_rl.env.goals import BoxGoalSampler, FixedGoalSampler, GoalSampler, fk_tip_batch
+from so101_rl.env.goals import (
+    GOAL_MIN_START_FACTOR,
+    BoxGoalSampler,
+    FixedGoalSampler,
+    GoalSampler,
+    fk_tip_batch,
+    redraw_near_start_np,
+    redraw_near_start_torch,
+)
 from so101_rl.env.tasks import REACH, GoalBounds
 from so101_rl.safety.fk import KinematicChain, So101FK
 
@@ -142,3 +150,41 @@ def test_the_real_and_batched_envs_share_one_table(sampler, cfg, fk):
 def test_torch_sampler_refuses_a_device_mismatch(sampler):
     with pytest.raises(ValueError, match="generator on"):
         sampler.sample_torch(4, torch.Generator(), device=torch.device("meta"))
+
+
+# ---------------------------------------------------------------- trimmed table + near-start rule (plan §10 2026-10-08)
+def test_the_table_is_trimmed_by_one_voxel_layer(sampler, cfg, fk):
+    """The shipped table is the untrimmed one minus its rim: a strict subset, and every kept voxel's 26 neighbours
+    are FK-reachable (in the untrimmed table, wherever the neighbour lies inside the goal bounds)."""
+    raw = BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0, erode_layers=0)
+    kept, full = sampler.keys, raw.keys
+    assert np.isin(kept, full).all() and 0.8 * full.size < kept.size < full.size
+    v = sampler.voxel_m
+    rng = np.random.default_rng(21)
+    g = sampler.sample_n(3000, rng)
+    centre = (np.floor(g / v) + 0.5) * v
+    offs = np.array([(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)], np.float64) * v
+    nb = (centre[:, None, :] + offs[None]).reshape(-1, 3)
+    inside = REACH.goal_bounds.contains_np(nb)
+    assert raw.reachable(nb[inside]).all()
+
+
+def test_trimmed_table_numpy_and_torch_lookups_are_bit_identical(sampler):
+    pts = REACH.goal_bounds.sample_np(50_000, np.random.default_rng(22))
+    got = sampler.reachable_torch(torch.as_tensor(pts)).numpy()
+    np.testing.assert_array_equal(got, sampler.reachable(pts))
+    assert 0 < got.mean() < 1
+
+
+def test_near_start_redraw_is_one_rule_for_numpy_and_torch():
+    r = REACH.success_radius_m
+    tip = np.array([0.2, 0.0, 0.15])
+    near = tip + np.array([0.0, 0.0, GOAL_MIN_START_FACTOR * r - 1e-4])
+    far = tip + np.array([0.0, 0.0, GOAL_MIN_START_FACTOR * r + 1e-4])
+    alt = np.array([0.25, 0.05, 0.1])
+    np.testing.assert_array_equal(redraw_near_start_np(near, tip, r, lambda: alt), alt)
+    np.testing.assert_array_equal(redraw_near_start_np(far, tip, r, lambda: alt), far)
+    g1 = torch.as_tensor(np.stack([near, far]))
+    g2 = torch.as_tensor(np.stack([alt, alt]))
+    out = redraw_near_start_torch(g1, g2, torch.as_tensor(tip)[None], r).numpy()
+    np.testing.assert_array_equal(out, np.stack([alt, far]))

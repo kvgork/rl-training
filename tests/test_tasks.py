@@ -20,7 +20,7 @@ from so101_rl.env.tasks import (
 
 
 def test_constants():
-    assert (REACH.name, REACH.obs, REACH.episode_steps, REACH.gamma) == ("reach", REACH_OBS, 50, 0.97)
+    assert (REACH.name, REACH.obs, REACH.episode_steps, REACH.gamma) == ("reach", REACH_OBS, 100, 0.97)
     assert (REACH.success_radius_m, REACH.success_debounce_steps, REACH.settle_m) == (0.015, 1, None)
     assert REACH.zone is None and REACH.die_start is None and REACH.start_pose == "home"
     assert (DIE_TO_ZONE.name, DIE_TO_ZONE.obs, DIE_TO_ZONE.episode_steps, DIE_TO_ZONE.gamma) == (

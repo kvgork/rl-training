@@ -108,6 +108,23 @@ def test_reset_seed_determines_the_goal(reach_env):
     assert REACH.goal_bounds.contains_np(a)
 
 
+def test_reset_redraws_a_goal_near_the_start_tip_like_the_batched_env(reach_env, monkeypatch):
+    """Parity with ``BatchedGoalEnv``: a sampled reach goal within 2 success radii of the start tip is redrawn once."""
+    from so101_rl.env.goals import GOAL_MIN_START_FACTOR
+
+    reach_env.reset(seed=0)
+    tip0 = reach_env.reset(seed=0)[0]["achieved_goal"].astype(np.float64)
+    far = np.array([0.25, 0.05, 0.10])
+    draws = iter([tip0 + [0.0, 0.0, 0.5 * GOAL_MIN_START_FACTOR * REACH.success_radius_m], far, far])
+    monkeypatch.setattr(reach_env.goal_sampler, "sample", lambda rng: next(draws))
+    obs = reach_env.reset(seed=0)[0]
+    np.testing.assert_allclose(obs["desired_goal"], far.astype(np.float32))
+    assert next(draws) is far  # exactly one redraw
+    draws2 = iter([far, tip0])  # a far first draw is kept
+    monkeypatch.setattr(reach_env.goal_sampler, "sample", lambda rng: next(draws2))
+    np.testing.assert_allclose(reach_env.reset(seed=0)[0]["desired_goal"], far.astype(np.float32))
+
+
 def test_step_before_reset_raises(reach_env):
     with pytest.raises(RuntimeError, match="reset"):
         reach_env.step(np.zeros(6, np.float32))
