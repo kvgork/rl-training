@@ -19,6 +19,7 @@ markers = [
     "gpu: needs CUDA",
     "slow: long-running test",
     "regression: regression test",
+    "integration: end-to-end test with real processes (systemd --user units, MCP over stdio)",
 ]
 addopts = "-ra --timeout=120"
 testpaths = ["tests"]
@@ -136,10 +137,16 @@ camera-intrinsics = "python -m so101_rl.perception.camera_intrinsics"   # --seri
 camera-calibrate = { cmd = "python -m so101_rl.perception.camera_calibrate", env = { MUJOCO_GL = "egl" } }   # --method arm-shape [--poses K]
 camera-overlay = { cmd = "python -m so101_rl.perception.camera_overlay", env = { MUJOCO_GL = "egl" } }
 camera-distractors = "python -m so101_rl.perception.distractors"
+# MVP (plans/mvp-plan.md): sim reach trainer (M1-M4) and the minimal lab connector (M5).
+sim-gates = "python -m so101_rl.rl.gates"   # --task reach: L1/L2 PASS/FAIL table, exit 0 only when all pass
+train-sim-sac = "python -m so101_rl.rl.train_sim_sac"   # --task reach --nworld N --budget-min M
+eval-sim = { cmd = "python -m so101_rl.rl.eval_sim", env = { MUJOCO_GL = "egl" } }   # renders eval rollouts headless
+export-policy = "python -m so101_rl.rl.policy_export"
+lab-mcp = "python -m so101_rl.lab.mcp_server"   # stdio MCP server (.mcp.json); jobs run as transient user units
+lab = "python -m so101_rl.lab.cli"   # status | stop <run> | gate-sign <run>
 # Planned tasks: each is added in the same commit that creates its module, so `pixi task list` never advertises a
 # broken task (tests/test_pixi_tasks.py). Phase 0 U8-U10 / SR1-SR3: random-policy-sim / random-policy-real
 # (so101_rl.env.random_policy --backend {sim,real}), train-reach-sac (rl.train_sac_her), train-reach-tdmpc2
 # (rl.train_tdmpc2), train-wm-state (wm.train_state_wm), check-milestone (scripts/check_milestone_phase0.py).
-# Sim track SU3-SU5: sim-gates (rl.gates), train-sim-sac (rl.train_sim_sac), eval-sim (rl.eval_sim), export-policy
-# (rl.policy_export), deploy-policy (rl.deploy_policy), pretrain-tdmpc2 (rl.tdmpc2_offline), gap-report
-# (rl.gap_report).
+# Sim track S5 (deferred after the MVP): deploy-policy (rl.deploy_policy), pretrain-tdmpc2 (rl.tdmpc2_offline),
+# gap-report (rl.gap_report).

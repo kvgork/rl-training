@@ -87,5 +87,12 @@ Sim-first track (`plans/sim-track-implementation-plan.md`; GPU tasks in the `def
   Warp; headless EGL rollout videos, TensorBoard scalars; `--viewer` opens the live window on a display).
 - `pixi run viz-attach --run runs/<run>` attaches the live 3D viewer to a running training run (needs a display).
 - `pixi run dashboard [--logdir runs/]` TensorBoard on localhost:6006 over every `runs/<run>/tensorboard`.
+- MVP sim reach (`plans/mvp-plan.md`): `pixi run sim-gates --task reach` the L1/L2 gates (exit 0 only when every row
+  passes); `pixi run train-sim-sac --task reach --nworld 1024 --budget-min 60` FastSAC on the batched env;
+  `pixi run eval-sim --ckpt <ckpt> --task reach --episodes 1000 --dr-stage 4 [--gate]` the sim eval and numeric exit
+  gate; `pixi run export-policy --ckpt <ckpt> --out <file>` the deployable policy.
+- `pixi run -e cpu lab-mcp` the stdio MCP server of the training lab (registered in `.mcp.json`; six sim-only tools; each
+  run is a transient `systemd --user` unit that outlives the client); `pixi run -e cpu lab status | stop <run> |
+  gate-sign <run>` the human CLI.
 
 `pixi task list` shows all tasks; tasks pointing at modules that later units create fail until then.

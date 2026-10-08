@@ -119,7 +119,7 @@ class DieStartSpec:
 class TaskSpec:
     name: Literal["reach", "die_to_zone"]
     obs: PolicyObsLayout
-    episode_steps: int  # 50 / 100
+    episode_steps: int  # reach 100 / die 100 (policy steps at 10 Hz)
     gamma: float  # 0.97 / 0.98 (training hint, not an env property)
     success_radius_m: float  # reach: 0.015 (Euclidean); die: = zone half edge (square, L-inf in xy)
     success_debounce_steps: int  # reach 1; die 2 (consecutive steps with the predicate true)
@@ -151,7 +151,7 @@ def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
         return TaskSpec(
             name="reach",
             obs=REACH_OBS,
-            episode_steps=50,
+            episode_steps=100,  # 10 s at 10 Hz (plan §10 2026-10-08)
             gamma=0.97,
             success_radius_m=0.015,
             success_debounce_steps=1,

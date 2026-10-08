@@ -43,7 +43,7 @@ from so101_rl.config import N_JOINTS, So101Config
 from so101_rl.safety.types import SmState
 
 from .backend import EnvBackend, ServoStateStale
-from .goals import BoxGoalSampler, FixedGoalSampler, GoalSampler
+from .goals import BoxGoalSampler, FixedGoalSampler, GoalSampler, redraw_near_start_np
 from .obs import DIE_AGE_MAX_FRAMES, GOAL_DIM, DieObs, build_policy_obs_np
 from .tasks import TaskSpec, action_to_delta_np, debounce_np, reward_np, success_np, visible_from_info
 
@@ -122,7 +122,8 @@ class So101GoalEnv(gymnasium.Env):
 
     # ------------------------------------------------------------------------------------------------ gym API
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[dict[str, np.ndarray], dict]:
-        """``options``: ``q0`` (start ticks, default per ``task.start_pose``), ``goal`` (xyz, default sampled)."""
+        """``options``: ``q0`` (start ticks, default per ``task.start_pose``), ``goal`` (xyz, default sampled; a
+        sampled reach goal within 2 success radii of the start tip is redrawn once, as in ``BatchedGoalEnv``)."""
         super().reset(seed=seed)
         options = options or {}
         q0 = options.get("q0")
@@ -139,7 +140,13 @@ class So101GoalEnv(gymnasium.Env):
         if not self._read_state():
             raise ServoStateStale("no servo state record after reset")
         goal = options.get("goal")
-        self._goal = np.asarray(goal if goal is not None else self.goal_sampler.sample(self.np_random), np.float64)
+        if goal is None:
+            goal = self.goal_sampler.sample(self.np_random)
+            if self.task.zone is None:  # reach: the batched env's near-start redraw (env/goals.py), sim == real
+                tip0 = self._fk.gripper_xyz_from_ticks(self._st[0]["present_ticks"], np.empty(3))
+                goal = redraw_near_start_np(goal, tip0, self.task.success_radius_m,
+                                            lambda: self.goal_sampler.sample(self.np_random))
+        self._goal = np.asarray(goal, np.float64)
         obs, achieved = self._observe()
         self._prev_achieved = achieved.astype(np.float64)
         self._needs_reset = False

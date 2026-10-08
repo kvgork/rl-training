@@ -15,6 +15,7 @@ def pytest_configure(config):
         ("gpu", "needs CUDA"),
         ("slow", "long-running test"),
         ("regression", "regression test"),
+        ("integration", "end-to-end test with real processes (systemd --user units, MCP over stdio)"),
     ):
         config.addinivalue_line("markers", f"{name}: {doc}")
     # The stdlib `logging` name would be shadowed if src/so101_rl itself were importable as top level.

@@ -30,7 +30,8 @@ is the command's complete post-clamp delta (the LOGGED action, L4).
 Resets (``reset``): the arm at ``home`` plus uniform +-``start_noise_ticks`` (30) on the five arm joints, FK
 checked inside the box (8 tries, else exact home; no host sync); reach goals from the real env's ``BoxGoalSampler``
 (``env/goals.py``: ``task.goal_bounds`` + the shared FK-reachability table; ``sample_torch``: 32 candidates per
-world, fallback (0.20, 0, 0.15)); the die task places the die at rest in the start well
+world, fallback (0.20, 0, 0.15)), a goal within ``GOAL_MIN_START_FACTOR`` (2) success radii of the start tip
+replaced by a second draw (no trivial episodes, L2 gate ``start_not_success`` / ``do_nothing``); the die task places the die at rest in the start well
 (``die_start``: xy ~ N(centre, sigma) clipped so the die footprint stays on the flat well floor for its yaw,
 yaw uniform, z = table + 8 mm, zero velocity; decision D-TRAY) and the goal is the zone centre at resting height.
 The chain is resynced to the reset's present ticks (``resync_target`` semantics), the delay FIFO pre-filled with
@@ -40,7 +41,11 @@ first full reset only (decorrelated auto-resets).
 Sim parameters: ``sim_params`` is any object with the FS7 ``SimParams`` fields (``kp kv damping frictionloss
 armature forcerange`` [6], ``delay_ticks``, ``die_mass_kg die_friction table_friction``); :func:`model_sim_params`
 reads them from the compiled model (= the MJCF prior, what ``SimParams.from_mjcf`` returns; SU2 owns that class).
-``randomizer`` (FS8) hooks land with SU3 (wave-2 hand-off of this file): passing one raises for now.
+``randomizer`` (FS8, reach subset: ``sim/domain_rand.py``, MVP M1): on every reset the worlds in the mask get new
+episode parameters (servo ratio group, frictionloss, delay; pushed with ``WarpSim.set_world_params`` when the stage
+randomises physics) and a proprio-noise amplitude; the policy observation (``q_norm`` and the FK tip) then sees the
+present ticks plus uniform integer noise in ``[-k, k]`` drawn every policy step. Reward, success and ``achieved``
+use the un-noised reading. ``info["dr_stage"]`` and the privileged ``dr_params`` block report the draws.
 
 Host syncs: none per step except the overflow check every ``cfg.sim_warp.overflow_check_every_steps`` steps
 (one copy) and ``close()``; ``stats`` and ``render_worlds`` sync when called.
@@ -61,7 +66,7 @@ import numpy as np
 import torch
 
 from so101_rl.config import CENTER_TICK, JOINT_NAMES, N_JOINTS, TICKS_PER_REV, MotorCalibration, So101Config
-from so101_rl.env.goals import BoxGoalSampler
+from so101_rl.env.goals import BoxGoalSampler, redraw_near_start_torch
 from so101_rl.env.obs import PRIV_OBS, DieObsT, build_policy_obs_torch
 from so101_rl.env.tasks import (
     DIE_HALF_EDGE_M,
@@ -153,7 +158,7 @@ class _WorldParams:
 
     def __init__(self, p: Any, n: int) -> None:
         def rows(x: Any) -> torch.Tensor:
-            return torch.as_tensor(np.asarray(x, np.float64)).float().expand(n, N_JOINTS).clone()
+            return torch.tensor(np.array(x, np.float64)).float().expand(n, N_JOINTS).clone()
 
         self.kp, self.kv, self.damping = rows(p.kp), rows(p.kv), rows(p.damping)
         self.frictionloss, self.armature, self.forcerange = rows(p.frictionloss), rows(p.armature), rows(p.forcerange)
@@ -184,8 +189,6 @@ class BatchedGoalEnv:
         seed: int = 0,
         device: str = "cuda:0",
     ) -> None:
-        if randomizer is not None:
-            raise NotImplementedError("BatchedGoalEnv: domain-randomisation hooks land with SU3 (FS8, wave 2)")
         self.cfg, self.task, self.nworld = cfg, task, int(nworld)
         calib: CameraCalib | None = None
         if task.obs.has_die:
@@ -244,10 +247,18 @@ class BatchedGoalEnv:
         self.sim_params = sim_params
         self.ws.set_world_params(_WorldParams(sim_params, n))
         self._centre = torch.cat(
-            [torch.as_tensor(np.asarray(getattr(sim_params, k), np.float64)) for k in ("kp", "kv", "damping", "frictionloss", "armature")]
+            [torch.tensor(np.array(getattr(sim_params, k), np.float64)) for k in ("kp", "kv", "damping", "frictionloss", "armature")]
         ).float().to(dev)
         self.delay_ticks = torch.full((n,), int(sim_params.delay_ticks), dtype=torch.int64, device=dev)
         self._fifo_len = int(sim_params.delay_ticks) + 1
+        # ---- domain randomisation (FS8 reach subset, sim/domain_rand.py)
+        self.randomizer = randomizer
+        self._dr_pushed = False
+        self._noise_amp = torch.zeros(n, dtype=torch.int64, device=dev)
+        if randomizer is not None:
+            if int(randomizer.nworld) != n or torch.device(randomizer.device) != dev:
+                raise ValueError("randomizer: nworld and device must match the env")
+            self._fifo_len = max(self._fifo_len, int(randomizer.max_delay_ticks) + 1)
         self._fifo = torch.zeros((n, self._fifo_len, N_JOINTS), dtype=torch.int64, device=dev)
         self._fifo_head = 0
         self._arange = torch.arange(n, device=dev)
@@ -293,6 +304,7 @@ class BatchedGoalEnv:
         self._priv = torch.zeros((n, self.priv_dim), dtype=torch.float32, device=dev)
         self._achieved = torch.zeros((n, 3), dtype=torch.float32, device=dev)
         self._xyz = torch.zeros((n, 3), dtype=torch.float64, device=dev)
+        self._xyz_obs = torch.zeros((n, 3), dtype=torch.float64, device=dev)
         self._first_reset = True
         self._steps = 0
         self._closed = False
@@ -355,6 +367,13 @@ class BatchedGoalEnv:
         qd = ws.qvel[:, self._v_adr]
         vel = self.velocity_ticks(qd)
         tip = self.chain.fk_tip(present, self._xyz).float()
+        present_obs, tip_obs = present, tip
+        if self.randomizer is not None:  # proprio noise: the POLICY's reading only (domain_rand.py)
+            k = self._noise_amp
+            u = torch.rand(present.shape, generator=self._gen, device=self.device)
+            noise = torch.floor(u * (2 * k + 1)[:, None]).to(torch.int64) - k[:, None]
+            present_obs = (present + noise).clamp(0, TICKS_PER_REV - 1)
+            tip_obs = self.chain.fk_tip(present_obs, self._xyz_obs).float()
         die_t = None
         if self.tracker is not None:
             self._trk_obs.xyz.copy_(self._trk.xyz)
@@ -362,7 +381,7 @@ class BatchedGoalEnv:
             self._trk_obs.age_frames.copy_(self._trk.age_frames)
             die_t = DieObsT(xyz=self._trk.xyz, visible=self._trk.visible, age_frames=self._trk.age_frames)
         build_policy_obs_torch(
-            self.task.obs, present_ticks=present, velocity=vel, applied_delta_ticks=self._applied, tip_xyz=tip,
+            self.task.obs, present_ticks=present_obs, velocity=vel, applied_delta_ticks=self._applied, tip_xyz=tip_obs,
             cfg=cfg, die=die_t, out=self._obs,
         )  # fmt: skip
         self._achieved.copy_(self._trk.xyz if self.tracker is not None else tip)
@@ -377,6 +396,8 @@ class BatchedGoalEnv:
         pr[:, P.die_in_gripper] = (ws.contact_count(self._jaw, self._die_geom) > 0).float()[:, None]
         pr[:, P.die_on_table] = (ws.contact_count(self._die_geom, self._table_geom) > 0).float()[:, None]
         dr = torch.ones((self.nworld, 33), dtype=torch.float32, device=self.device)  # no DR: every ratio 1
+        if self.randomizer is not None:
+            dr[:, :30] = self.randomizer.dr_ratios()
         dr[:, 30] = self.delay_ticks.float() / 5.0
         pr[:, P.dr_params] = dr
         lat = self.tracker.latency.float() / 3.0 if self.tracker is not None else torch.zeros(self.nworld, device=self.device)
@@ -443,6 +464,13 @@ class BatchedGoalEnv:
         q = self._start_qpos()
         if self.task.die_start is not None:
             self._place_die(q)
+        if self.randomizer is not None:
+            p = self.randomizer.sample_episode(mask)
+            if self.randomizer.current.physics or self._dr_pushed:
+                self.ws.set_world_params(p, validate=False)  # before reset_worlds: its forward sees the new values
+                self._dr_pushed = True
+            self.delay_ticks.copy_(p.delay_ticks)
+            self._noise_amp.copy_(self.randomizer.proprio_noise)
         ctrl = self._home_ctrl.expand(n, -1).clone()
         ctrl[:, self._act] = q[:, self._q_adr]  # hold the start pose (== the keyframe ctrl without noise)
         self.ws.reset_worlds(mask, q, torch.zeros_like(self.ws.qvel), ctrl)
@@ -452,7 +480,14 @@ class BatchedGoalEnv:
         self._fifo.copy_(torch.where(mask[:, None, None], held[:, None, :], self._fifo))
         self._applied.masked_fill_(mask[:, None], 0.0)
         self._count.masked_fill_(mask, 0)
-        goals = self._sample_goals() if self._zone_goal is None else self._zone_goal.expand(n, -1)
+        if self._zone_goal is None:
+            # no trivial episodes (L2 do-nothing = 0, rl/gates.py): a goal within GOAL_MIN_START_FACTOR x the
+            # success radius of the start tip is replaced by a second draw
+            g1, g2 = self._sample_goals(), self._sample_goals()
+            tip0 = self.chain.fk_tip(present, self._xyz).float()
+            goals = redraw_near_start_torch(g1, g2, tip0, self.task.success_radius_m)  # env/goals.py, as So101GoalEnv
+        else:
+            goals = self._zone_goal.expand(n, -1)
         self.goal.copy_(torch.where(mask[:, None], goals, self.goal))
         if self.tracker is not None:
             die = self.ws.body_xpos("die")
@@ -577,7 +612,7 @@ class BatchedGoalEnv:
             "success": success,
             "tracker_visible": vis.clone() if vis is not None else torch.ones(self.nworld, dtype=torch.bool, device=dev),
             "episode_step": self.episode_step.clone(),
-            "dr_stage": torch.zeros(self.nworld, dtype=torch.int64, device=dev),
+            "dr_stage": torch.full((self.nworld,), self.dr_stage, dtype=torch.int64, device=dev),
         }
         final_obs, final_priv, final_ach = self._obs.clone(), self._priv.clone(), self._achieved.clone()
         desired = self.goal.clone()
@@ -596,6 +631,10 @@ class BatchedGoalEnv:
         )  # fmt: skip
 
     # ------------------------------------------------------------------ misc
+    @property
+    def dr_stage(self) -> int:
+        return int(self.randomizer.stage) if self.randomizer is not None else 0
+
     def _check_open(self) -> None:
         if self._closed:
             raise RuntimeError("BatchedGoalEnv is closed")
