@@ -882,3 +882,29 @@ def test_resume_against_a_mujoco_default_start_has_no_stale_cmd(tmp_path, monkey
     assert len(eps) == 2 and eps[1]["trips"] == 0 and not eps[1]["tripped"] and summary["halted"] is None
     _assert_hold_from_attach_to_run(log)
 
+
+# ------------------------------------------------------------------------------------------------ reset: lift then return
+
+WALL_GOAL = (0.25358, -0.15443, 0.03161)  # seed-7 goal 33: the M6 policy ends with the tip on the y = -0.22 wall
+
+
+@pytest.mark.slow
+@pytest.mark.regression
+@pytest.mark.timeout(400)
+def test_reset_after_a_wall_press_does_not_trip_stuck(tmp_path, monkeypatch):
+    """Regression (plan §10 2026-10-08 "Deploy reset: lift then return"): with the old joint ramp, the reset after
+    an M6 episode on the wall goal pushed the tip into the box wall, the servo's clamp held it and STUCK (0x80)
+    tripped in the reset. The episodes may fail; every reset must complete."""
+    if not M6_POLICY.is_file():
+        pytest.skip(f"the M6 policy export is not on this host ({M6_POLICY})")
+    monkeypatch.setattr(dp, "draw_goal_pairs", lambda _s, _seed, n: np.tile(np.array(WALL_GOAL), (n, 2, 1)))
+    servo = ServoChild(tmp_path, "mujoco")
+    try:
+        code = _deploy(M6_POLICY, servo, tmp_path / "deploy", "--episodes", "3", "--speed-scale", "1.0")
+    finally:
+        assert servo.stop() == 0
+    _run, eps, summary = _run_dir(tmp_path / "deploy")
+    assert code == dp.EXIT_OK, summary["halted"]
+    assert summary["halted"] is None and len(eps) == 3
+    assert all(e["trips"] == 0 and not e["tripped"] for e in eps)
+    assert np.allclose(eps[0]["goal"], WALL_GOAL, atol=1e-4)
