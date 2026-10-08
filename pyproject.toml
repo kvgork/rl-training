@@ -78,6 +78,8 @@ pyrealsense2 = ">=2.57"
 [tool.pixi.feature.train.dependencies]
 tensorboard = "*"   # the live dashboard (viz.monitor / viz.dashboard; SUV, integration 2026-10-06)
 moviepy = ">=1.0.3,<2"   # TensorBoard rollout videos inline (plan §10 2026-10-06); torch add_video imports moviepy.editor, gone in 2.x
+mcp = "2.3.*"   # MVP connector MCP server (plans/mvp-plan.md M5; stdio)
+nvidia-ml-py = "*"   # NVML thermal fail-closed for training jobs (plan §10 P8)
 
 [tool.pixi.feature.train.pypi-dependencies]
 torchrl = "*"
