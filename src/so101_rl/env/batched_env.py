@@ -21,11 +21,13 @@ One policy step (10 Hz) of every world, in the order of the real ``ServoCore`` p
    bookkeeping, ``final_*`` (pre-reset copies) and auto-reset of the done worlds.
 
 Episode semantics (F7/FS9, the real env's rule, ``env/tasks.py`` "Episode end"): ``terminated`` = debounced
-success, where the success predicate only counts on a step without an emulated trip (NAN, RANGE, BOX_PRESENT,
-STUCK; decision D-TRIPS, STUCK added by plan §10 2026-10-08; the sim read never fails, so ``read_ok`` is always true) -- a trip resets the debounce count, so a
-tripped step is never a success; ``truncated`` = step limit OR an emulated trip, independently of ``terminated``
-(on the step-limit step both can be true, exactly like ``So101GoalEnv``). Clamp bits (JOINT_LIMIT, TRACKING, BOX)
-never end an episode. ``info["trips"]`` / ``info["clamped_mask"]`` are ORed over the step's three ticks; ``applied_delta_ticks``
+success OR an emulated trip (``tasks.TERMINAL_TRIPS``: NAN, RANGE, BOX_PRESENT, STUCK; decision D-TRIPS, STUCK added
+and trips made terminal with ``task.trip_penalty`` as the step reward by plan §10 2026-10-08), where the success
+predicate only counts on a step without a trip (the sim read never fails, so ``read_ok`` is always true) -- a trip
+resets the debounce count, so a tripped step is never a success; ``truncated`` = step limit OR an emulated trip,
+independently of ``terminated`` (on a trip or the step-limit step both can be true, exactly like ``So101GoalEnv``).
+Success is ``info["success"]``, a terminal trip ``info["tripped"]`` (``terminated`` is their OR). Clamp bits
+(JOINT_LIMIT, TRACKING, BOX) never end an episode. ``info["trips"]`` / ``info["clamped_mask"]`` are ORed over the step's three ticks; ``applied_delta_ticks``
 is the command's complete post-clamp delta (the LOGGED action, L4).
 
 Resets (``reset``): the arm at ``home`` plus uniform +-``start_noise_ticks`` (30) on the five arm joints, FK
@@ -71,10 +73,11 @@ from so101_rl.env.goals import BoxGoalSampler, redraw_near_start_torch
 from so101_rl.env.obs import PRIV_OBS, DieObsT, build_policy_obs_torch
 from so101_rl.env.tasks import (
     DIE_HALF_EDGE_M,
+    TERMINAL_TRIPS,
     TaskSpec,
     action_to_delta_torch,
     debounce_torch,
-    reward_torch,
+    step_reward_torch,
     success_torch,
 )
 from so101_rl.perception.camera_calib import CameraCalib, load_camera_calib
@@ -95,11 +98,9 @@ from so101_rl.sim.sim_tracker import (
 )
 from so101_rl.sim.warp_model import WarpSim
 
-__all__ = ["TRUNCATING_TRIPS", "BatchedGoalEnv", "BatchedStep", "ModelSimParams", "model_sim_params"]
+__all__ = ["BatchedGoalEnv", "BatchedStep", "ModelSimParams", "model_sim_params"]
 
 _RAD_PER_TICK = 2.0 * math.pi / TICKS_PER_REV
-# D-TRIPS; STUCK since plan §10 2026-10-08 ("STUCK emulated in batched sim")
-TRUNCATING_TRIPS = int(TripCause.NAN | TripCause.RANGE | TripCause.BOX_PRESENT | TripCause.STUCK)
 _TRIP_STATS = (("nan", TripCause.NAN), ("range", TripCause.RANGE), ("box_present", TripCause.BOX_PRESENT), ("stuck", TripCause.STUCK))
 GRIPPER = N_JOINTS - 1
 _START_TRIES = 8
@@ -598,8 +599,9 @@ class BatchedGoalEnv:
             "action_clamped": clamped.any(dim=1).to(torch.float32),
             "applied_action": (self._applied.double() / self._max_delta64).clamp(-1.0, 1.0).float(),
         }
-        reward = reward_torch(self._achieved, self.goal, task, visible=vis, info=info_r)
-        tripped = (trips & TRUNCATING_TRIPS) != 0
+        # a terminal trip pays task.trip_penalty instead (plan §10 2026-10-08 "Trip penalty"), the same function as HER
+        reward = step_reward_torch(self._achieved, self.goal, task, trips=trips, visible=vis, info=info_r)
+        tripped = (trips & TERMINAL_TRIPS) != 0
         # the real env's rule: a tripped step never counts toward success (read_ok is always true in sim)
         pred = success_torch(self._achieved, self.goal, task, visible=vis) & ~tripped
         success, self._count = debounce_torch(
@@ -607,13 +609,14 @@ class BatchedGoalEnv:
         )
         self._prev_achieved.copy_(self._achieved)
         self.episode_step += 1
-        terminated = success
+        terminated = success | tripped  # a terminal trip: no bootstrap (success and tripped never coincide)
         truncated = (self.episode_step >= task.episode_steps) | tripped  # So101GoalEnv: may coincide with terminated
         done = terminated | truncated
         info = {
             "applied_delta_ticks": self._applied.clone(),
             "clamped_mask": clamped,
             "trips": trips,
+            "tripped": tripped,
             "success": success,
             "tracker_visible": vis.clone() if vis is not None else torch.ones(self.nworld, dtype=torch.bool, device=dev),
             "episode_step": self.episode_step.clone(),

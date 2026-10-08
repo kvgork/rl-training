@@ -117,9 +117,12 @@ CALIB_KEYS = frozenset({"id", "drive_mode", "homing_offset", "range_min", "range
 # FS4 tasks (plan §10 2026-10-06). Keys per task; ranges reject typos and absurd values, the sign rules of the
 # reward are proven by env.reward.validate_reward_spec (run whenever a TaskSpec is built).
 TASK_KEYS: dict[str, frozenset[str]] = {
-    "reach": frozenset({"reward"}),
-    "die_to_zone": frozenset({"reward", "max_height_m", "settle_mm"}),
+    "reach": frozenset({"reward", "trip_penalty"}),
+    "die_to_zone": frozenset({"reward", "trip_penalty", "max_height_m", "settle_mm"}),
 }
+# < 0 (rewards are non-positive); the bounds only reject absurd values. "Worse than any trip-free episode" needs the
+# task's horizon and workspace box: env.reward.validate_trip_penalty proves it whenever a TaskSpec is built.
+TRIP_PENALTY_RANGE = (-1.0e4, -1.0)
 REWARD_WEIGHT_RANGE = (0.0, 100.0)  # >= 0: every term is <= 0, a negative weight would pay a positive reward
 REWARD_SCALE_RANGE_M = (1e-3, 10.0)
 # Die centroid above the goal: > 0 and below ~2 cm, where a die "held clearly in the air" must still fail.
@@ -277,7 +280,10 @@ def parse_tasks(node: Any, where: str = "tasks") -> TasksConfig:
     for name in TASK_NAMES:
         tw = f"{where}.{name}"
         e = _keys(t[name], TASK_KEYS[name], tw)
-        kw: dict[str, Any] = {"reward": _parse_reward(e["reward"], f"{tw}.reward")}
+        kw: dict[str, Any] = {
+            "reward": _parse_reward(e["reward"], f"{tw}.reward"),
+            "trip_penalty": _num_in(e["trip_penalty"], *TRIP_PENALTY_RANGE, f"{tw}.trip_penalty"),
+        }
         if "max_height_m" in e:
             kw["max_height_m"] = _num_in(e["max_height_m"], *DIE_MAX_HEIGHT_RANGE_M, f"{tw}.max_height_m")
         if "settle_mm" in e:

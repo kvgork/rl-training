@@ -14,10 +14,13 @@ One class for both tasks, both backends, and one definition of everything that s
   code base: :func:`tasks.action_to_delta_np`, bit-identical to the batched env's ``action_to_delta_torch``). A
   NaN passes through unchanged: the servo's sanitizer trips on it (the env never pre-filters what the safety chain
   must see); ±inf clip to ±1.
-* **Reward / success / termination:** ``env/tasks.py`` (FS4): ``compute_reward`` = :func:`tasks.reward_np` with
-  the visibility of the stored transition (:func:`tasks.visible_from_info`), and ``step`` uses the very same
-  function, so SB3 HER relabelling reproduces the step reward exactly. ``terminated`` = the debounced (and, for
-  the die, settled) success predicate on a step with a good bus read and no trip.
+* **Reward / success / termination:** ``env/tasks.py`` (FS4): ``compute_reward`` = :func:`tasks.step_reward_np`
+  with the visibility and the trip bits of the stored transition (:func:`tasks.visible_from_info`,
+  ``info["trips"]``), and ``step`` uses the very same function, so SB3 HER relabelling reproduces the step reward
+  exactly and never turns a trip into a success. ``terminated`` = the debounced (and, for the die, settled) success
+  predicate on a step with a good bus read and no trip (``info["is_success"]``), OR a terminal trip
+  (``tasks.TERMINAL_TRIPS`` in ``fault_bits``: NAN, RANGE, BOX_PRESENT, STUCK; ``info["tripped"]``), whose reward is
+  ``task.trip_penalty`` (plan §10 2026-10-08 "Trip penalty").
 * **Truncation:** the step limit, any ``fault_bits`` in the state record or the servo leaving RUN (``info["trip"]``
   = the fault bits; the episode then needs ``reset``), or a stalled servo (``info["servo_stalled"]``).
 * **Stale state:** a record with ``read_ok = 0`` repeats the last good reading; it is still observed (flagged in
@@ -25,7 +28,7 @@ One class for both tasks, both backends, and one definition of everything that s
   ``info["tracker_visible"] = read_ok`` (the achieved goal was measured this step).
 
 ``info`` keys every step: ``applied_delta_ticks`` f32[6], ``target_ticks`` i32[6], ``clamped_mask`` bool[6],
-``trips`` (int, the state record's ``fault_bits``), ``is_success``, ``state_seq``, ``cmd_seq``,
+``trips`` (int, the state record's ``fault_bits``), ``is_success``, ``tripped``, ``state_seq``, ``cmd_seq``,
 ``tracker_visible``, ``read_ok``, ``sm_state``, ``tick``, ``action_clamped`` (any joint clamped this step) and
 ``applied_action`` (``applied_delta_ticks / max_delta_ticks``, the logged L4 action) -- the last two feed the
 optional ``clamp`` / ``action_l2`` reward terms; plus ``trip`` when truncated by a fault.
@@ -45,7 +48,15 @@ from so101_rl.safety.types import SmState
 from .backend import EnvBackend, ServoStateStale
 from .goals import BoxGoalSampler, FixedGoalSampler, GoalSampler, redraw_near_start_np
 from .obs import DIE_AGE_MAX_FRAMES, GOAL_DIM, DieObs, build_policy_obs_np
-from .tasks import TaskSpec, action_to_delta_np, debounce_np, reward_np, success_np, visible_from_info
+from .tasks import (
+    TaskSpec,
+    action_to_delta_np,
+    debounce_np,
+    step_reward_np,
+    success_np,
+    tripped_from_info,
+    visible_from_info,
+)
 
 __all__ = ["DIE_LABEL", "So101GoalEnv"]
 
@@ -203,9 +214,12 @@ class So101GoalEnv(gymnasium.Env):
             prev_achieved=self._prev_achieved if settle else None,
         )
         self._prev_achieved = achieved.astype(np.float64)
-        terminated = bool(success)
+        # a policy-caused trip (TERMINAL_TRIPS) is terminal: no bootstrap, compute_reward paid task.trip_penalty
+        terminal_trip = bool(tripped_from_info(info))
+        terminated = bool(success) or terminal_trip
         truncated = bool(tripped or stalled or self._steps >= self.task.episode_steps)
-        info["is_success"] = terminated
+        info["is_success"] = bool(success)
+        info["tripped"] = terminal_trip
         if self.task.zone is not None:
             info["fiducial_ok"] = self._fiducial_ok
         if tripped:
@@ -221,10 +235,11 @@ class So101GoalEnv(gymnasium.Env):
         return obs, reward, terminated, truncated, info
 
     def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info: Any) -> np.ndarray:
-        """= :func:`tasks.reward_np` (vectorised for SB3 HER): ``info`` is one dict or a sequence of the stored
-        transitions' dicts; the die visibility comes from ``info["tracker_visible"]`` (never assumed)."""
+        """= :func:`tasks.step_reward_np` (vectorised for SB3 HER): ``info`` is one dict or a sequence of the stored
+        transitions' dicts; the die visibility comes from ``info["tracker_visible"]`` and the trip bits from
+        ``info["trips"]`` (neither is ever assumed), so a relabelled terminal-trip step keeps ``task.trip_penalty``."""
         visible = visible_from_info(info, self.task)
-        return reward_np(achieved_goal, desired_goal, self.task, visible=visible, info=info)
+        return step_reward_np(achieved_goal, desired_goal, self.task, visible=visible, info=info)
 
     def render(self) -> np.ndarray | None:
         if self.render_mode != "rgb_array":

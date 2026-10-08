@@ -273,7 +273,7 @@ def _episodes(env: Any, act_fn: Callable[[torch.Tensor], torch.Tensor]) -> tuple
         live = ~done
         steps += live.sum()
         hits += (live & st.info["success"]).sum()
-        succ |= live & st.terminated
+        succ |= live & st.info["success"]  # terminated also covers a terminal trip
         done |= st.terminated | st.truncated
         obs = st.obs
     return float(succ.float().mean()), float(hits / steps)

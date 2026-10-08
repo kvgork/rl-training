@@ -46,6 +46,13 @@ def _spec(**weights) -> RewardSpec:
     return RewardSpec(tuple(terms))
 
 
+def _with_reward(task, rspec: RewardSpec):
+    """``task`` with reward ``rspec`` and a trip penalty that satisfies ``validate_trip_penalty`` for it (heavier
+    weights make the worst step worse, so the shipped -310 can be too mild)."""
+    bound = task.episode_steps * R.worst_step_reward(rspec, max_dist_m=task.max_dist_m)
+    return dataclasses.replace(task, reward=rspec, trip_penalty=min(task.trip_penalty, bound))
+
+
 # ---------------------------------------------------------------- validator
 
 
@@ -130,7 +137,7 @@ def test_terms_sum_to_the_reward_np_and_torch():
 
 
 def test_info_terms_read_the_stored_transition_and_never_default():
-    spec = dataclasses.replace(REACH, reward=_spec(distance=1.0, success=1.0, clamp=0.5, action_l2=0.2))
+    spec = _with_reward(REACH, _spec(distance=1.0, success=1.0, clamp=0.5, action_l2=0.2))
     g = np.array([0.2, 0.0, 0.1])
     a = np.tile(g, (2, 1))  # both successful: only the info terms contribute
     infos = [{"action_clamped": True, "applied_action": np.ones(6)},
@@ -146,7 +153,7 @@ def test_info_terms_read_the_stored_transition_and_never_default():
     with pytest.raises(KeyError):
         reward_np(a, a, spec)
     # a weight-0 term is skipped and needs no info
-    zero = dataclasses.replace(REACH, reward=_spec(distance=1.0, success=1.0, clamp=0.0))
+    zero = _with_reward(REACH, _spec(distance=1.0, success=1.0, clamp=0.0))
     assert reward_np(g, g, zero) == pytest.approx(-0.05)  # only the time term
 
 
@@ -172,7 +179,7 @@ def test_property_no_step_reward_is_positive(rspec, seed, die):
     """For any spec the validator accepts and any states: reward <= -w_time < 0, and <= -(w_success + w_time) on
     unsuccessful steps (numpy and torch agree)."""
     b = validate_reward_spec(rspec)
-    task = dataclasses.replace(DIE_TO_ZONE if die else REACH, reward=rspec)
+    task = _with_reward(DIE_TO_ZONE if die else REACH, rspec)
     rng = np.random.default_rng(seed)
     n = 256
     desired = (np.tile(task.zone.goal_xyz(), (n, 1)) if die else task.goal_bounds.sample_np(n, rng))
@@ -252,7 +259,7 @@ def test_finishing_beats_every_gaming_policy(gamma):
 @settings(max_examples=40, deadline=None)
 @given(rspec=valid_specs())
 def test_finishing_beats_gaming_for_any_valid_spec(rspec):
-    task = dataclasses.replace(DIE_TO_ZONE, reward=rspec)
+    task = _with_reward(DIE_TO_ZONE, rspec)
     info = {"action_clamped": False, "applied_action": np.zeros(6)}
     pol = _policies(task)
     fin, done = _episode_return(task, *pol["finish"], 0.98, 400, info=info)

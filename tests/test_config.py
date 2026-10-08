@@ -402,6 +402,10 @@ def test_tasks_defaults(cfg):
         (lambda r: r["tasks"]["die_to_zone"].update(max_height_m=0.025), "max_height_m"),  # 2.5 cm up must fail
         (lambda r: r["tasks"]["die_to_zone"].update(settle_mm=0.0), "settle_mm"),
         (lambda r: r["tasks"]["die_to_zone"].update(settle_mm=True), "settle_mm"),
+        (lambda r: r["tasks"]["reach"].pop("trip_penalty"), "trip_penalty"),
+        (lambda r: r["tasks"]["reach"].update(trip_penalty=0.0), "trip_penalty"),  # rewards stay non-positive
+        (lambda r: r["tasks"]["reach"].update(trip_penalty=5.0), "trip_penalty"),
+        (lambda r: r["tasks"]["die_to_zone"].update(trip_penalty="big"), "trip_penalty"),
         (lambda r: r["tasks"].update(stack={}), "stack"),
         (lambda r: r.pop("tasks"), "tasks"),
     ],
