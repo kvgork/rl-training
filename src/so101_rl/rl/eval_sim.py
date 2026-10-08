@@ -4,7 +4,7 @@
 
 Every world runs exactly one deterministic episode per round (worlds that finish early are not re-counted), so
 the success rate is not biased toward short (successful) episodes. Writes ``eval.json`` (success rate, Wilson 95 %
-interval, final error p50/p90, trips, the DR stage and its ranges, the gate verdict), ``review_checklist.md`` (the
+interval, final error p50/p90, trips (``trip_episodes`` and per cause ``trip_causes``), the DR stage and its ranges, the gate verdict), ``review_checklist.md`` (the
 human part of the gate) and, with ``--render K``, ``renders/*.mp4`` through ``viz/video.py``.
 
 **Exit gate** (plan §5 S4, §10 D-EXIT-GATE): ``success >= 0.95`` over ``>= 1000`` episodes at the final DR stage
@@ -38,6 +38,8 @@ from typing import Any, Final
 import numpy as np
 import torch
 
+from so101_rl.safety.types import TripCause
+
 __all__ = [
     "GATE_FINAL_STAGE",
     "GATE_MIN_EPISODES",
@@ -56,6 +58,10 @@ GATE_MIN_WILSON_LO: Final[float] = 0.93
 GATE_MIN_EPISODES: Final[int] = 1000
 GATE_FINAL_STAGE: Final[int] = 4  # the last entry of sim/domain_rand.REACH_DR_STAGES (test-enforced)
 TASKS: Final[tuple[str, ...]] = ("reach",)  # MVP: reach only (die_to_zone deferred, plans/mvp-plan.md)
+# per-cause counts of the episodes ended by an emulated trip (eval.json ``trip_causes``; batched_env.TRUNCATING_TRIPS)
+TRIP_CAUSES: Final[tuple[tuple[str, TripCause], ...]] = (
+    ("nan", TripCause.NAN), ("range", TripCause.RANGE), ("box_present", TripCause.BOX_PRESENT), ("stuck", TripCause.STUCK),
+)
 CAMERA_POSE_METHOD_REACH: Final[str] = "none"  # reach observation is state only; no camera in the policy loop
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[3]
 
@@ -164,7 +170,7 @@ def run_episodes(env: Any, policy: Callable[[torch.Tensor], torch.Tensor], episo
     randomisation), counting each world's FIRST episode only. Returns host statistics."""
     n = int(env.nworld)
     horizon = int(getattr(getattr(env, "task", None), "episode_steps", getattr(env, "episode_steps", 50)))
-    succ, err, ret, length, trips = [], [], [], [], []
+    succ, err, ret, length, trips, causes = [], [], [], [], [], []
     left = int(episodes)
     while left > 0:
         k = min(n, left)
@@ -175,6 +181,7 @@ def run_episodes(env: Any, policy: Callable[[torch.Tensor], torch.Tensor], episo
         e_ep = torch.zeros(n, device=env.device)
         l_ep = torch.zeros(n, dtype=torch.int64, device=env.device)
         t_ep = torch.zeros(n, dtype=torch.bool, device=env.device)
+        c_ep = torch.zeros(n, dtype=torch.int64, device=env.device)  # trip bits of the step that ended the episode
         for t in range(horizon):
             st = env.step(policy(policy_input(env, obs)))
             live = ~done
@@ -184,7 +191,11 @@ def run_episodes(env: Any, policy: Callable[[torch.Tensor], torch.Tensor], episo
             fe = (st.final_achieved - st.desired).norm(dim=1)
             e_ep = torch.where(end, fe, e_ep)
             l_ep = torch.where(end, torch.full_like(l_ep, t + 1), l_ep)
-            t_ep |= end & st.truncated & ~st.terminated & (t + 1 < horizon)  # truncated early: an emulated trip
+            tripped = end & st.truncated & ~st.terminated & (t + 1 < horizon)  # truncated early: an emulated trip
+            t_ep |= tripped
+            step_trips = getattr(st, "info", {}).get("trips")
+            if step_trips is not None:
+                c_ep = torch.where(tripped, step_trips.to(torch.int64), c_ep)
             done |= end
             obs = st.obs
         succ.append(s_ep[:k].cpu())
@@ -192,9 +203,11 @@ def run_episodes(env: Any, policy: Callable[[torch.Tensor], torch.Tensor], episo
         ret.append(r_acc[:k].cpu())
         length.append(l_ep[:k].cpu())
         trips.append(t_ep[:k].cpu())
+        causes.append(c_ep[:k].cpu())
         left -= k
     s = torch.cat(succ).numpy()
     e = torch.cat(err).double().numpy()
+    cause = torch.cat(causes)
     return {
         "episodes": int(s.size),
         "successes": int(s.sum()),
@@ -203,6 +216,7 @@ def run_episodes(env: Any, policy: Callable[[torch.Tensor], torch.Tensor], episo
         "mean_return": float(torch.cat(ret).mean()),
         "mean_length": float(torch.cat(length).double().mean()),
         "trip_episodes": int(torch.cat(trips).sum()),
+        "trip_causes": {name: int(((cause & int(c)) != 0).sum()) for name, c in TRIP_CAUSES},
         "returns": torch.cat(ret).numpy(),
     }
 
@@ -332,7 +346,8 @@ def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Pa
         "task": task, "ckpt": str(ckpt), "ckpt_sha256": _sha256(Path(ckpt)), "env_step": int(d.get("env_step", 0)),
         "episodes": stats["episodes"], "successes": stats["successes"], "success_rate": stats["success_rate"],
         "wilson95": [lo, hi], "final_err_m": stats["final_err_m"], "mean_return": stats["mean_return"],
-        "mean_length": stats["mean_length"], "trip_episodes": stats["trip_episodes"], "dr_stage": int(dr_stage), "dr": dr,
+        "mean_length": stats["mean_length"], "trip_episodes": stats["trip_episodes"],
+        "trip_causes": stats["trip_causes"], "dr_stage": int(dr_stage), "dr": dr,
         "gate": {"min_success": GATE_MIN_SUCCESS, "min_wilson_lo": GATE_MIN_WILSON_LO, "min_episodes": GATE_MIN_EPISODES,
                  "final_stage": GATE_FINAL_STAGE, "numeric_passed": passed, "reasons": reasons,
                  "human_checklist": "pending (review_checklist.md; signed outside this tool)"},

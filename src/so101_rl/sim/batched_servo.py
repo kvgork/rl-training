@@ -32,9 +32,16 @@ Semantics (identical to ``safety/pipeline.py``, which is the source of truth; di
    lowered by ``gripper_present_tolerance_m``) -> ``BOX_PRESENT`` and ``target = prev_target`` (the target box test
    is skipped); else the target outside the exact box / point floor -> ``target = goal = prev_target`` with mask
    ``target != prev_target`` and ``BOX`` iff that mask is non-empty
-6. thermal / protection bits / stuck: NOT emulated (decision D-TRIPS)
+6. thermal / protection bits: NOT emulated (decision D-TRIPS)
 7. ``applied_delta_ticks = goal - goal_at_cmd_start`` (float32; the LOGGED action, L4)
-8. ``RANGE`` if any target is outside 0..4095 (the target is left as-is, pipeline semantics)
+8. stuck-action monitor (``safety/stuck.py`` ``StuckActionMonitor``, emulated since plan §10 2026-10-08 "STUCK
+   emulated in batched sim"), only when ``apply`` gets the tick's ``moving`` flags: it watches the sanitized,
+   rounded COMMANDED delta of the latest ``new_command`` (zero after a NaN row or a resync) and counts consecutive
+   ticks on which that delta is non-zero (``max|delta| > STUCK_EPSILON_TICKS``), equal to the delta of the first
+   counted tick (every component within ``STUCK_EPSILON_TICKS``) and no joint is ``moving``; ``STUCK`` once the
+   count reaches ``STUCK_REPEAT_TICKS`` (90 ticks = 3 s at 30 Hz). Any change, a zero delta, any motion or a resync
+   resets the count.
+9. ``RANGE`` if any target is outside 0..4095 (the target is left as-is, pipeline semantics)
 
 ``prev_target`` = the target of this tick. All tick state is int64 (the pipeline's int32 values fit). Nothing in
 ``new_command`` / ``apply`` synchronises with the host; ``clamp_active_fraction`` does (one copy) when read.
@@ -52,21 +59,33 @@ from so101_rl.config import CENTER_TICK, JOINT_NAMES, N_JOINTS, TICKS_PER_REV, M
 from so101_rl.safety.fk import N_ARM_JOINTS, KinematicChain
 from so101_rl.safety.types import TripCause
 
-__all__ = ["CHAIN_TRIP_BITS", "STAGES", "BatchedServoChain", "ChainOut"]
+__all__ = ["CHAIN_TRIP_BITS", "STAGES", "STUCK_EPSILON_TICKS", "STUCK_REPEAT_TICKS", "BatchedServoChain", "ChainOut"]
 
 _RAD_PER_TICK: Final[float] = 2.0 * np.pi / TICKS_PER_REV
 _MAX_TICK: Final[int] = TICKS_PER_REV - 1
 _GOAL_CLIP: Final[float] = float(2**30)
 
-# The trip bits this chain can set (decision D-TRIPS: THERMAL / PROTECTION_BIT / STUCK are not emulated).
+# The trip bits this chain can set (decision D-TRIPS: THERMAL / PROTECTION_BIT are not emulated; STUCK is, since
+# plan §10 2026-10-08, when ``apply`` is given the ``moving`` flags).
 CHAIN_TRIP_BITS: Final[int] = int(
-    TripCause.NAN | TripCause.JOINT_LIMIT | TripCause.TRACKING | TripCause.BOX | TripCause.BOX_PRESENT | TripCause.RANGE
+    TripCause.NAN
+    | TripCause.JOINT_LIMIT
+    | TripCause.TRACKING
+    | TripCause.BOX
+    | TripCause.BOX_PRESENT
+    | TripCause.RANGE
+    | TripCause.STUCK
 )
+# ``StuckActionMonitor()`` defaults (the servo builds it with them, ``servo/core.py``). Copied, not imported: ``sim/``
+# imports only TripCause / KinematicChain from ``safety`` (D-DEPS); tests/test_batched_servo.py pins the equality.
+STUCK_REPEAT_TICKS: Final[int] = 90
+STUCK_EPSILON_TICKS: Final[float] = 0.5
 # Stages counted by ``clamp_active_fraction`` (fraction of world-ticks on which the stage modified any joint).
 STAGES: Final[tuple[str, ...]] = ("joint_limit", "velocity", "tracking", "box")
 
 _NAN, _JL, _TRK = int(TripCause.NAN), int(TripCause.JOINT_LIMIT), int(TripCause.TRACKING)
 _BOX, _BOXP, _RANGE = int(TripCause.BOX), int(TripCause.BOX_PRESENT), int(TripCause.RANGE)
+_STUCK = int(TripCause.STUCK)
 
 
 @dataclass
@@ -151,6 +170,10 @@ class BatchedServoChain:
         self._goal_at_cmd_start = z.clone()
         self._cmd_mask = torch.zeros((n, N_JOINTS), dtype=torch.bool, device=dev)
         self._cmd_trips = torch.zeros(n, dtype=torch.int64, device=dev)
+        # stuck-action monitor state: the pipeline's sanitized+rounded float32 ``_delta``, the reference delta and count
+        self._delta = torch.zeros((n, N_JOINTS), dtype=torch.float32, device=dev)
+        self._stuck_ref = torch.zeros((n, N_JOINTS), dtype=torch.float32, device=dev)
+        self.stuck_count = torch.zeros(n, dtype=torch.int64, device=dev)
         self._xyz = torch.zeros((n, 3), dtype=torch.float64, device=dev)
         self._zlow = torch.zeros(n, dtype=torch.float64, device=dev)
         self._counts = torch.zeros(len(STAGES), dtype=torch.int64, device=dev)
@@ -159,13 +182,16 @@ class BatchedServoChain:
     # ------------------------------------------------------------------ state
     def resync(self, present_ticks: torch.Tensor, mask: torch.Tensor | None = None) -> None:
         """goal = prev_target = present for the worlds in ``mask`` (all if None); forgets their pending command
-        results (``resync_target`` semantics: every entry to RUN, every episode reset)."""
+        results and the stuck-monitor history (``resync_target`` semantics: every entry to RUN, every episode
+        reset)."""
         p = present_ticks.to(device=self.device, dtype=torch.int64)
         if mask is None:
             for t in (self.goal, self.prev_target, self._goal_at_cmd_start):
                 t.copy_(p)
             self._cmd_mask.zero_()
             self._cmd_trips.zero_()
+            self._delta.zero_()
+            self.stuck_count.zero_()
             return
         m = mask.to(device=self.device, dtype=torch.bool)
         m2 = m[:, None]
@@ -173,6 +199,8 @@ class BatchedServoChain:
             t.copy_(torch.where(m2, p, t))
         self._cmd_mask.masked_fill_(m2, False)
         self._cmd_trips.masked_fill_(m, 0)
+        self._delta.masked_fill_(m2, 0.0)
+        self.stuck_count.masked_fill_(m, 0)
 
     # ------------------------------------------------------------------ 10 Hz
     def new_command(self, delta_ticks: torch.Tensor) -> torch.Tensor:
@@ -187,7 +215,9 @@ class BatchedServoChain:
         # sanitize: clip in float64, store float32 (the pipeline's _delta), round half-to-even in float32
         clipped = torch.maximum(torch.minimum(torch.nan_to_num(d, nan=0.0), self._max_delta), -self._max_delta)
         clipped = torch.where(nan[:, None], torch.zeros_like(clipped), clipped)
-        delta = torch.round(clipped.to(torch.float32)).to(torch.float64)
+        delta32 = torch.round(clipped.to(torch.float32))
+        self._delta.copy_(delta32)  # the pipeline's _delta: zeroed for a NaN row (sanitize_delta), rounded otherwise
+        delta = delta32.to(torch.float64)
         g = (self.goal.to(torch.float64) + delta).clamp(-_GOAL_CLIP, _GOAL_CLIP).to(torch.int64)
         lim = torch.maximum(torch.minimum(g, self._jl_max), self._jl_min)
         cmd_mask = (lim != g) & ~nan[:, None]
@@ -198,7 +228,11 @@ class BatchedServoChain:
         return nan
 
     # ------------------------------------------------------------------ 30 Hz
-    def apply(self, present_ticks: torch.Tensor, ticks_remaining: int, out: ChainOut) -> ChainOut:
+    def apply(
+        self, present_ticks: torch.Tensor, ticks_remaining: int, out: ChainOut, moving: torch.Tensor | None = None
+    ) -> ChainOut:
+        """One servo tick of every world. ``moving`` (bool/int [N,6], the Moving flags read with ``present``) enables
+        the stuck-action stage; without it the stage is skipped (its history is left as it is)."""
         present = present_ticks.to(device=self.device, dtype=torch.int64)
         prev = self.prev_target
         trips = self._cmd_trips.clone()
@@ -243,7 +277,10 @@ class BatchedServoChain:
         out.goal_ticks.copy_(self.goal)
         out.applied_delta_ticks.copy_((self.goal - self._goal_at_cmd_start).to(torch.float32))
         out.clamped_mask.copy_(mask)
-        # 8. range check last (target left as-is)
+        # 8. stuck-action monitor on the commanded delta (StuckActionMonitor.update, vectorised)
+        if moving is not None:
+            trips |= self._stuck_update(moving)
+        # 9. range check last (target left as-is)
         bad = ((target < 0) | (target > _MAX_TICK)).any(dim=1)
         trips |= torch.where(bad, _RANGE, 0)
         out.trips.copy_(trips)
@@ -252,6 +289,19 @@ class BatchedServoChain:
         self._counts += torch.stack([m_jl.any(1).sum(), m_vel.any(1).sum(), m_trk.any(1).sum(), m_box.any(1).sum()])
         self._world_ticks += self.nworld
         return out
+
+    def _stuck_update(self, moving: torch.Tensor) -> torch.Tensor:
+        eps = STUCK_EPSILON_TICKS
+        d = self._delta
+        still = ~moving.to(device=self.device, dtype=torch.bool).any(dim=1)
+        active = (d.abs().amax(dim=1) > eps) & still
+        cnt = self.stuck_count
+        changed = (cnt > 0) & ((d - self._stuck_ref).abs().amax(dim=1) > eps)
+        cnt = torch.where(changed, 0, cnt)
+        self._stuck_ref.copy_(torch.where((active & (cnt == 0))[:, None], d, self._stuck_ref))
+        cnt = torch.where(active, cnt + 1, 0)
+        self.stuck_count.copy_(cnt)
+        return torch.where(cnt >= STUCK_REPEAT_TICKS, _STUCK, 0)
 
     # ------------------------------------------------------------------ FK
     @staticmethod

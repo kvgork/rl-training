@@ -7,7 +7,8 @@ One policy step (10 Hz) of every world, in the order of the real ``ServoCore`` p
    ``BatchedServoChain.new_command`` (sanitize -> rint -> goal += delta -> joint limits; NaN rows trip).
 2. Three servo ticks, ``ticks_remaining`` = 3, 2, 1. Each tick: ``present = q_to_ticks(qpos)`` (the read at the
    START of the tick, MujocoBus quantisation: arm ``rint(sign q / rad_per_tick + 2047)``, gripper through the
-   0-100 % map, clipped 0..4095) -> tracker frame (die task) -> ``chain.apply(present, rem)`` -> the servo's
+   0-100 % map, clipped 0..4095) and ``moving = |qvel| > MOVING_EPS_RAD_S`` per joint (MujocoBus, same instant) ->
+   tracker frame (die task) -> ``chain.apply(present, rem, moving=moving)`` -> the servo's
    register clip to the calibration range -> per-world delay FIFO -> ``ctrl = ticks_to_q`` clipped to
    ``ctrlrange`` -> ``WarpSim.step(steps_per_tick)`` (17 substeps of 1/510 s = 1/30 s, the same count as
    ``MujocoBus.step_ticks``).
@@ -20,8 +21,8 @@ One policy step (10 Hz) of every world, in the order of the real ``ServoCore`` p
    bookkeeping, ``final_*`` (pre-reset copies) and auto-reset of the done worlds.
 
 Episode semantics (F7/FS9, the real env's rule, ``env/tasks.py`` "Episode end"): ``terminated`` = debounced
-success, where the success predicate only counts on a step without an emulated trip (NAN, RANGE, BOX_PRESENT;
-decision D-TRIPS; the sim read never fails, so ``read_ok`` is always true) -- a trip resets the debounce count, so a
+success, where the success predicate only counts on a step without an emulated trip (NAN, RANGE, BOX_PRESENT,
+STUCK; decision D-TRIPS, STUCK added by plan §10 2026-10-08; the sim read never fails, so ``read_ok`` is always true) -- a trip resets the debounce count, so a
 tripped step is never a success; ``truncated`` = step limit OR an emulated trip, independently of ``terminated``
 (on the step-limit step both can be true, exactly like ``So101GoalEnv``). Clamp bits (JOINT_LIMIT, TRACKING, BOX)
 never end an episode. ``info["trips"]`` / ``info["clamped_mask"]`` are ORed over the step's three ticks; ``applied_delta_ticks``
@@ -83,6 +84,7 @@ from so101_rl.sim.batched_servo import BatchedServoChain, ChainOut
 from so101_rl.sim.d435 import COLOR_CAM
 from so101_rl.sim.gripper_map import gripper_range_rad, gripper_ticks_per_rad
 from so101_rl.sim.model import TABLE_Z_M, jaw_collision_geom_ids, load_model
+from so101_rl.sim.mujoco_bus import MOVING_EPS_RAD_S
 from so101_rl.sim.sim_tracker import (
     CameraModel,
     DistractorModel,
@@ -96,7 +98,9 @@ from so101_rl.sim.warp_model import WarpSim
 __all__ = ["TRUNCATING_TRIPS", "BatchedGoalEnv", "BatchedStep", "ModelSimParams", "model_sim_params"]
 
 _RAD_PER_TICK = 2.0 * math.pi / TICKS_PER_REV
-TRUNCATING_TRIPS = int(TripCause.NAN | TripCause.RANGE | TripCause.BOX_PRESENT)  # D-TRIPS
+# D-TRIPS; STUCK since plan §10 2026-10-08 ("STUCK emulated in batched sim")
+TRUNCATING_TRIPS = int(TripCause.NAN | TripCause.RANGE | TripCause.BOX_PRESENT | TripCause.STUCK)
+_TRIP_STATS = (("nan", TripCause.NAN), ("range", TripCause.RANGE), ("box_present", TripCause.BOX_PRESENT), ("stuck", TripCause.STUCK))
 GRIPPER = N_JOINTS - 1
 _START_TRIES = 8
 _WELL_HALF_M = 0.0115  # flat floor of the start well (assets/so101/so101_rl_scene.xml tray), half width
@@ -309,7 +313,7 @@ class BatchedGoalEnv:
         self._steps = 0
         self._closed = False
         # stats (device counters)
-        self._n_trips = torch.zeros(3, dtype=torch.int64, device=dev)  # NAN, RANGE, BOX_PRESENT
+        self._n_trips = torch.zeros(len(_TRIP_STATS), dtype=torch.int64, device=dev)  # NAN, RANGE, BOX_PRESENT, STUCK
         self._n_visible = torch.zeros((), dtype=torch.int64, device=dev)
         self._n_resets = torch.zeros((), dtype=torch.int64, device=dev)
         self._renderer: dict[tuple[int, int], mujoco.Renderer] = {}
@@ -553,9 +557,10 @@ class BatchedGoalEnv:
         clamped = torch.zeros((n, N_JOINTS), dtype=torch.bool, device=dev)
         for k, rem in enumerate((3, 2, 1)):
             present = self._present()
+            moving = ws.qvel[:, self._v_adr].abs() > MOVING_EPS_RAD_S  # MujocoBus.read_block, same instant
             if self.tracker is not None:
                 self._tracker_frame(1)
-            chain.apply(present, rem, out)
+            chain.apply(present, rem, out, moving=moving)
             trips |= out.trips
             clamped |= out.clamped_mask
             if k == 2:
@@ -616,7 +621,7 @@ class BatchedGoalEnv:
         }
         final_obs, final_priv, final_ach = self._obs.clone(), self._priv.clone(), self._achieved.clone()
         desired = self.goal.clone()
-        self._n_trips += torch.stack([((trips & int(c)) != 0).sum() for c in (TripCause.NAN, TripCause.RANGE, TripCause.BOX_PRESENT)])
+        self._n_trips += torch.stack([((trips & int(c)) != 0).sum() for _, c in _TRIP_STATS])
         if vis is not None:
             self._n_visible += vis.sum()
         self._steps += 1
@@ -645,7 +650,7 @@ class BatchedGoalEnv:
         trips = self._n_trips.cpu().tolist()
         out = {f"clamp_active/{k}": v for k, v in self.chain.clamp_active_fraction.items()}
         out["tracker_visible_frac"] = float(self._n_visible) / (steps * self.nworld) if self.tracker else 1.0
-        for name, v in zip(("nan", "range", "box_present"), trips, strict=True):
+        for (name, _), v in zip(_TRIP_STATS, trips, strict=True):
             out[f"trips_per_1000_steps/{name}"] = 1000.0 * v / (steps * self.nworld)
         out["resets"] = float(self._n_resets)
         out["overflow_checks"] = float(self.ws.overflow_checks)

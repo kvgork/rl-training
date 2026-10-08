@@ -271,7 +271,7 @@ class ChainOut:
     trips: torch.Tensor               # int64[N] bitmask of TripCause (NAN, JOINT_LIMIT, TRACKING, BOX, BOX_PRESENT, RANGE)
 ```
 
-Stage order and semantics are those of `safety/pipeline.py` (interpolate → joint limits → velocity → tracking with goal pull-back → box via FK of target: present outside ⇒ BOX_PRESENT trip and target = prev_target; target outside ⇒ revert target and goal to prev_target → range check). Thermal, protection bits and stuck are **not** emulated (decision D-TRIPS). `sim/` may import `safety.types.TripCause` and `safety.fk.KinematicChain` (constants only; recorded in ARCHITECTURE §4 dependency arrows).
+Stage order and semantics are those of `safety/pipeline.py` (interpolate → joint limits → velocity → tracking with goal pull-back → box via FK of target: present outside ⇒ BOX_PRESENT trip and target = prev_target; target outside ⇒ revert target and goal to prev_target → range check). Thermal, protection bits and stuck are **not** emulated (decision D-TRIPS; stuck is emulated since plan §10 2026-10-08). `sim/` may import `safety.types.TripCause` and `safety.fk.KinematicChain` (constants only; recorded in ARCHITECTURE §4 dependency arrows).
 
 ### FS6. Simulated die tracker — `src/so101_rl/sim/sim_tracker.py`
 
@@ -1224,7 +1224,7 @@ execution_shape:
 4. **D-CONFIG:** a `sim_warp:` section in `config/so101.yaml` and `SimWarpConfig` on `So101Config` (F1 extension), with `overflow_policy` having only the value `fail`.
 5. **D-OBS (FS3):** the policy observation adds the **last applied (post-clamp) action** and, for die tasks, the tracker block (last-known xyz, visible flag, age); 21 / 26 dims (+3 goal) superseding F7's 15-D layout; `So101ReachEnv` becomes `So101GoalEnv(task)`. Reward/success definitions live once in `env/tasks.py` for sim and real.
 6. **D-REWARD:** dense reward and the success predicate use the **tracker-reported** die position (held last-known when invisible); success needs the die **visible** in the zone for 2 consecutive steps; the privileged truth goes only to the critic.
-7. **D-TRIPS:** in sim, NAN / RANGE / BOX_PRESENT trips truncate the episode (as on the real arm); THERMAL, STUCK and protection bits are **not** emulated.
+7. **D-TRIPS:** in sim, NAN / RANGE / BOX_PRESENT trips truncate the episode (as on the real arm); THERMAL, STUCK and protection bits are **not** emulated. *Changed 2026-10-08 (plan §10 "STUCK emulated in batched sim"): STUCK is emulated and truncates too.*
 8. **D-TRAY:** the tray is modelled as static funnel/rim geometry in the scene; resets place the die at rest from the measured start-well distribution (no per-reset drop-and-settle); `tray-check` is the sim twin of H9.
 9. **D-SYSID:** fit `kp, kv, frictionloss, armature, delay_ticks` (delay as an integer grid), hold `damping` and `forcerange` at the MJCF values unless the held-out gate fails; held-out split by time **and** by excitation kind; parameters with CMA-ES spread > 0.5 are declared unidentified and get wide DR ranges; `calib/sim_params.yaml` is a committed, versioned artifact (v0 = MJCF prior shipped now); CPU multiprocessing is the fallback backend.
 10. **D-BACKLASH:** backlash/dead-band is approximated as a per-episode hysteresis band on the commanded actuator target (0–6 ticks), not as a gear model.
