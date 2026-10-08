@@ -25,6 +25,9 @@ MAX_AI_PAUSES = 2  # P7: the AI may pause and resume a sim attempt at most twice
 MAX_WAIT_S = 300
 METRIC_ROWS = 20
 METRIC_COLS = 8
+# the columns an AI needs to judge a fastsac_sim run (train_sim_sac.METRICS_FIELDS has 25); others: the first 8
+KEY_METRIC_COLS = ("env_step", "train_s", "dr_stage", "train_success_rate", "mean_return", "critic_loss",
+                   "eval_success_rate", "eval_wilson_lo")  # fmt: skip
 LAUNCH_GRACE_S = 60.0
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
@@ -273,7 +276,10 @@ class Lab:
             return {"error": "metrics.csv unreadable"}
         if not rows:
             return None
-        header, body = rows[0][:METRIC_COLS], rows[1:]
+        cols = [i for i, c in enumerate(rows[0]) if c in KEY_METRIC_COLS]
+        if len(cols) < len(KEY_METRIC_COLS):
+            cols = list(range(min(len(rows[0]), METRIC_COLS)))
+        header, body = [rows[0][i] for i in cols], rows[1:]
         stride = max(1, math.ceil(len(body) / METRIC_ROWS))
         picked = body[::stride]
         if body and picked[-1] is not body[-1]:
@@ -287,7 +293,7 @@ class Lab:
             return v if math.isfinite(v) else None
 
         return {"columns": header, "n_rows": len(body), "stride": stride,
-                "rows": [[f(x) for x in r[:METRIC_COLS]] for r in picked]}
+                "rows": [[f(r[i]) if i < len(r) else None for i in cols] for r in picked]}
 
     def _latest_eval(self, run_id: str) -> dict[str, Any] | None:
         best = None

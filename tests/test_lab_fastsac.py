@@ -86,6 +86,17 @@ def test_fastsac_job_completes_with_metrics_heartbeat_and_checkpoint(toy, tmp_pa
     assert runs.read_usage(d)["gpu_h"] > 0
 
 
+def test_get_run_shows_the_key_fastsac_metric_columns(toy, tmp_path):
+    from so101_rl.lab.api import KEY_METRIC_COLS
+
+    d = _run(tmp_path, TINY)
+    assert Job(d, use_nvml=False).run_segment() == 0
+    m = Lab(tmp_path, Launcher("subprocess", python=[sys.executable])).get_run(d.name)["untrusted"]["metrics"]
+    assert m["columns"] == list(KEY_METRIC_COLS)
+    assert all(len(r) == len(KEY_METRIC_COLS) for r in m["rows"])
+    assert any(r[m["columns"].index("eval_success_rate")] is not None for r in m["rows"])
+
+
 def test_fastsac_stop_request_maps_to_stopped_with_checkpoint(toy, tmp_path):
     d = _run(tmp_path, {**TINY, "max_env_steps": None})
     j = Job(d, use_nvml=False)
@@ -203,6 +214,7 @@ def test_fastsac_reach_probe_through_the_lab_api(tmp_path):
         assert out["status"]["env_step"] == 64 * 100 and out["status"]["has_checkpoint"]
         m = out["untrusted"]["metrics"]
         assert m["columns"][0] == "env_step" and m["n_rows"] >= 3
+        assert "eval_success_rate" in m["columns"] and "critic_loss" in m["columns"]
     finally:
         for d in runs.list_run_dirs(lab.root):
             st = runs.read_status(d)
