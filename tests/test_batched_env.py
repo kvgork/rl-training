@@ -307,9 +307,16 @@ def test_render_worlds(scene, mcfg, mcal):
 
 
 @gpu
-def test_randomizer_hooks_not_yet_available(scene, mcfg, mcal):
-    with pytest.raises(NotImplementedError):
-        _env(scene, mcfg, mcal, n=2, randomizer=object())
+def test_randomizer_must_match_the_env(scene, mcfg, mcal):
+    """The FS8 hooks landed with the MVP (M1, sim/domain_rand.py): a randomizer for another world count or device
+    is refused."""
+    from so101_rl.env.batched_env import model_sim_params
+    from so101_rl.sim.domain_rand import DomainRandomizer
+    from so101_rl.sim.sysid.params import DrRanges
+
+    rnd = DomainRandomizer(model_sim_params(scene[0]), DrRanges(), 3, device="cpu")
+    with pytest.raises(ValueError, match="randomizer"):
+        _env(scene, mcfg, mcal, n=2, randomizer=rnd)
 
 
 def test_dataclass_replace_keeps_reward_validation():
