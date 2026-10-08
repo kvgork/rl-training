@@ -6,6 +6,9 @@ definition: ``plans/sim-track-implementation-plan.md`` "Parity test definition")
   targets, goals, clamped masks, the clamp bits of the trips and the applied deltas are bit-identical.
 * Layer B (``gpu``): both rigs closed loop (CPU float64 MuJoCo vs MuJoCo Warp float32).
 * Layer C (``gpu``): grasp contact parity (close the gripper on the die, lift, hold).
+* STUCK (plan §10 2026-10-08): a wall press that trips the CPU servo's stuck-action monitor; the recorded stream
+  (present + Moving flags) trips the chain on the same tick (CPU), the batched env closed loop within +-1 policy
+  step (``gpu``). Layer A also feeds the recorded Moving flags, so its trip comparison includes STUCK.
 
 Every layer has a "shown to fail" twin. Layer B/C live further down this file.
 
@@ -41,7 +44,7 @@ from so101_rl.servo.core import build_servo_core
 from so101_rl.servo.heartbeat import FakeHeartbeatLink, FakeMcu
 from so101_rl.servo.shm import CmdMode, LocalIpc, new_cmd, new_state
 from so101_rl.servo.timing import FakeClock
-from so101_rl.sim.batched_servo import CHAIN_TRIP_BITS, BatchedServoChain, ChainOut
+from so101_rl.sim.batched_servo import CHAIN_TRIP_BITS, STUCK_REPEAT_TICKS, BatchedServoChain, ChainOut
 from so101_rl.sim.model import jaw_collision_geom_ids, load_model
 from so101_rl.sim.mujoco_bus import MujocoBus
 
@@ -185,6 +188,7 @@ class CpuRun:
     qpos: np.ndarray  # float64[TICKS, nq] after the tick's physics
     jaw_table: np.ndarray  # int64[TICKS] contacts jaw_col <-> table after the tick's physics
     deltas: np.ndarray  # float32[STEPS, 6] what the chains get (NaN rows kept)
+    moving: np.ndarray  # uint8[TICKS, 6] the Moving flags read with ``present`` (MujocoBus: |qvel| > 1e-3 rad/s)
 
 
 class CpuRig:
@@ -263,6 +267,7 @@ class CpuRig:
             qpos=np.zeros((n, self.model.nq)),
             jaw_table=np.zeros(n, np.int64),
             deltas=deltas,
+            moving=np.zeros((n, 6), np.uint8),
         )
         other = self.die_geom if die_contacts else self.table
         for i, dl in enumerate(deltas):
@@ -276,6 +281,7 @@ class CpuRig:
                 self.ipc.read_state(self.st)
                 s = self.st[0]
                 r.present[t] = s["present_ticks"]
+                r.moving[t] = s["moving"]
                 r.target[t] = s["target_ticks"]
                 r.goal[t] = s["goal_ticks"]
                 r.applied[t] = s["applied_delta_ticks"]
@@ -313,7 +319,7 @@ class NpChain:
         self.pipe = SafetyPipeline(cfg, So101FK(chain, cal), ThermalMonitor(cfg.thermal, clock), StuckActionMonitor())
         self.block = BlockRead()
         self.block.temperature_c[...] = 35
-        self.block.moving[...] = 1  # STUCK is not emulated (D-TRIPS); keep it out of the reference
+        self.block.moving[...] = 1  # overwritten per tick by ``tick(..., moving)`` (STUCK emulated, 2026-10-08)
         self.block.ok = True
         self.block.position[...] = present0
         self.v = Verdict()
@@ -322,9 +328,10 @@ class NpChain:
     def command(self, delta: np.ndarray) -> None:
         self.pipe.new_command(np.asarray(delta, np.float32), self.v)
 
-    def tick(self, present: np.ndarray, rem: int) -> Verdict:
+    def tick(self, present: np.ndarray, rem: int, moving: np.ndarray) -> Verdict:
         self.clock.advance(33_333_333)
         self.block.position[...] = present
+        self.block.moving[...] = moving
         return self.pipe.apply(self.block, rem, self.v)
 
 
@@ -348,10 +355,12 @@ def layer_a(cfg, cal, chain, run: CpuRun, *, nworld: int, world: int, vmax_offse
         bc.new_command(torch.as_tensor(d))
         for k, rem in enumerate((3, 2, 1)):
             t = 3 * i + k
-            v = ref.tick(run.present[t], rem)
+            v = ref.tick(run.present[t], rem, run.moving[t])
             p = np.tile(other_p[t], (nworld, 1))
             p[world] = run.present[t]
-            bc.apply(torch.as_tensor(p), rem, out)
+            mv = np.ones((nworld, N_JOINTS), np.uint8)  # the other worlds move (their streams are random walks)
+            mv[world] = run.moving[t]
+            bc.apply(torch.as_tensor(p), rem, out, moving=torch.as_tensor(mv))
             w = world
             counts["ticks"] += 1
             counts["target"] += int(not np.array_equal(v.target_ticks, out.target_ticks[w].numpy()))
@@ -772,3 +781,140 @@ def test_layer_c_shown_to_fail_die_mass(mcfg, mcal):
     r = _layer_c(mcfg, mcal, cpu_die_mass_scale=10.0)
     print(f"Layer C, CPU die x10: {r}")
     assert not _layer_c_pass(r)
+
+
+# ------------------------------------------------------------------------------------------------ STUCK
+# Plan §10 2026-10-08 "STUCK emulated in batched sim": the M7 CPU-servo zero-shot run found the reach policy pressing
+# the tip into the box's y wall (seed 7 goal #32) until the servo's stuck-action monitor tripped. Scenario: approach
+# (0.254, -0.20, 0.032) on an ideal plant, then hold ONE saturated action that pushes the tip through y = -0.22.
+STUCK_APPROACH, STUCK_HOLD = 40, 60
+
+
+def _wall_press_actions(cfg, cal, chain) -> np.ndarray:
+    """float32[STUCK_APPROACH + STUCK_HOLD, 6]: Jacobian approach to the wall, then one constant action (the policy's
+    saturated output) pressing -y. Open loop, planned once on an ideal kinematic plant (present = target)."""
+    bc = BatchedServoChain(cfg, cal, chain, 1, device=CPU)
+    out = ChainOut.empty(1, CPU)
+    present = torch.as_tensor(np.asarray(cfg.safe_state.home_ticks, np.int64))[None]
+    bc.resync(present)
+    md = np.asarray(cfg.action.max_delta_ticks, np.float64)
+    xyz = torch.zeros(1, 3, dtype=torch.float64)
+    acts = np.zeros((STUCK_APPROACH + STUCK_HOLD, N_JOINTS), np.float32)
+    a = np.zeros(N_JOINTS)
+    for i in range(len(acts)):
+        if i <= STUCK_APPROACH:
+            g = bc.goal.clone()
+            x0 = bc.fk_tip(g, xyz).clone()[0].numpy()
+            J = np.zeros((3, 4))
+            for k in range(4):
+                gp = g.clone()
+                gp[0, k] += 10
+                J[:, k] = (bc.fk_tip(gp, xyz)[0].numpy() - x0) / 10
+            want = np.array([0.254, -0.20, 0.032]) - x0 if i < STUCK_APPROACH else np.array([0.0, -0.02, 0.0])
+            dq = np.linalg.lstsq(J, np.clip(want, -0.015, 0.015), rcond=None)[0]
+            a = np.zeros(N_JOINTS)
+            a[:4] = dq / md[:4]
+            a /= max(1.0, float(np.abs(a).max()))
+            if i == STUCK_APPROACH:
+                a /= float(np.abs(a).max())  # saturated, like a tanh policy pressing on
+        acts[i] = np.clip(a, -1.0, 1.0)
+        bc.new_command(torch.as_tensor(np.rint(acts[i] * md.astype(np.float32)))[None])
+        for rem in (3, 2, 1):
+            bc.apply(present, rem, out)
+            present = out.target_ticks.clone()
+    return acts
+
+
+_STUCK_RUN: list[CpuRun] = []
+
+
+def stuck_cpu_run(cfg, cal, chain) -> CpuRun:
+    """The wall press on a FRESH CPU rig (a STUCK trip ends RUN for good: FRESH_PROCESS), cached."""
+    if not _STUCK_RUN:
+        rig = CpuRig(cfg, cal)
+        rig.reset("home")
+        _STUCK_RUN.append(rig.run(_wall_press_actions(cfg, cal, chain)))
+    return _STUCK_RUN[0]
+
+
+def _first(trips: np.ndarray, cause: TripCause) -> int:
+    hit = (np.asarray(trips) & int(cause)) != 0
+    return int(np.argmax(hit)) if hit.any() else -1
+
+
+def test_stuck_cpu_servo_trips_on_the_wall_press(mcfg, mcal, kchain):
+    """Harness: the real servo path (ServoCore + StuckActionMonitor + MujocoBus) trips STUCK on this scenario, after
+    the box clamp held the tip at the wall, and only after STUCK_REPEAT_TICKS ticks of the held action."""
+    run = stuck_cpu_run(mcfg, mcal, kchain)
+    t_stuck, t_box = _first(run.trips, TripCause.STUCK), _first(run.trips, TripCause.BOX)
+    assert t_box >= 0 and t_stuck > t_box, (t_box, t_stuck)
+    assert t_stuck >= 3 * STUCK_APPROACH + STUCK_REPEAT_TICKS - 1
+    assert run.in_run[t_stuck - 1] and not run.in_run[t_stuck + 1]  # the trip ended RUN
+    assert not run.moving[t_stuck - STUCK_REPEAT_TICKS + 1 : t_stuck + 1].any()
+
+
+def test_stuck_layer_a_same_tick(mcfg, mcal, kchain):
+    """The recorded present / Moving stream fed to a fresh SafetyPipeline and to BatchedServoChain (N=4, world 2):
+    the chain trips STUCK on exactly the tick the CPU servo did; targets / trips agree up to it."""
+    run = stuck_cpu_run(mcfg, mcal, kchain)
+    t_cpu = _first(run.trips, TripCause.STUCK)
+    ref = NpChain(mcfg, mcal, kchain, run.present[0])
+    bc = BatchedServoChain(mcfg, mcal, kchain, 4, device=CPU)
+    out = ChainOut.empty(4, CPU)
+    bc.resync(torch.as_tensor(np.tile(run.present[0], (4, 1))))
+    ref_trips, chain_trips = [], []
+    for i, dl in enumerate(run.deltas):
+        ref.command(dl)
+        bc.new_command(torch.as_tensor(np.tile(dl, (4, 1))))
+        for k, rem in enumerate((3, 2, 1)):
+            t = 3 * i + k
+            if t > t_cpu:
+                break
+            v = ref.tick(run.present[t], rem, run.moving[t])
+            mv = np.ones((4, N_JOINTS), np.uint8)
+            mv[2] = run.moving[t]
+            bc.apply(torch.as_tensor(np.tile(run.present[t], (4, 1))), rem, out, moving=torch.as_tensor(mv))
+            assert np.array_equal(v.target_ticks, out.target_ticks[2].numpy()), f"tick {t}"
+            ref_trips.append(int(v.trips) & CHAIN_TRIP_BITS)
+            chain_trips.append(int(out.trips[2]))
+            assert not int(out.trips[0]) & TripCause.STUCK  # the moving worlds never trip
+    assert ref_trips == chain_trips
+    assert _first(np.array(chain_trips), TripCause.STUCK) == t_cpu
+
+
+def test_stuck_shown_to_fail_with_moving_always_set(mcfg, mcal, kchain):
+    """The emulation needs the Moving flags: fed ``moving = 1`` (the pre-2026-10-08 Layer A reference) the chain never
+    trips on the same stream, so the same-tick result above is not vacuous."""
+    run = stuck_cpu_run(mcfg, mcal, kchain)
+    bc = BatchedServoChain(mcfg, mcal, kchain, 1, device=CPU)
+    out = ChainOut.empty(1, CPU)
+    bc.resync(torch.as_tensor(run.present[:1]))
+    seen = 0
+    for i, dl in enumerate(run.deltas):
+        bc.new_command(torch.as_tensor(dl[None]))
+        for k, rem in enumerate((3, 2, 1)):
+            bc.apply(torch.as_tensor(run.present[3 * i + k][None]), rem, out, moving=torch.ones(1, N_JOINTS))
+            seen |= int(out.trips[0])
+    assert not seen & TripCause.STUCK
+
+
+@gpu
+def test_stuck_layer_b_same_policy_step(mcfg, mcal, kchain):
+    """Closed loop: the batched env (MuJoCo Warp, moving from qvel) truncates on STUCK within +-1 policy step of the
+    CPU servo's STUCK tick, and counts it in its trip stats."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    run = stuck_cpu_run(mcfg, mcal, kchain)
+    step_cpu = _first(run.trips, TripCause.STUCK) // 3
+    env = _parity_env(mcfg, mcal)
+    try:
+        r = _run_batched(env, _wall_press_actions(mcfg, mcal, kchain))
+        stats = env.stats
+    finally:
+        env.close()
+    step_gpu = _first(r["step_trips"], TripCause.STUCK)
+    print(f"STUCK: CPU servo step {step_cpu}, batched env step {step_gpu}")
+    assert step_gpu >= 0, "the batched env never tripped STUCK"
+    assert abs(step_gpu - step_cpu) <= 1
+    assert len(r["step_trips"]) == step_gpu + 1  # _run_batched stops at the first truncation: STUCK truncated
+    assert stats["trips_per_1000_steps/stuck"] > 0

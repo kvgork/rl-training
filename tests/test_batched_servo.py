@@ -16,7 +16,14 @@ from so101_rl.safety.thermal import ThermalMonitor
 from so101_rl.safety.types import TripCause, Verdict
 from so101_rl.servo.bus import BlockRead
 from so101_rl.servo.timing import FakeClock
-from so101_rl.sim.batched_servo import CHAIN_TRIP_BITS, STAGES, BatchedServoChain, ChainOut
+from so101_rl.sim.batched_servo import (
+    CHAIN_TRIP_BITS,
+    STAGES,
+    STUCK_EPSILON_TICKS,
+    STUCK_REPEAT_TICKS,
+    BatchedServoChain,
+    ChainOut,
+)
 
 T = TripCause
 CPU = torch.device("cpu")
@@ -51,7 +58,7 @@ class NpRef:
         self.pipe = SafetyPipeline(cfg, self.fk, ThermalMonitor(cfg.thermal, clock), StuckActionMonitor())
         self.block = BlockRead()
         self.block.temperature_c[...] = 35
-        self.block.moving[...] = 1  # never STUCK (not emulated by the batched chain, D-TRIPS)
+        self.block.moving[...] = 1  # no STUCK unless a test feeds its own moving stream (the chain needs ``moving``)
         self.block.ok = True
         self.block.position[...] = pose
         self.v = Verdict()
@@ -278,3 +285,81 @@ def test_random_streams_bit_identical_to_pipeline(cfg, calibration, chain, kind,
     assert stages_seen  # the stream exercised at least one clamp
     if kind == "gfloor":
         assert point_only > 0, "the stream never put the lowest gripper point below its floor with the tip in the box"
+
+
+# ---- stuck-action monitor (plan §10 2026-10-08 "STUCK emulated in batched sim") ------------------------------------
+def test_stuck_constants_match_the_servo_monitor():
+    """The chain copies the monitor's defaults (sim/ may not import them, D-DEPS); the servo builds it with them."""
+    m = StuckActionMonitor()
+    assert (m.repeat_ticks, m.epsilon_ticks) == (STUCK_REPEAT_TICKS, STUCK_EPSILON_TICKS)
+
+
+def _stuck_stream(rng, steps: int):
+    """Per policy step a delta and per tick a moving row: long runs of one repeated delta (some zero, some sub-tick
+    small that rounds to zero, some differing by one tick in one joint only), short motion blips, NaN rows and
+    resyncs, so the count crosses STUCK_REPEAT_TICKS several times and every reset rule fires."""
+    deltas = np.zeros((steps, N_JOINTS), np.float32)
+    moving = np.zeros((steps * 3, N_JOINTS), np.int32)
+    resync = np.zeros(steps, bool)
+    i = 0
+    cur = rng.integers(-60, 61, size=N_JOINTS).astype(np.float32)
+    while i < steps:
+        run = int(rng.integers(5, 60))
+        kind = rng.choice(["same", "zero", "small", "one_tick"], p=[0.6, 0.1, 0.1, 0.2])
+        if kind == "zero":
+            cur = np.zeros(N_JOINTS, np.float32)
+        elif kind == "small":
+            cur = rng.uniform(-0.49, 0.49, size=N_JOINTS).astype(np.float32)
+        elif kind == "one_tick":
+            cur = np.rint(cur)
+            cur[rng.integers(0, N_JOINTS)] += rng.choice([-1.0, 1.0])
+        else:
+            cur = rng.uniform(-60, 60, size=N_JOINTS).astype(np.float32)
+        deltas[i : i + run] = cur
+        i += run
+    for t in rng.integers(0, steps * 3, size=steps // 50):
+        moving[t, rng.integers(0, N_JOINTS)] = 1
+    deltas[rng.integers(0, steps, size=3), 2] = np.nan
+    resync[rng.integers(1, steps, size=2)] = True
+    return deltas, moving, resync
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_stuck_bit_identical_to_pipeline(cfg, calibration, chain, seed):
+    """SafetyPipeline + StuckActionMonitor vs the chain on the same command / moving stream (present held still):
+    every tick's trips (STUCK included) and the monitor count agree; world 1 gets a different stream (no leak)."""
+    rng = np.random.default_rng(77 + seed)
+    steps = 400
+    deltas, moving, resync = _stuck_stream(rng, steps)
+    ref = NpRef(cfg, calibration, chain, POSE)
+    bc, out = _batched(cfg, calibration, chain, 2)
+    pose2 = torch.as_tensor(np.tile(POSE, (2, 1)))
+    stuck_ticks = 0
+    for i in range(steps):
+        if resync[i]:
+            ref.pipe.resync(ref.block.position)
+            bc.resync(pose2, torch.tensor([True, False]))
+        ref.command(deltas[i])
+        bc.new_command(torch.as_tensor(np.stack([deltas[i], np.full(N_JOINTS, 30.0, np.float32)])))
+        for k, rem in enumerate((3, 2, 1)):
+            t = 3 * i + k
+            ref.block.moving[...] = moving[t]
+            v = ref.tick(POSE, rem)
+            mv = torch.as_tensor(np.stack([moving[t], np.zeros(N_JOINTS, np.int32)]))
+            bc.apply(pose2, rem, out, moving=mv)
+            bad = _same(v, out, 0)
+            assert not bad, f"step {i} tick {k}: {bad}"
+            assert ref.pipe._stuck.count == int(bc.stuck_count[0]), f"step {i} tick {k}: stuck count"
+            stuck_ticks += bool(int(v.trips) & T.STUCK)
+    assert stuck_ticks > 0, "the stream never tripped STUCK (vacuous)"
+    assert int(bc.stuck_count[1]) > STUCK_REPEAT_TICKS  # world 1: one constant delta, never moving
+
+
+def test_stuck_skipped_without_moving(cfg, calibration, chain):
+    """Without ``moving`` the stage does not run (callers that model no Moving flag)."""
+    bc, out = _batched(cfg, calibration, chain, 1)
+    for _ in range(STUCK_REPEAT_TICKS):
+        bc.new_command(torch.full((1, N_JOINTS), 5.0))
+        for rem in (3, 2, 1):
+            bc.apply(torch.as_tensor(POSE[None]), rem, out)
+            assert not int(out.trips[0]) & T.STUCK
