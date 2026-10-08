@@ -75,7 +75,7 @@ class RealtimeSimClock(RealClock):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="so101-servo", description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="so101-servo", description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("--backend", choices=("feetech", "fake", "mujoco"), required=True)
     ap.add_argument("--config", type=Path, default=None, help="so101.yaml (default: the packaged one)")
     ap.add_argument("--calibration", type=Path, default=None, help="LeRobot calibration JSON (default: from config)")

@@ -379,9 +379,15 @@ session. It does not go through the lab connector.
      runs/deploy/ticks-<ts>.bin --summary runs/deploy/servo-<ts>.json`. Do not press the reset button yet.
   2. Terminal 2: `pixi run -e cpu deploy-policy --policy runs/lab/<eval run>/policy.pt --protocol zero-shot --seed 7
      --attended`. Wait (~7 s) for "waiting for the servo to reach RUN".
-  3. Press the MCU reset button. The ladder runs 10 episodes at speed 0.5, 10 at 0.75, then 50 at 1.0.
-  4. On a trip the ladder stops (exit 1): restart the servo (step 1) and rerun step 2 with `--rung-episodes` set to
-     the episodes still to run.
+  3. Press the MCU reset button. The ladder runs 10 episodes at speed 0.5, 10 at 0.75, then 50 at 1.0. It climbs a
+     rung only if the finished rung had no trip and at least 8 of 10 successes; otherwise it stops (exit 1,
+     `halt_reason: rung_below_threshold` in `summary.json`): that is a result, not a fault.
+  4. On a trip or stall the ladder stops (exit 1): restart the servo (step 1, new tick-log name) and rerun step 2 as
+     `pixi run -e cpu deploy-policy --resume runs/deploy/<ts> --attended` (the run dir printed by the first run). It
+     keeps the finished episodes and continues the same goal list at the next episode; do not change `--policy`,
+     `--seed`, `--protocol` or `--rung-episodes` (refused). A trip in the 0.5 or 0.75 rung still counts in that
+     rung's advance check, so after the resume that rung is finished and the ladder stops there; a trip in the
+     full-speed rung is resumed to the end. A real servo started with `--no-mcu` is refused.
   5. When done, Ctrl-C the servo (normal shutdown to rest).
 - **Artifact:** `runs/deploy/<ts>/{episodes.jsonl, summary.json}` and the servo tick log.
 - **Pass:** exit 0, and `summary.json` `verdict.finetune_eligible` true (Wilson 95 % lower bound >= 0.60 with n >= 50
