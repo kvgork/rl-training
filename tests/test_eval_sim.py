@@ -84,3 +84,47 @@ def test_refuses_other_tasks_and_bad_files(toy_ckpt, tmp_path):
         eval_sim.load_checkpoint(bad)
     with pytest.raises(ValueError):
         eval_sim.load_checkpoint(Path(__file__))
+
+
+def test_render_env_freezes_return_and_flags_after_end():
+    """_RenderEnv: no auto-reset, return/flags constant once a world has ended (video overlay = episode return)."""
+    import types
+
+    import torch
+
+    from so101_rl.rl.eval_sim import _RenderEnv
+
+    class E:
+        nworld, device, dr_stage = 2, "cpu", 0
+        task = types.SimpleNamespace(success_radius_m=0.015)
+        goal = torch.zeros(2, 3)
+
+        def __init__(self):
+            self.t = 0
+            self.resets = 0
+
+        def reset(self, *a, **k):
+            self.resets += 1
+            return (torch.zeros(2, 4),)
+
+        def step(self, action):
+            self.t += 1
+            self.reset(torch.ones(2, dtype=torch.bool))  # the real env auto-resets inside step
+            return types.SimpleNamespace(
+                reward=torch.full((2,), -1.0), obs=torch.zeros(2, 4),
+                terminated=torch.tensor([self.t >= 3, False]), truncated=torch.tensor([False, self.t >= 5]),
+            )
+
+    e = E()
+    r = _RenderEnv(e)
+    r.reset()
+    base = e.resets
+    rets = []
+    for _ in range(6):
+        r.step(torch.zeros(2, 1))
+        rets.append(r._ret.clone())
+    assert e.resets == base  # suppressed during step
+    assert "reset" not in e.__dict__
+    assert [float(x[0]) for x in rets] == [-1, -2, -3, -3, -3, -3]  # constant after success
+    assert [float(x[1]) for x in rets] == [-1, -2, -3, -4, -5, -5]  # constant after timeout
+    assert bool(r._succ[0]) and not bool(r._succ[1]) and bool(r._trunc[1]) and not bool(r._trunc[0])

@@ -235,23 +235,36 @@ def _sha256(path: Path) -> str:
 
 
 class _RenderEnv:
-    """``viz.video.RolloutEnv`` over a small batched env: the policy input is FS3 obs + goal."""
+    """``viz.video.RolloutEnv`` over a small batched env: the policy input is FS3 obs + goal.
+
+    Render semantics: one episode per world, no auto-reset. The wrapped env auto-resets a world the step its episode
+    ends (new pose, new goal), which would lose the terminal frame; reset is suppressed during ``step`` and the
+    return / flags stop updating once a world has ended, so the overlay return is the episode return.
+    """
 
     def __init__(self, env: Any) -> None:
         self.env, self.nworld = env, env.nworld
         self._ret = torch.zeros(env.nworld, device=env.device)
         self._succ = torch.zeros(env.nworld, dtype=torch.bool, device=env.device)
+        self._trunc = torch.zeros(env.nworld, dtype=torch.bool, device=env.device)
 
     def reset(self) -> torch.Tensor:
         obs = self.env.reset(phase_randomise=False)[0]
         self._ret.zero_()
         self._succ.zero_()
+        self._trunc.zero_()
         return policy_input(self.env, obs)
 
     def step(self, action: torch.Tensor) -> torch.Tensor:
-        st = self.env.step(action)
-        self._ret += st.reward.float()
-        self._succ |= st.terminated
+        self.env.reset = lambda *a, **k: None  # type: ignore[method-assign]  # instance attr shadows the method
+        try:
+            st = self.env.step(action)
+        finally:
+            self.env.__dict__.pop("reset", None)
+        live = ~(self._succ | self._trunc)
+        self._ret += torch.where(live, st.reward.float(), torch.zeros_like(self._ret))
+        self._succ |= live & st.terminated
+        self._trunc |= live & st.truncated & ~st.terminated
         return policy_input(self.env, st.obs)
 
     def qpos(self, worlds: Sequence[int]) -> np.ndarray:
@@ -261,7 +274,11 @@ class _RenderEnv:
         from so101_rl.viz.video import RolloutStatus
 
         w = list(worlds)
-        return RolloutStatus(self._succ[w].cpu().numpy(), self._ret[w].cpu().numpy(), self.env.dr_stage)
+        return RolloutStatus(
+            self._succ[w].cpu().numpy(), self._ret[w].cpu().numpy(), self.env.dr_stage,
+            terminated=self._succ[w].cpu().numpy(), truncated=self._trunc[w].cpu().numpy(),
+            goal=self.env.goal[w].detach().cpu().double().numpy(), success_radius=float(self.env.task.success_radius_m),
+        )  # fmt: skip
 
 
 CHECKLIST: Final[str] = """# Reach exit gate: human review checklist
@@ -347,6 +364,16 @@ def _render(d: dict, actor: Any, task: str, k: int, stage: int, run_cfg: dict, o
     return res.paths, d435_camera_pose()[1]
 
 
+def rerender(ckpt: Path, task: str, *, dr_stage: int, render: int, out_dir: Path) -> list[Path]:
+    """Re-render the gate-review videos of an already evaluated ``ckpt`` (same seeds / worlds as ``evaluate``) into
+    ``out_dir/renders``, WITHOUT a new evaluation: no ``eval.json`` is written or touched."""
+    d = load_checkpoint(Path(ckpt))
+    if d["task"] != task:
+        raise ValueError(f"checkpoint task {d['task']!r} != {task!r}")
+    actor = actor_from_checkpoint(d, "cpu")
+    return _render(d, actor, task, int(render), int(dr_stage), d.get("config", {}), Path(out_dir))[0]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="eval-sim", description="Sim evaluation + numeric reach exit gate")
     ap.add_argument("--ckpt", type=Path, required=True)
@@ -355,9 +382,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dr-stage", type=int, default=GATE_FINAL_STAGE)
     ap.add_argument("--render", type=int, default=0, help="number of rollout videos (renders/*.mp4)")
     ap.add_argument("--out", type=Path, default=None, help="default runs/eval-sim/<task>-<timestamp>/")
+    ap.add_argument("--render-only", action="store_true", help="only (re-)render --render videos of --ckpt into --out/renders")
     ap.add_argument("--gate", action="store_true", help="exit 1 unless the numeric exit gate passes")
     a = ap.parse_args(argv)
     out = a.out or Path("runs/eval-sim") / f"{a.task}-{time.strftime('%Y%m%d-%H%M%S')}"
+    if a.render_only:
+        paths = rerender(a.ckpt, a.task, dr_stage=a.dr_stage, render=a.render, out_dir=out)
+        print(f"rendered {len(paths)} videos -> {out / 'renders'}")
+        return 0
     res = evaluate(a.ckpt, a.task, episodes=a.episodes, dr_stage=a.dr_stage, out_dir=out, render=a.render)
     if not res.eval_json.exists():
         print(f"eval-sim: {res.eval_json} missing", file=sys.stderr)
