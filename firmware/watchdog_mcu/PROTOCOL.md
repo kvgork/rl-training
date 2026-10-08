@@ -16,6 +16,11 @@ The command bytes, the heartbeat frame and the status byte layout are unchanged.
 (`WELD`) exists, ARM additionally requires a dead servo-side bus, `0xE1` is answered with the status byte alone
 unless it is accepted, and `drop_ms` is measured on the servo-side divider.
 
+FW1 (arm timeout) is again semantic only: DISARMED no longer lasts forever. 120 000 ms after entering DISARMED
+without an accepted ARM the MCU latches with the new trip reason `8` (`ARM_TIMEOUT`, status `0x82`). A host that
+ARMs within a tick of seeing DISARMED (the servo does) never meets it; a host that decodes the reason nibble must
+accept `8`.
+
 ## Host -> MCU
 
 | Byte | Meaning | Payload |
@@ -39,7 +44,8 @@ bit0 relay_on   bit1 latched   bit2 armed   bit3 undervolt   bits4-7 trip_reason
 
 `relay_on` and `armed` are always equal (the relay is energised only in ARMED). `undervolt` follows the live
 **PSU-side** V_bus (below 9.0 V), it is not latched. `trip_reason`: `0` NONE, `1` TIMEOUT, `2` UNDERVOLT,
-`3` SEQ_ERROR, `4` ESTOP_PIN, `5` TEST, `6` MCU_RESET, `7` WELD (new).
+`3` SEQ_ERROR, `4` ESTOP_PIN, `5` TEST, `6` MCU_RESET, `7` WELD, `8` ARM_TIMEOUT (FW1). The nibble can carry up
+to 15; a host must decode an unknown value without failing (`McuStatus.reason_name` gives `UNKNOWN_<n>`).
 
 After an **accepted** `0xE1` (the status byte shows LATCHED, reason 5) the MCU later sends `drop_ms` as one uint16
 little-endian, when the servo-side V_bus falls below 1 V. If it has not fallen after 2000 ms the value is 2000 (the
@@ -49,7 +55,9 @@ link, no 2 s wait). A host should also check ARMED with `0xE0` first, so a refus
 
 Example status bytes: `0x62` boot (LATCHED, reason MCU_RESET); `0x60` after the button cleared the boot latch
 (DISARMED, reason kept); `0x05` ARMED; `0x12` LATCHED after timeout; `0x42` LATCHED by e-stop; `0x2A` LATCHED by
-undervolt while the PSU side is still low; `0x72` LATCHED by relay weld.
+undervolt while the PSU side is still low; `0x72` LATCHED by relay weld; `0x82` LATCHED by the arm timeout
+(DISARMED for 120 s without ARM); `0x80` DISARMED again after a press that cleared the arm-timeout latch (reason
+kept).
 
 ## Voltage sensing: two dividers (B4)
 
@@ -75,6 +83,7 @@ only use the PSU side (a single servo-side divider would refuse ARM forever).
 | ARMED | PSU-side V_bus < 9.0 V continuously for > 50 ms | LATCHED, reason 2 |
 | ARMED | e-stop input asserted | LATCHED, reason 4 |
 | ARMED | `0xE1` with TEST jumper | LATCHED, reason 5, `drop_ms` measurement starts |
+| DISARMED | >= 120 000 ms since entering DISARMED without an accepted ARM (wrap-safe `ticks_diff`) | LATCHED, reason 8 (ARM_TIMEOUT) |
 | DISARMED / LATCHED | servo-side V_bus >= 1 V continuously for >= 500 ms while the relay is commanded open | LATCHED, reason 7 (WELD) |
 | any | MCU reset (power, hardware WDT, USB re-enumeration that resets the board) | **LATCHED**, reason 6 |
 
@@ -95,6 +104,15 @@ Details that the vectors pin down:
   500 ms and `drop_ms` is still reported as 2000.
 - **Partial frames:** a frame head (`0xA5` without its 2 payload bytes) is dropped if no further byte arrives within
   100 ms; the remaining bytes are then ordinary line noise.
+- **Arm timeout (FW1): a press means "arm within 2 minutes".** The window starts when the 500 ms hold completes
+  (the poll that enters DISARMED) and is tested with `>=` (119 999 ms DISARMED, 120 000 ms LATCHED reason 8). It is
+  evaluated in `poll` right after the ARMED trip rows (like the heartbeat timeout: before the button rows and the
+  weld check) and before any frame of the same loop iteration, so an ARM at exactly 120 000 ms is refused (judged
+  at the loop tick in which its byte is drained, as for every serial frame). Only an accepted ARM leaves DISARMED; serial traffic
+  (STATUS, heartbeats, noise, a refused ARM) never moves the window, and pressing the button while DISARMED does not
+  restart it. A later 500 ms press re-enters DISARMED (`0x80`, reason 8 kept) and restarts the window. A button held
+  through the timeout clears the new latch exactly 500 ms later (the hold starts at the latch tick), which only
+  returns to DISARMED: the relay closes only on ARM. If the servo side is live, WELD (7) still overwrites reason 8.
 - Tick counters wrap at 2**30 on the RP2040 (MicroPython `ticks_ms`); `ticks_diff` handles it (`wrap_bits: 30`
   vector).
 
@@ -110,3 +128,5 @@ Details that the vectors pin down:
    broken wire* reads HIGH = asserted.
 7. Lost USB link, host crash, `kill -9` of the servo process and host reboot all stop the heartbeats, so they all
    end in TIMEOUT within about 1 s.
+8. DISARMED is bounded: a press nobody follows with ARM latches again after 120 s (reason 8), so an unattended
+   MCU never sits armable for longer than two minutes after a press.

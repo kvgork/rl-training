@@ -187,9 +187,15 @@ Header (append one row per artifact; the H-track, not the software waves, writes
   9. TEST_DROP: with the TEST jumper fitted and ARMED, `0xE1` -> status `0x52` then `drop_ms` (informational
      here; the e-stop timing is measured in H2 step 5). Without the jumper, or when not ARMED, `0xE1` must be
      answered with a plain status byte and no `drop_ms`.
+  10. Arm timeout (FW1-HW; flash the FW1 `main.py` and replay every vector incl. the FW1 ones in step 4): press the
+      button 500 ms and send no ARM. `0xE0` answers DISARMED with the previous reason kept (`0x80` after an
+      arm-timeout latch, `0x60` after the boot latch) for 120 s, then `0x82` (LATCHED, reason 8 ARM_TIMEOUT); the
+      relay stays open throughout (scope or ADC log; time the latch, 120 +/- 1 s). Press again: `0x80` (DISARMED,
+      reason 8 kept). ARM within 2 min of that press: `0x05`. Pass: latch at 120 +/- 1 s with `0x82` and the
+      relay open throughout; the re-press gives `0x80`; the ARM gives `0x05`.
 - **Artifact:** `runs/hw/deadman-<ts>.json {timeout_s, kill9_s, usb_unplug_s, host_reboot_open, latch_persists,
   serial_reset_rejected, boot_latched, button_required_after_reset, arm_ok_with_relay_open, weld_detected,
-  vectors_passed}`.
+  vectors_passed, arm_timeout_s}` (`arm_timeout_s` from step 10, about 120).
 - **Pass:** timeout 1.0 +/- 0.1 s; kill -9 <= 1.5 s; USB unplug <= 1.5 s; host reboot opens; latch persists;
   serial reset rejected; boots `0x62` and needs the button after every MCU reset; ARM accepted with the relay
   open (divider A); weld injection gives `0x72`; all vectors pass on the real MCU.

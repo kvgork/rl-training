@@ -1,7 +1,8 @@
 # Watchdog MCU (RP2040, MicroPython)
 
 Off-host deadman: a 12 V automotive relay (normally open, 30/40 A) sits in the servo supply feed and is
-energised only while valid heartbeats arrive. See `PROTOCOL.md` for the wire protocol and state machine, and
+energised only while valid heartbeats arrive. A button press means "arm within 2 minutes": 120 s after the
+press without an ARM the MCU latches again (reason 8, `0x82`; FW1). See `PROTOCOL.md` for the wire protocol and state machine, and
 `docs/HARDWARE_CHECKLIST.md` (H2, H3) for the power path and the bring-up procedure.
 
 **Read the safety section of `docs/HARDWARE_CHECKLIST.md` before wiring anything.** Nothing in this repository
@@ -35,6 +36,7 @@ flashes the board for you.
    It runs automatically at every boot.
 3. Reconnect and check the boot status: send `0xE0`, expect `0x62` (LATCHED, reason MCU_RESET). Hold the reset
    button 500 ms: `0xE0` now answers `0x60` (DISARMED, reason kept). Serial ARM before the button must be refused.
+   Without an ARM, `0xE0` answers `0x82` (LATCHED, reason ARM_TIMEOUT) 120 s after the press; press again.
 4. Continue with H3 in `docs/HARDWARE_CHECKLIST.md`; do not connect the servo supply until H3's bench steps pass
    with a **dummy load (lamp or resistor)** on the relay.
 

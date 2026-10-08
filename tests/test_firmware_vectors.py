@@ -97,14 +97,20 @@ def test_vectors_cover_protocol_invariants():
         "test_drop_then_weld",
         "partial_frame_discarded_after_100ms",
         "partial_frame_99ms_completes",
+        "disarmed_119999ms_still_disarmed",
+        "disarmed_120000ms_latches_reason_8",
+        "arm_at_119000ms_accepted",
+        "press_after_arm_timeout_reenters_disarmed_and_restarts_window",
+        "wrap_safe_arm_timeout_30bit",
     ):
         assert required in names
-    # every status byte in every expectation is a legal byte: reason nibble <= 7
+    assert "disarmed_never_times_out" not in names  # FW1: DISARMED now latches reason 8 after 120 s
+    # every status byte in every expectation is a legal byte: reason nibble <= 8 (8 = ARM_TIMEOUT, FW1)
     for v in VECTORS:
         for s in v["steps"]:
             out = bytes.fromhex(s["out"])
             if s.get("tx") and out and "drop" not in v["name"]:
-                assert out[0] >> 4 <= 7
+                assert all(b >> 4 <= 8 for b in out)
 
 
 def clear_boot_latch(core, t0: int) -> int:
@@ -150,7 +156,11 @@ def test_firmware_line_budget():
 
 
 def run_vector_fake(vec: dict) -> list[str]:
-    """Replay a vector through FakeMcu's public API (no private attributes)."""
+    """Replay a vector through FakeMcu's public API (no private attributes).
+
+    Each setter runs FakeMcu's loop body with the step's inputs only partly applied, and ``feed`` re-polls at the
+    same instant: the two models are proven byte-identical on these curated vectors, not on arbitrary input
+    sequences (FW1 review, NIT)."""
     hb = pytest.importorskip("so101_rl.servo.heartbeat")
     from so101_rl.servo.timing import FakeClock
 

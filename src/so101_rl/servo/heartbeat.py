@@ -16,7 +16,9 @@ Firmware invariants modelled by :class:`FakeMcu` (same as ``firmware/watchdog_mc
 at reset and the MCU boots LATCHED (reason MCU_RESET); ARMED -> LATCHED after ``timeout_ms`` (>=) without a valid
 heartbeat, on a bad sequence or complement, on PSU-side bus voltage below threshold for more than 50 ms, or on the
 e-stop input; LATCHED clears only by the physical reset button held 500 ms and lands in DISARMED (reason kept). A
-servo-side bus that stays live 500 ms after the relay is commanded open latches reason WELD.
+servo-side bus that stays live 500 ms after the relay is commanded open latches reason WELD. DISARMED -> LATCHED
+(reason ARM_TIMEOUT) after ``ARM_TIMEOUT_MS`` (>=) from DISARMED entry without an accepted ARM (FW1): a press means
+"arm within 2 minutes"; a later press re-enters DISARMED and restarts the window.
 """
 
 from __future__ import annotations
@@ -42,6 +44,19 @@ REASON_ESTOP_PIN = 4
 REASON_TEST = 5
 REASON_MCU_RESET = 6
 REASON_WELD = 7
+REASON_ARM_TIMEOUT = 8  # FW1: DISARMED for ARM_TIMEOUT_MS without an accepted ARM
+
+REASON_NAMES = {
+    REASON_NONE: "NONE",
+    REASON_TIMEOUT: "TIMEOUT",
+    REASON_UNDERVOLT: "UNDERVOLT",
+    REASON_SEQ_ERROR: "SEQ_ERROR",
+    REASON_ESTOP_PIN: "ESTOP_PIN",
+    REASON_TEST: "TEST",
+    REASON_MCU_RESET: "MCU_RESET",
+    REASON_WELD: "WELD",
+    REASON_ARM_TIMEOUT: "ARM_TIMEOUT",
+}
 
 DISARMED, ARMED, LATCHED = "DISARMED", "ARMED", "LATCHED"
 
@@ -52,6 +67,7 @@ DROP_THRESHOLD_V = 1.0
 DROP_TIMEOUT_MS = 2000
 WELD_MS = 500
 PARTIAL_FRAME_MS = 100
+ARM_TIMEOUT_MS = 120_000  # FW1: measured from DISARMED entry (the button hold completing)
 
 _MS = 1_000_000
 
@@ -66,6 +82,11 @@ class McuStatus(NamedTuple):
     @classmethod
     def from_byte(cls, b: int) -> McuStatus:
         return cls(bool(b & 1), bool(b & 2), bool(b & 4), bool(b & 8), (b >> 4) & 0xF)
+
+    @property
+    def reason_name(self) -> str:
+        """Trip reason as its PROTOCOL.md name; an unknown nibble decodes as ``UNKNOWN_<n>`` (never raises)."""
+        return REASON_NAMES.get(self.reason, f"UNKNOWN_{self.reason}")
 
     def to_byte(self) -> int:
         return (
@@ -154,6 +175,7 @@ class FakeMcu:
             now - 10**15
         )  # when the relay last opened (servo-side decay model): long ago at boot
         self._last_hb_ns = now
+        self._disarmed_since_ns = now  # DISARMED entry (FW1 arm timeout); only read while DISARMED
         self._last_seq: int | None = None
         self._uv_since_ns: int | None = None
         self._rst_since_ns: int | None = None
@@ -167,6 +189,8 @@ class FakeMcu:
     def _set_state(self, state: str, reason: int | None = None) -> None:
         if self.relay_on and state != ARMED:
             self._open_since_ns = self.clock.monotonic_ns()
+        if state == DISARMED:  # every DISARMED entry (_poll, reset_button) restarts the FW1 window
+            self._disarmed_since_ns = self.clock.monotonic_ns()
         self.state = state
         self.armed = state == ARMED
         self.latched = state == LATCHED
@@ -217,13 +241,17 @@ class FakeMcu:
 
         Only a full 500 ms hold clears LATCHED (never while the e-stop is asserted); the trip reason is kept.
         The elapsed time matters: after a trip the servo side needs ``drop_time_ms`` to decay, and ARM is refused
-        until it has (just like the firmware), which a real 500 ms press always outlasts.
+        until it has (just like the firmware), which a real 500 ms press always outlasts. Assumes the button was
+        released before the call and ``hold_ms < ARM_TIMEOUT_MS``: the DISARMED entry (FW1 window start) is put at
+        the 500th ms of the press, as the firmware does; for a button held across a latch use :meth:`set_button`.
         """
         self._poll()
-        self.clock.sleep_until(self.clock.monotonic_ns() + int(hold_ms * _MS))
+        pressed_ns = self.clock.monotonic_ns()
+        self.clock.sleep_until(pressed_ns + int(hold_ms * _MS))
         self._poll()
         if self.state == LATCHED and hold_ms >= RESET_HOLD_MS and not self._estop:
             self._set_state(DISARMED)
+            self._disarmed_since_ns = pressed_ns + RESET_HOLD_MS * _MS  # the firmware enters at the 500th ms
             self._last_seq = None
             self._poll()  # a still-live servo side re-latches WELD once its 500 ms window has run
 
@@ -258,6 +286,8 @@ class FakeMcu:
             self._estop or uv_trip or now - self._last_hb_ns >= self.timeout_ms * _MS
         ):
             self._latch(REASON_ESTOP_PIN if self._estop else REASON_UNDERVOLT if uv_trip else REASON_TIMEOUT)
+        if self.state == DISARMED and now - self._disarmed_since_ns >= ARM_TIMEOUT_MS * _MS:
+            self._latch(REASON_ARM_TIMEOUT)  # FW1: a press means "arm within 2 minutes"
         held = self.state == LATCHED and self._btn and not self._estop
         if not held:
             self._rst_since_ns = None

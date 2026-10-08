@@ -846,3 +846,111 @@ def test_serial_link_young_tail_is_still_completed(skew_link, clock, monkeypatch
     assert link.send(7) is not HbSend.NOT_DELIVERED
     p.pump()
     assert bytes(p.rx) == bytes([0xA5, 7, 0xF8]) and p.mcu._last_seq == 7 and not p.mcu.latched
+
+
+# -- FW1: DISARMED -> LATCHED (reason 8 ARM_TIMEOUT) after 120 s without ARM --------------------------------------
+
+
+def test_fakemcu_disarmed_latches_reason_8_at_120s_and_press_restarts_window(mcu, link, clock):
+    """The window runs from DISARMED entry (the `mcu` fixture's button hold); >= 120 000 ms latches reason 8."""
+    clock.advance((hb.ARM_TIMEOUT_MS - 1) * MS)
+    st = link.status()
+    assert st.to_byte() == 0x60 and not st.latched  # 119 999 ms: still DISARMED, reason MCU_RESET kept
+    clock.advance(1 * MS)
+    st = link.status()
+    assert st.to_byte() == 0x82 and st.reason == hb.REASON_ARM_TIMEOUT and st.reason_name == "ARM_TIMEOUT"
+    assert not mcu.relay_on and not mcu.relay_closed()
+    assert link.arm().armed is False  # serial ARM never clears the latch
+    mcu.reset_button(500)  # a new press re-enters DISARMED and restarts the window
+    assert link.status().to_byte() == 0x80  # DISARMED, reason 8 kept until the next ARM
+    clock.advance((hb.ARM_TIMEOUT_MS - 1) * MS)
+    assert link.status().to_byte() == 0x80
+    clock.advance(1 * MS)
+    assert link.status().to_byte() == 0x82
+
+
+def test_fakemcu_level_button_path_restarts_window(raw_mcu, clock):
+    """DISARMED entry through the level-button path in `_poll` (not `reset_button`) also starts the window."""
+    raw_mcu.set_button(True)
+    clock.advance(500 * MS)
+    raw_mcu.poll()
+    raw_mcu.set_button(False)
+    assert raw_mcu.state == "DISARMED"
+    clock.advance((hb.ARM_TIMEOUT_MS - 1) * MS)
+    raw_mcu.poll()
+    assert raw_mcu.state == "DISARMED"
+    clock.advance(1 * MS)
+    raw_mcu.poll()
+    assert raw_mcu.latched and raw_mcu.reason == hb.REASON_ARM_TIMEOUT
+
+
+def test_reason_name_mapping_includes_8():
+    assert set(hb.REASON_NAMES) == set(range(9))
+    assert hb.REASON_NAMES[hb.REASON_ARM_TIMEOUT] == "ARM_TIMEOUT" and hb.REASON_ARM_TIMEOUT == 8
+    assert hb.ARM_TIMEOUT_MS == 120_000
+    assert McuStatus.from_byte(0x82).reason_name == "ARM_TIMEOUT"
+    assert McuStatus.from_byte(0x80).reason_name == "ARM_TIMEOUT"  # DISARMED after the press, reason kept
+    assert McuStatus.from_byte(0x62).reason_name == "MCU_RESET"
+    assert McuStatus.from_byte(0x72).reason_name == "WELD"
+    assert McuStatus.from_byte(0x05).reason_name == "NONE"
+    assert McuStatus.from_byte(0x92).reason_name == "UNKNOWN_9"  # a newer firmware's nibble never raises
+
+
+def test_fakemcu_arm_at_119s_accepted(mcu, link, clock):
+    clock.advance(119_000 * MS)
+    assert link.arm().armed
+    for seq in range(6):  # well past 120 s from DISARMED entry: ARMED ignores the arm timer
+        clock.advance(500 * MS)
+        assert link.send(seq) is HbSend.ACKED
+    assert mcu.state == "ARMED" and mcu.reason == hb.REASON_NONE and mcu.relay_on
+
+
+def test_fakemcu_serial_traffic_does_not_extend_arm_window(mcu, link, clock):
+    """STATUS, heartbeats, line noise, partial frames and refused ARMs never move the 120 s window."""
+    mcu.set_bus_voltage(8.0)
+    for i in range(11):  # t = 10 s .. 110 s
+        clock.advance(10_000 * MS)
+        assert link.arm().armed is False  # refused: PSU-side undervolt
+        mcu.feed(b"\xa5\x10\xef\x00\x13\xe0\xa5")
+        assert mcu.state == "DISARMED", i
+    mcu.set_bus_voltage(12.0)
+    clock.advance(9_999 * MS)
+    assert link.status().to_byte() == 0x60
+    clock.advance(1 * MS)
+    assert link.arm().to_byte() == 0x82  # the ARM at exactly 120 000 ms is too late
+
+
+def test_fakemcu_button_while_disarmed_does_not_restart_window(mcu, link, clock):
+    """Only an entry into DISARMED (LATCHED + 500 ms hold) restarts the window; pressing while DISARMED does not."""
+    clock.advance(60_000 * MS)
+    mcu.reset_button(600)  # advances the clock by 600 ms
+    assert mcu.state == "DISARMED"
+    clock.advance((hb.ARM_TIMEOUT_MS - 60_600 - 1) * MS)
+    assert link.status().to_byte() == 0x60
+    clock.advance(1 * MS)
+    assert link.status().to_byte() == 0x82
+
+
+def test_fakemcu_power_cycle_boots_latched_not_arm_timeout(mcu, clock):
+    """An MCU reset while DISARMED boots LATCHED reason 6; the old window does not leak into the new boot."""
+    clock.advance(100_000 * MS)
+    mcu.power_cycle()
+    clock.advance(30_000 * MS)
+    mcu.poll()
+    assert mcu.latched and mcu.reason == hb.REASON_MCU_RESET
+    mcu.reset_button(500)
+    clock.advance((hb.ARM_TIMEOUT_MS - 1) * MS)
+    mcu.poll()
+    assert mcu.state == "DISARMED"
+
+
+def test_fakemcu_reset_button_longer_hold_starts_window_at_the_500th_ms(raw_mcu, clock):
+    """FW1 grill: like the firmware, a 600 ms press enters DISARMED at the 500th ms; the window starts there."""
+    raw_mcu.reset_button(600)  # the clock is now 100 ms past the DISARMED entry
+    assert raw_mcu.state == "DISARMED"
+    clock.advance((hb.ARM_TIMEOUT_MS - 100 - 1) * MS)
+    raw_mcu.poll()
+    assert raw_mcu.state == "DISARMED"
+    clock.advance(1 * MS)
+    raw_mcu.poll()
+    assert raw_mcu.latched and raw_mcu.reason == hb.REASON_ARM_TIMEOUT
