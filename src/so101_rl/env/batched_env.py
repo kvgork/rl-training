@@ -71,12 +71,21 @@ from so101_rl.env.tasks import (
     reward_torch,
     success_torch,
 )
+from so101_rl.perception.camera_calib import CameraCalib, load_camera_calib
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.types import TripCause
 from so101_rl.sim.batched_servo import BatchedServoChain, ChainOut
+from so101_rl.sim.d435 import COLOR_CAM
 from so101_rl.sim.gripper_map import gripper_range_rad, gripper_ticks_per_rad
 from so101_rl.sim.model import TABLE_Z_M, jaw_collision_geom_ids, load_model
-from so101_rl.sim.sim_tracker import CameraModel, Occluders, SimDieTracker, TrackerNoise, TrackerOut
+from so101_rl.sim.sim_tracker import (
+    CameraModel,
+    DistractorModel,
+    Occluders,
+    SimDieTracker,
+    TrackerNoise,
+    TrackerOut,
+)
 from so101_rl.sim.warp_model import WarpSim
 
 __all__ = ["TRUNCATING_TRIPS", "BatchedGoalEnv", "BatchedStep", "ModelSimParams", "model_sim_params"]
@@ -168,6 +177,9 @@ class BatchedGoalEnv:
         sim_params: Any,
         randomizer: Any | None = None,
         tracker_noise: TrackerNoise | None = None,
+        camera: CameraCalib | None = None,
+        allow_provisional_camera: bool = False,
+        distractors: DistractorModel | None = None,
         model: mujoco.MjModel | None = None,
         seed: int = 0,
         device: str = "cuda:0",
@@ -175,6 +187,17 @@ class BatchedGoalEnv:
         if randomizer is not None:
             raise NotImplementedError("BatchedGoalEnv: domain-randomisation hooks land with SU3 (FS8, wave 2)")
         self.cfg, self.task, self.nworld = cfg, task, int(nworld)
+        calib: CameraCalib | None = None
+        if task.obs.has_die:
+            calib = camera if camera is not None else load_camera_calib()
+            # a PROVISIONAL camera pose (calib/camera.yaml method: provisional) is a placeholder, not a calibration:
+            # training on it bakes an unmeasured camera into the policy, so refuse (before any GPU allocation)
+            # unless the caller opts in
+            calib.require_pose(calibrated=not allow_provisional_camera)
+        # run identification: camera_pose_method / camera_pose_date / camera_yaml_sha256 (die tasks; {} otherwise)
+        self.metadata: dict[str, Any] = {"allow_provisional_camera": bool(allow_provisional_camera)}
+        if calib is not None:
+            self.metadata.update(calib.pose_meta())
         self.device = dev = torch.device(device)
         self.model = model if model is not None else load_model()[0]
         m = self.model
@@ -247,9 +270,14 @@ class BatchedGoalEnv:
         # ---- tracker (die tasks)
         self.tracker: SimDieTracker | None = None
         self._occl: Occluders | None = None
-        if task.obs.has_die:
-            noise = tracker_noise if tracker_noise is not None else TrackerNoise()
-            self.tracker = SimDieTracker(CameraModel.default(), noise, n, device=dev, seed=seed + 7919)
+        if calib is not None:
+            # the real D435 from calib/camera.yaml (camera parity C.3): colour + depth sensor, camera-pose DR within
+            # the calibration uncertainty (>= 5 mm / 1.5 deg) unless the caller passes its own noise
+            noise = tracker_noise if tracker_noise is not None else TrackerNoise().with_camera_dr(calib)
+            self.tracker = SimDieTracker(
+                CameraModel.from_calib(calib, "color"), noise, n, device=dev, seed=seed + 7919,
+                depth_cam=CameraModel.from_calib(calib, "depth"), distractors=distractors,
+            )  # fmt: skip
             self._occl = Occluders(m, dev)
             self._trk = TrackerOut.empty(n, dev)
             self._trk_obs = TrackerOut.empty(n, dev)
@@ -586,7 +614,7 @@ class BatchedGoalEnv:
         return out
 
     def render_worlds(
-        self, worlds: Sequence[int], *, width: int = 320, height: int = 240, camera: str = "overhead"
+        self, worlds: Sequence[int], *, width: int = 320, height: int = 240, camera: str = COLOR_CAM
     ) -> np.ndarray:
         """uint8[k,H,W,3] via ``mujoco.Renderer`` on a CPU MjData copy of each world (pixel-track hook)."""
         self._check_open()
@@ -632,12 +660,18 @@ def _bench(argv: list[str] | None = None) -> int:
     ap.add_argument("--calibration", default="tests/data/so101_follower.calib.json")
     ap.add_argument("--bench", action="store_true", help="random actions, report policy-steps/s and clamp stats")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--allow-provisional-camera",
+        action="store_true",
+        help="accept a method: provisional camera pose in calib/camera.yaml (refused by default for die tasks)",
+    )
     args = ap.parse_args(argv)
     cal = load_calibration(args.calibration)
     cfg = load_config(calibration=cal)
     task = REACH if args.task == "reach" else DIE_TO_ZONE
     model = load_model()[0]
-    env = BatchedGoalEnv(cfg, cal, task, args.nworld, sim_params=model_sim_params(model), model=model, seed=args.seed)
+    env = BatchedGoalEnv(cfg, cal, task, args.nworld, sim_params=model_sim_params(model), model=model, seed=args.seed,
+        allow_provisional_camera=args.allow_provisional_camera)
     gen = torch.Generator(device=env.device)
     gen.manual_seed(args.seed)
     env.reset()
@@ -652,6 +686,7 @@ def _bench(argv: list[str] | None = None) -> int:
     sps = args.steps * env.nworld / dt
     stats = env.stats
     env.close()
+    print("run:", env.metadata)
     print(f"task={args.task} nworld={args.nworld} steps={args.steps} wall={dt:.2f}s policy_steps_per_s={sps:.0f}")
     print("clamp_active:", {k.split('/')[1]: round(v, 4) for k, v in stats.items() if k.startswith("clamp_active/")})
     print("stats:", {k: round(v, 4) for k, v in stats.items() if not k.startswith("clamp_active/")})

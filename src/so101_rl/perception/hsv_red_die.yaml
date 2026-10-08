@@ -6,6 +6,7 @@ hsv_hi: [10, 255, 255]
 min_area_px: 40
 max_area_px: 4000
 depth_window_m: 0.02
-# Die edge (16 mm, = sim/model.py DIE_EDGE_M, test-enforced): the tracker deprojects the TOP face and
-# HsvDepthDieTracker.centroid_base subtracts half of this along the table normal (centroid convention).
+# Die edge (16 mm, = sim/model.py DIE_EDGE_M, test-enforced): the tracker deprojects the visible surface and
+# HsvDepthDieTracker.centroid_base pushes the deprojected surface point on along the viewing ray by the entry depth
+# (half of this edge / max |ray component|; centroid convention, perception/die_tracker.py).
 die_edge_m: 0.016

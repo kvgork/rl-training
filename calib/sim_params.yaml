@@ -5,9 +5,9 @@
 version: 2
 meta:
   version: 0
-  date: '2026-10-06'
-  git_sha: e732654411448316da5c5ec4120fb1cbd2af8111
-  mjcf_sha256: 770e04756c0ef502e440be5a1c3e652be701bfc102076da3c7103965c01c3a98
+  date: '2026-10-07'
+  git_sha: bf7346b2abb29f2a8469d6178381eb359b169d95
+  mjcf_sha256: bf66bd4daa646005b4f0f9b58b370d9aaae71958eb48efaecd5a685c3cb793cb
   excitation_run: none (MJCF prior)
   fit_rms_pct: {}
   heldout_rms_pct: null

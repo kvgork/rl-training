@@ -35,7 +35,7 @@ def mcfg(mcal):
 def _env(scene, cfg, cal, task=REACH, n=8, **kw):
     from so101_rl.env.batched_env import BatchedGoalEnv, model_sim_params
 
-    return BatchedGoalEnv(cfg, cal, task, n, sim_params=model_sim_params(scene[0]), model=scene[0], **kw)
+    return BatchedGoalEnv(cfg, cal, task, n, sim_params=model_sim_params(scene[0]), model=scene[0], **{"allow_provisional_camera": True, **kw})
 
 
 def test_model_sim_params_reads_the_mjcf(scene):
@@ -317,3 +317,56 @@ def test_dataclass_replace_keeps_reward_validation():
     t = dataclasses.replace(REACH, episode_steps=10**6)
     assert t.episode_steps == 10**6 and t.reward == REACH.reward
     assert N_JOINTS == 6
+
+
+# ---- provisional camera pose is refused unless the caller opts in (review finding: training on a placeholder)
+def test_provisional_camera_pose_refused_by_default(scene, mcfg, mcal):
+    from so101_rl.perception.camera_calib import CameraNotCalibrated, load_camera_calib
+
+    assert not load_camera_calib().pose.calibrated, "test premise: calib/camera.yaml is provisional"
+    with pytest.raises(CameraNotCalibrated, match="provisional"):
+        _env(scene, mcfg, mcal, DIE_TO_ZONE, allow_provisional_camera=False)
+
+
+def test_reach_needs_no_camera_pose(scene, mcfg, mcal):
+    """No die tracker -> no camera -> nothing to refuse (and nothing to record)."""
+    pytest.importorskip("warp")
+    if not torch.cuda.is_available():
+        pytest.skip("needs the GPU")
+    env = _env(scene, mcfg, mcal, REACH, n=2, allow_provisional_camera=False)
+    try:
+        assert "camera_pose_method" not in env.metadata
+    finally:
+        env.close()
+
+
+@gpu
+def test_provisional_camera_allowed_with_flag_and_recorded(scene, mcfg, mcal):
+    import hashlib
+
+    from so101_rl.perception.camera_calib import CAMERA_YAML
+
+    env = _env(scene, mcfg, mcal, DIE_TO_ZONE, n=2, allow_provisional_camera=True)
+    try:
+        assert env.metadata["camera_pose_method"] == "provisional"
+        assert env.metadata["allow_provisional_camera"] is True
+        assert env.metadata["camera_yaml_sha256"] == hashlib.sha256(CAMERA_YAML.read_bytes()).hexdigest()
+    finally:
+        env.close()
+
+
+def test_calibrated_camera_pose_needs_no_flag(scene, mcfg, mcal):
+    """A calibrated pose passes the default; only the (cheap) refusal is exercised here via require_pose."""
+    from so101_rl.perception.camera_calib import load_camera_calib
+
+    c = load_camera_calib()
+    pose = dataclasses.replace(c.pose, method="arm-shape", residual_mm=2.0)
+    c.with_pose(pose).require_pose(calibrated=True)
+
+
+def test_bench_cli_has_allow_provisional_flag():
+    import inspect
+
+    from so101_rl.env import batched_env
+
+    assert "--allow-provisional-camera" in inspect.getsource(batched_env._bench)

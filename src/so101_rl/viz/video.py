@@ -3,13 +3,10 @@
 ``record_rollout`` runs the current deterministic policy on a :class:`RolloutEnv` for ``seconds`` of env time and
 writes one mp4 per recorded world, ``<out_dir>/<env_step>_<world>.mp4``. Each frame shows two cameras side by side:
 
-1. **overhead**: the D435 pose of the real arm (so a sim and a real frame line up), a fixed MuJoCo camera at
-   ``T_base_cam``. Source of the pose: ``calib/hand_eye.yaml`` (the measured hand-eye result) when that file
-   exists; otherwise ``perception.calibrate_hand_eye.default_synthetic_camera_pose()`` (0.6 m above the workspace
-   box centre, looking straight down), because ``so101.yaml`` does not carry the camera mount (it says so in
-   docs/ARCHITECTURE.md). :func:`overhead_camera_pose` returns the matrix and a string naming the source.
-   The camera frame is the OpenCV one (x right, y down, z forward); MuJoCo cameras look along -z with y up, hence
-   ``R_mj = R_cv @ diag(1, -1, -1)``. The field of view is the D435 colour stream's (``fy`` ~615 px at 480 rows).
+1. **d435**: the real D435's colour view (so a sim and a real frame line up): the scene camera ``d435_color``,
+   built from ``calib/camera.yaml`` by ``sim/model.py`` (camera parity C.3: intrinsics from the device, pose from
+   the camera calibration; ``sim/d435.py`` holds the RealSense <-> MuJoCo frame conversion). The real camera is
+   oblique (64 deg from vertical), not overhead. :func:`d435_camera_pose` returns the pose and its source.
 2. a free 3/4 view.
 
 Rendering is CPU ``mujoco.Renderer`` on copied states, which is always available. MuJoCo Warp's batch renderer is
@@ -47,25 +44,23 @@ if TYPE_CHECKING:
     import torch
 
 __all__ = [
+    "D435_CAM",
     "FREE_CAM",
-    "OVERHEAD_CAM",
     "ReplayRolloutEnv",
     "RolloutEnv",
     "RolloutResult",
     "RolloutStatus",
     "VideoWriter",
     "build_render_model",
+    "d435_camera_pose",
     "draw_overlay",
     "find_ffmpeg",
-    "overhead_camera_pose",
     "overlay_lines",
     "record_rollout",
 ]
 
-OVERHEAD_CAM: Final[str] = "d435_overhead"
+D435_CAM: Final[str] = "d435_color"  # sim/d435.py COLOR_CAM (kept literal: importing sim/d435 loads mujoco)
 FREE_CAM: Final[str] = "free_3q"
-D435_FY_PX: Final[float] = 615.0  # nominal D435 colour intrinsics at 640x480
-HAND_EYE_PATH: Final[Path] = Path(__file__).resolve().parents[3] / "calib" / "hand_eye.yaml"
 
 
 @dataclass(frozen=True)
@@ -101,42 +96,38 @@ class RolloutResult:
 
 
 # --------------------------------------------------------------------------------------------- cameras and model
-def overhead_camera_pose(path: Path | None = None) -> tuple[np.ndarray, str]:
-    """``(T_base_cam 4x4 in the OpenCV camera convention, source description)``."""
-    p = HAND_EYE_PATH if path is None else Path(path)
-    if p.exists():
-        from so101_rl.perception.frames import load_hand_eye
+def d435_camera_pose(path: Path | None = None) -> tuple[np.ndarray, str]:
+    """``(T_base_color 4x4, RealSense optical convention; source description)`` of ``calib/camera.yaml`` (or
+    ``path``)."""
+    from so101_rl.perception.camera_calib import CAMERA_YAML, load_camera_calib
 
-        return load_hand_eye(p).T_base_cam, f"hand-eye calibration {p}"
-    from so101_rl.perception.calibrate_hand_eye import default_synthetic_camera_pose
-
-    return default_synthetic_camera_pose(), "default_synthetic_camera_pose (no calib/hand_eye.yaml yet)"
-
-
-def cv_to_mujoco_rotation(r_cv: np.ndarray) -> np.ndarray:
-    return np.asarray(r_cv, dtype=np.float64) @ np.diag([1.0, -1.0, -1.0])
+    p = CAMERA_YAML if path is None else Path(path)
+    pose = load_camera_calib(p).require_pose()
+    return pose.matrix, f"{p} ({pose.method}, {pose.date})"
 
 
 def build_render_model(
-    height: int = 360, width: int = 480, *, hand_eye_path: Path | None = None
+    height: int = 360, width: int = 480, *, camera_path: Path | None = None, backlit: bool = False
 ) -> tuple[mujoco.MjModel, str]:
-    """The RL scene with the D435 overhead camera and offscreen buffers sized for ``height x width``.
+    """The RL scene with the D435 cameras of ``calib/camera.yaml`` (or ``camera_path``) and offscreen buffers sized
+    for ``height x width`` (use the D435's 4:3 aspect so its intrinsics hold). ``backlit``: add the window light
+    behind the workspace (pixel world-model renders, C.5).
 
-    Adding a camera changes neither the dof layout nor the body/geom order, so ``qpos`` rows of ``WarpSim`` apply
-    unchanged. Returns ``(model, camera pose source)``.
+    Adding cameras and a light changes neither the dof layout nor the body/geom order, so ``qpos`` rows of
+    ``WarpSim`` apply unchanged. Returns ``(model, camera pose source)``.
     """
-    import mujoco
-
+    from so101_rl.perception.camera_calib import load_camera_calib
     from so101_rl.sim.model import build_spec
 
-    T, source = overhead_camera_pose(hand_eye_path)
-    quat = np.zeros(4)
-    mujoco.mju_mat2Quat(quat, cv_to_mujoco_rotation(T[:3, :3]).ravel())
-    spec = build_spec()
-    fovy = float(np.degrees(2.0 * np.arctan(0.5 * 480.0 / D435_FY_PX)))
-    spec.worldbody.add_camera(name=OVERHEAD_CAM, pos=[float(x) for x in T[:3, 3]], quat=[float(x) for x in quat], fovy=fovy)
-    spec.visual.global_.offheight = int(height)
-    spec.visual.global_.offwidth = int(width)
+    calib = load_camera_calib(camera_path)
+    _T, source = d435_camera_pose(camera_path)
+    spec = build_spec(camera=calib)
+    if backlit:
+        from so101_rl.sim.d435 import add_window_backlight
+
+        add_window_backlight(spec, calib)
+    spec.visual.global_.offheight = max(int(height), calib.color.height, calib.depth.height)
+    spec.visual.global_.offwidth = max(int(width), calib.color.width, calib.depth.width)
     return spec.compile(), source
 
 
@@ -245,7 +236,7 @@ def record_rollout(
     fps: float = 10.0,
     height: int = 360,
     width: int = 480,
-    hand_eye_path: Path | None = None,
+    camera_path: Path | None = None,
     keep_tb_frames: bool = True,
 ) -> RolloutResult:
     """Roll ``policy`` out on ``env`` for ``seconds * fps`` env steps, writing ``<env_step>_<world>.mp4`` per world.
@@ -257,7 +248,7 @@ def record_rollout(
     import torch
 
     n_steps = max(1, round(seconds * fps))
-    model, _src = build_render_model(height, width, hand_eye_path=hand_eye_path)
+    model, _src = build_render_model(height, width, camera_path=camera_path)
     data = mujoco.MjData(model)
     free = _free_camera()
     out_dir = Path(out_dir)
@@ -275,7 +266,7 @@ def record_rollout(
                 for i, w in enumerate(worlds):
                     data.qpos[:] = qpos[i]
                     mujoco.mj_forward(model, data)
-                    renderer.update_scene(data, camera=OVERHEAD_CAM)
+                    renderer.update_scene(data, camera=D435_CAM)
                     top = renderer.render().copy()
                     renderer.update_scene(data, camera=free)
                     side = renderer.render().copy()

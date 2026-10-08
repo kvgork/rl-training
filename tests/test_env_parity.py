@@ -101,7 +101,7 @@ def _batched(scene, cfg, cal, task, n):
 
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    env = BatchedGoalEnv(cfg, cal, task, n, sim_params=model_sim_params(scene[0]), model=scene[0], seed=0)
+    env = BatchedGoalEnv(cfg, cal, task, n, sim_params=model_sim_params(scene[0]), model=scene[0], seed=0, allow_provisional_camera=True)
     env.start_noise_ticks = 0  # exact home, like the real env's start_pose "home"
     return env
 

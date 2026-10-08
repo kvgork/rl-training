@@ -4,8 +4,8 @@ Procedure: visit >= 10 poses spread over the workspace box (greedy farthest-poin
 the gripper-tip position from forward kinematics (base frame) and from the die tracker looking at a red marker on
 the tip (camera frame), then fit ``T_base_cam`` with :func:`fit_hand_eye` and write ``hand_eye.yaml``.
 
-* ``--dry-run`` uses a synthetic rig (ground-truth transform, rendered marker, real tracker) and never touches the
-  arm or a camera. It proves the pipeline and the residual gate end to end.
+* ``--dry-run`` uses a synthetic rig (ground truth: the camera of ``calib/camera.yaml``, rendered marker, real
+  tracker) and never touches the arm or a camera. It proves the pipeline and the residual gate end to end.
 * ``--execute`` is required to move the arm. The real rig adapter needs the env ``ShmBackend`` (unit U8) and
   ``So101FK``; until those exist it exits with code 3 and a clear message. H8 finishes and runs it on the real arm.
 """
@@ -22,6 +22,7 @@ import numpy as np
 
 from so101_rl.config.schema import WorkspaceBox
 from so101_rl.perception.camera import DEFAULT_SERIAL, FakeCamera, Intrinsics
+from so101_rl.perception.camera_calib import load_camera_calib
 from so101_rl.perception.die_tracker import HsvDepthDieTracker
 from so101_rl.perception.frames import MIN_POSES, HandEye, fit_hand_eye, load_hand_eye, save_hand_eye
 
@@ -53,14 +54,6 @@ def sample_box_points(box: WorkspaceBox, n: int, rng: np.random.Generator, margi
     lo = np.array([box.x[0], box.y[0], box.z[0]]) + margin_m
     hi = np.array([box.x[1], box.y[1], box.z[1]]) - margin_m
     return rng.uniform(lo, hi, (n, 3))
-
-
-def default_synthetic_camera_pose() -> np.ndarray:
-    """Camera 0.6 m above the box centre looking straight down (cam z = base -z, x = base y, y = base x)."""
-    T = np.eye(4)
-    T[:3, :3] = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
-    T[:3, 3] = [0.21, 0.0, 0.6]
-    return T
 
 
 class SyntheticRig:
@@ -131,9 +124,11 @@ def run_calibration(
 
 
 def _dry_run(out: Path, n_poses: int, seed: int) -> int:
-    intr = Intrinsics(615.0, 615.0, 320.0, 240.0, 640, 480, 0.001)
+    # the synthetic ground truth is the camera of calib/camera.yaml (intrinsics and pose; plan C.1 single source)
+    calib = load_camera_calib()
+    intr = calib.color_intrinsics()
     tracker = HsvDepthDieTracker.from_yaml(intr)
-    T_true = default_synthetic_camera_pose()
+    T_true = calib.T_base_color
     rig = SyntheticRig(T_true, intr, tracker)
     rng = np.random.default_rng(seed)
     cands = sample_box_points(WorkspaceBox(), 200, rng)

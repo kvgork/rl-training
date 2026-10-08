@@ -1,0 +1,82 @@
+# Red/orange false-positive candidates of the HSV die tracker (camera-distractors, C.5). Generated.
+version: 1
+date: '2026-10-07'
+source: 'camera-distractors 2026-10-07, D435 819312071240, saved capture 20261007-capture.npz,
+  colour only; an operator''s bare arm was in the left of the frame: the small blobs
+  at u < 160 are skin; the 300 px blob at (357, 300) is the orange tip marker'
+camera_pose_method: provisional
+hsv:
+  hsv_lo:
+  - 170
+  - 120
+  - 70
+  hsv_hi:
+  - 10
+  - 255
+  - 255
+  min_area_px: 40
+  max_area_px: 4000
+distractors:
+- label: blob6
+  u: 357.5
+  v: 300.4
+  area_px: 306
+  xyz_base:
+  - 0.1426
+  - -0.1098
+  - -0.02
+  xyz_source: table-ray
+- label: blob4
+  u: 118.6
+  v: 252.5
+  area_px: 119
+  xyz_base:
+  - 0.4414
+  - -0.298
+  - -0.02
+  xyz_source: table-ray
+- label: blob0
+  u: 141.3
+  v: 220.7
+  area_px: 99
+  xyz_base:
+  - 0.433
+  - -0.3971
+  - -0.02
+  xyz_source: table-ray
+- label: blob2
+  u: 83.2
+  v: 232.0
+  area_px: 67
+  xyz_base:
+  - 0.5139
+  - -0.3818
+  - -0.02
+  xyz_source: table-ray
+- label: blob5
+  u: 104.5
+  v: 252.9
+  area_px: 48
+  xyz_base:
+  - 0.4611
+  - -0.3022
+  - -0.02
+  xyz_source: table-ray
+- label: blob1
+  u: 71.7
+  v: 227.1
+  area_px: 43
+  xyz_base:
+  - 0.5381
+  - -0.4053
+  - -0.02
+  xyz_source: table-ray
+- label: blob3
+  u: 142.5
+  v: 236.8
+  area_px: 40
+  xyz_base:
+  - 0.4185
+  - -0.3392
+  - -0.02
+  xyz_source: table-ray

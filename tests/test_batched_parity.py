@@ -457,7 +457,7 @@ def _parity_env(cfg, cal, *, nworld: int = 4, substep_offset: int = 0, task=None
 
     model = model if model is not None else load_model()[0]
     task = task if task is not None else dataclasses.replace(REACH, episode_steps=10**6)
-    env = BatchedGoalEnv(cfg, cal, task, nworld, sim_params=model_sim_params(model), model=model, seed=0)
+    env = BatchedGoalEnv(cfg, cal, task, nworld, sim_params=model_sim_params(model), model=model, seed=0, allow_provisional_camera=True)
     env.start_noise_ticks = 0
     env.steps_per_tick += substep_offset
     return env
