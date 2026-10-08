@@ -13,7 +13,7 @@ reach goal rule (``BoxGoalSampler`` with the near-start redraw) and the success 
 input is ``observation ++ desired_goal`` (as ``eval_sim``); the action is ``policy(x) * speed_scale`` (the ladder
 scales the delta magnitude; the env then clips and maps it).
 
-* **Goal list:** drawn from ``--seed`` BEFORE the attach, independent of any measurement: per episode ``i`` a pair
+* **Goal list:** drawn from ``--seed`` before RUN, independent of any measurement: per episode ``i`` a pair
   (first draw, redraw), two sequential ``BoxGoalSampler.sample`` calls on ``default_rng(seed)``, so pair ``i``
   depends only on the seed, the config and the calibration (the goal table). At the reset the env applies its
   near-start rule to the MEASURED start tip: the first draw, or the redraw if the first is within 2 success radii
@@ -46,14 +46,17 @@ scales the delta magnitude; the env then clips and maps it).
   plan and the servo's real / sim class are taken from the run; a differing value is refused.
 * **Start order:** once the servo is in RUN it safe-stops after 0.5 s without a command (``max_consecutive_misses``),
   so this script must be attached BEFORE the servo reaches RUN: it waits up to ``--wait-servo-s`` for the servo
-  process, then sends HOLD every 100 ms (never moves the arm) until RUN. Real arm: start the servo (it waits for the
-  reset button), start this script, then press the button. ``servo --backend mujoco`` presses it itself: start this
-  script first.
+  process, classifies it read-only (``/proc``; every refusal happens here, nothing sent), then attaches AT ONCE and
+  from the attach until RUN sends HOLD every 100 ms (never moves the arm): a keep-alive thread through the slow
+  set-up after the attach (the goal table, ~7 s on a cold cache; the env; the first summary), then the main thread
+  until RUN. Only a ``--resume`` whose goal list no longer matches is refused after the attach (HOLD only). Real arm:
+  start the servo (it waits for the reset button), start this script, then press the button (any time after the
+  attach). ``servo --backend mujoco`` presses it itself: start this script first or together with it.
 * **Outputs** ``<out-root>/<ts>/``: ``episodes.jsonl`` (one line per episode, appended as it ends), ``summary.json``
-  (written before the attach and at the end: per rung and overall success rate + Wilson 95 %, the verdict, the goal
+  (written before RUN and at the end: per rung and overall success rate + Wilson 95 %, the verdict, the goal
   list, the servo's tick-log path, inference timing).
 * **Ctrl-C / SIGTERM** (handled from the start of ``main``): before the attach exit 130 with nothing sent; after it,
-  stop sending RUN commands, send HOLD, write what was collected, exit 130. Further signals are ignored while the
+  stop sending RUN commands (and the keep-alive), send HOLD, write what was collected, exit 130. Further signals are ignored while the
   final HOLD and the summary are written. The servo's own stop / safe-state logic handles the arm. The same holds
   after a normal end: the last command is HOLD, and 0.5 s later the servo runs its safe-state sequence to rest (a
   fresh servo process is needed for the next deployment).
@@ -414,8 +417,8 @@ def _run_episode(env: Any, policy: Any, speed: float, *, goals: GoalList, index:
     }
 
 
-def wait_for_run(backend: Any, timeout_s: float, log: Any = None) -> None:
-    """Send HOLD every policy period (the servo safe-stops after 0.5 s without any command once it is in RUN) until
+def wait_for_run(backend: Any, timeout_s: float, log: Any = None, period_s: float = 0.1) -> None:
+    """Send HOLD every ``period_s`` (the servo safe-stops after 0.5 s without any command once it is in RUN) until
     the servo reports RUN or HOLD. Raises ``ServoNotRunning`` if it is tripped / stopping, ``ServoStateStale`` on
     timeout. HOLD never moves the arm."""
     from so101_rl.env.backend import RUNNABLE, ServoNotRunning, ServoStateStale
@@ -423,11 +426,13 @@ def wait_for_run(backend: Any, timeout_s: float, log: Any = None) -> None:
     from so101_rl.servo.shm import new_state
 
     st = new_state()
-    t_end = time.monotonic() + timeout_s
+    t_next = time.monotonic()
+    t_end = t_next + timeout_s
     told = False
     while True:
         _hold(backend)
-        time.sleep(0.1)
+        t_next += period_s  # an absolute 100 ms grid: the read below does not stretch the HOLD period
+        time.sleep(max(0.0, t_next - time.monotonic()))
         if backend.read_state(st):
             sm = int(st["sm_state"][0])
             if sm in RUNNABLE:
@@ -451,11 +456,13 @@ def hold_keepalive(backend: Any, period_s: float = 0.1) -> Iterator[None]:
 
     def _run() -> None:
         warned = False
+        t_next = time.monotonic()
         while not stop.is_set():
             if not _hold(backend) and not warned:
                 print("deploy-policy: HOLD keep-alive could not write the shm command", file=sys.stderr, flush=True)
                 warned = True
-            stop.wait(period_s)
+            t_next += period_s
+            stop.wait(max(0.0, t_next - time.monotonic()))
 
     t = threading.Thread(target=_run, name="hold-keepalive", daemon=True)
     t.start()
@@ -603,8 +610,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
-    # everything slow (torch, the policy, the goal table) happens BEFORE attaching: once the servo is in RUN it
-    # safe-stops after 0.5 s without a command, so the HOLD keep-alive must start right after the attach
+    # torch and the policy load BEFORE the servo is looked up; the goal table (it needs the servo's config and
+    # calibration) is built after the attach under the HOLD keep-alive (see "ATTACH NOW" below)
     import torch
 
     from so101_rl.env.backend import ResetFailed, ServoNotRunning, ServoStateStale, ShmBackend
@@ -655,13 +662,6 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         cfg = dataclasses.replace(load_config(config_path, calibration=calibration), shm_name=shm_name)
         fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
         schedule = [s for s, n in plan for _ in range(n)]
-        pairs = draw_goal_pairs(BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0), args.seed,
-                                len(schedule))  # fmt: skip
-        if orig is not None:
-            if not np.allclose(np.asarray(orig["goals"]["pairs"], float), pairs, atol=1e-9):
-                raise Refused("--resume: the goal list drawn from the seed differs from the run's (config, "
-                              "calibration or goal table changed)")  # fmt: skip
-            _check_resumed_episodes(prev_episodes, schedule, pairs)
     except Refused as exc:
         _log(f"refused: {exc}")
         return EXIT_REFUSED
@@ -674,7 +674,6 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
                  "shm_name": shm_name, "cmdline": servo.cmdline}  # fmt: skip
     if orig is None:
         out = args.out_root / f"{datetime.now().astimezone():%Y%m%d-%H%M%S}-{os.urandom(2).hex()}"
-        out.mkdir(parents=True, exist_ok=False)
         meta: dict[str, Any] = {
             "policy": str(args.policy.resolve()),
             "policy_meta": {k: v for k, v in policy.meta.items() if isinstance(v, (str, int, float, list, type(None)))},
@@ -688,9 +687,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
             "calibration": str(servo_cal),
             "tick_log": None if servo.tick_log is None else str(servo.tick_log),
             "started": started,
-            "goals": {"seed": args.seed, "rule": "per episode (first draw, redraw) from default_rng(seed); the redraw "
-                      "is used if the first is within 2 success radii of the measured start tip",
-                      "pairs": pairs.tolist()},
+            "goals": None,  # drawn after the attach (below)
             "resumes": [],
         }  # fmt: skip
     else:
@@ -723,21 +720,56 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         })
         return doc
 
-    _write_json(out / "summary.json", _doc(None))  # before the attach: a resumable record even if killed
-    if servo.tick_log is None:
-        _log("the servo runs without --tick-log: no tick log for this deployment")
-    _log(f"servo pid {servo.pid} --backend {servo.backend} ({'REAL ARM, attended' if servo.is_real else 'sim'}); "
-         f"out {out}" + (f"; resuming at episode {len(prev_episodes)} of {len(schedule)}" if orig else ""))
+    # ATTACH NOW, before anything slow. The servo was found and classified (read-only), so it may reach RUN at any
+    # moment (``servo --backend mujoco`` presses its own button; on the arm the human does) and, once in RUN, it
+    # safe-stops after 0.5 s without a command (STALE_CMD). Invariant: from the attach until the servo is in RUN a
+    # HOLD goes out at least every 100 ms -- the keep-alive thread through the slow set-up (the goal table, ~7 s on
+    # a cold cache; the env; the first summary), then ``wait_for_run`` on the main thread.
+    keepalive = contextlib.ExitStack()
+    try:
+        backend = ShmBackend(cfg, calibration=calibration)
+    except (FileNotFoundError, RuntimeError) as exc:
+        _log(f"refused: cannot attach to the servo shm {shm_name!r}: {exc}")
+        return EXIT_REFUSED
+    keepalive.enter_context(hold_keepalive(backend))
+    try:
+        pairs = draw_goal_pairs(BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0), args.seed,
+                                len(schedule))  # fmt: skip
+        if orig is not None:
+            if not np.allclose(np.asarray(orig["goals"]["pairs"], float), pairs, atol=1e-9):
+                raise Refused("--resume: the goal list drawn from the seed differs from the run's (config, "
+                              "calibration or goal table changed)")  # fmt: skip
+            _check_resumed_episodes(prev_episodes, schedule, pairs)
+        else:
+            meta["goals"] = {"seed": args.seed, "rule": "per episode (first draw, redraw) from default_rng(seed); the "
+                             "redraw is used if the first is within 2 success radii of the measured start tip",
+                             "pairs": pairs.tolist()}  # fmt: skip
+        env = So101GoalEnv(backend, cfg, REACH, goal_sampler=GoalList(pairs))
+        out.mkdir(parents=True, exist_ok=orig is not None)
+        _write_json(out / "summary.json", _doc(None))  # before RUN: a resumable record even if killed
+        if servo.tick_log is None:
+            _log("the servo runs without --tick-log: no tick log for this deployment")
+        _log(f"servo pid {servo.pid} --backend {servo.backend} ({'REAL ARM, attended' if servo.is_real else 'sim'}); "
+             f"out {out}" + (f"; resuming at episode {len(prev_episodes)} of {len(schedule)}" if orig else ""))
+    except (Refused, ValueError, OSError, KeyError, TypeError, KeyboardInterrupt) as exc:
+        stopping[0] = True
+        keepalive.close()
+        _hold(backend)  # only HOLD was ever sent; the servo safe-stops 0.5 s after it reaches RUN
+        with contextlib.suppress(Exception):
+            (env or backend).close()
+        if isinstance(exc, KeyboardInterrupt):
+            _log("interrupted during the set-up after the attach: only HOLD was sent")
+            return EXIT_INTERRUPTED
+        _log(f"refused: {exc}" if isinstance(exc, Refused) else f"refused: {type(exc).__name__}: {exc}")
+        return EXIT_REFUSED
     rung_of = [k for k, (_s, n) in enumerate(plan) for _ in range(n)]
     rung_start = [sum(n for _s, n in plan[:k]) for k in range(len(plan))]
     code = EXIT_OK
     try:
-        backend = ShmBackend(cfg, calibration=calibration)
-        with hold_keepalive(backend):  # the env set-up after the attach: keep the servo commanded meanwhile
-            env = So101GoalEnv(backend, cfg, REACH, goal_sampler=GoalList(pairs))
         goals = env.goal_sampler
         with (out / "episodes.jsonl").open("a") as f:
             try:
+                keepalive.close()  # wait_for_run's own HOLD loop takes over at once
                 wait_for_run(backend, args.wait_servo_s, _log)
                 again = servo_info(shm_name)  # the owner must still be the servo we classified (no swap meanwhile)
                 if again.pid != servo.pid or again.is_real != servo.is_real:
@@ -796,6 +828,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         _log(f"stopped by an error: {exc!r}")
     finally:
         stopping[0] = True  # from here on SIGINT / SIGTERM are ignored: the HOLD and the summary must be written
+        keepalive.close()
         if backend is not None:
             _hold(backend)  # last command is always HOLD (never a stale RUN)
         with contextlib.suppress(Exception):

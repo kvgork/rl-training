@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -200,7 +201,8 @@ def test_real_servo_with_no_mcu_is_refused(tmp_path, capsys, no_hardware, preten
 
 
 def test_attended_real_servo_gets_past_the_refusals(tmp_path, capsys, monkeypatch, pretend_servo):
-    """A real-looking servo with --attended: no refusal; the run fails only at the shm attach (stubbed)."""
+    """A real-looking servo with --attended: no refusal; the run fails only at the shm attach (stubbed), which is
+    the first thing after the read-only checks (exit 2, nothing written, nothing sent)."""
 
     def attach(*_a, **_k):
         raise RuntimeError("attach reached (test stub)")
@@ -208,13 +210,10 @@ def test_attended_real_servo_gets_past_the_refusals(tmp_path, capsys, monkeypatc
     monkeypatch.setattr(ShmBackend, "__init__", attach)
     name = pretend_servo("feetech", "--calibration", str(CALIB), "--heartbeat-port", "/dev/null-mcu")
     code = dp.main(_args(_export(tmp_path / "p.pt"), name, tmp_path / "out", "--attended"))
-    assert code == dp.EXIT_HALTED
-    assert "attach reached" in capsys.readouterr().err
-    (run,) = (tmp_path / "out").iterdir()
-    summary = json.loads((run / "summary.json").read_text())
-    assert summary["servo"]["real"] is True and summary["servo"]["mcu"] is True and summary["attended"] is True
-    assert summary["halt_reason"] == "error" and summary["calibration"] == str(CALIB.resolve())
-    assert len(summary["goals"]["pairs"]) == 10 and not summary["verdict"]["finetune_eligible"]
+    assert code == dp.EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "attach reached" in err and "REAL" not in err.split("refused:")[-1]
+    assert not (tmp_path / "out").exists()
 
 
 def test_config_must_match_the_servo(tmp_path, capsys, no_hardware, pretend_servo):
@@ -795,3 +794,91 @@ def test_resume_refuses_a_different_servo_class(tmp_path, capsys, no_hardware, p
 def test_resume_refuses_a_non_run_dir(tmp_path, capsys, no_hardware):
     assert dp.main(["--resume", str(tmp_path), "--wait-servo-s", "0"]) == dp.EXIT_REFUSED
     assert "--resume" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------------------------------------ attach -> RUN keep-alive
+
+
+def _record_cmds(monkeypatch) -> list[tuple[float, str]]:
+    """(monotonic time, "ATTACH" | "HOLD" | "RUN") for every attach and shm command, with a cold goal-table cache:
+    the ~7 s table build (what used to run between finding the servo and attaching) happens in the test."""
+    from so101_rl.env import goals
+
+    monkeypatch.setattr(goals, "_TABLE_CACHE", {})
+    log: list[tuple[float, str]] = []
+    init, send = ShmBackend.__init__, ShmBackend._send
+
+    def _init(self, *a, **k):
+        init(self, *a, **k)
+        log.append((time.monotonic(), "ATTACH"))
+
+    def _send(self, mode, delta, state_seq, episode):
+        log.append((time.monotonic(), "RUN" if mode == CmdMode.RUN else "HOLD"))
+        return send(self, mode, delta, state_seq, episode)
+
+    monkeypatch.setattr(ShmBackend, "__init__", _init)
+    monkeypatch.setattr(ShmBackend, "_send", _send)
+    return log
+
+
+def _assert_hold_from_attach_to_run(log: list[tuple[float, str]], max_gap_s: float = 0.15) -> None:
+    """From the attach until the first RUN command only HOLD, never more than ~100 ms apart (servo limit 0.5 s)."""
+    kinds = [k for _t, k in log]
+    a, r = kinds.index("ATTACH"), kinds.index("RUN")
+    assert set(kinds[a + 1 : r]) == {"HOLD"}, kinds[a : r + 1]
+    times = [t for t, _k in log[a:r]]
+    gaps = np.diff(times)
+    assert times[-1] - times[0] > 1.0  # the slow set-up really ran after the attach (cold goal table)
+    assert gaps.max() <= max_gap_s, f"HOLD gap {gaps.max() * 1e3:.0f} ms after the attach"
+
+
+@pytest.mark.slow
+@pytest.mark.regression
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("backend", ["mujoco", "fake"])
+def test_servo_default_start_reaches_episode_0_without_stale_cmd(tmp_path, monkeypatch, backend):
+    """Regression (64679b6): the goal table was built between finding the servo and attaching, so a servo with its
+    default (home) start that reaches RUN on its own (``--backend mujoco``: ~5 s; the fake: at once) safe-stopped with
+    STALE_CMD (0x100) before episode 0. The servo is started first, as in the bug report."""
+    _short_episodes(monkeypatch)
+    policy = _export(tmp_path / "p.pt")
+    log = _record_cmds(monkeypatch)
+    servo = ServoChild(tmp_path, backend)
+    try:
+        code = _deploy(policy, servo, tmp_path / "deploy", "--episodes", "1")
+    finally:
+        assert servo.stop() == 0
+    _run, eps, summary = _run_dir(tmp_path / "deploy")
+    assert code == dp.EXIT_OK, summary["halted"]
+    assert summary["halted"] is None and len(eps) == 1 and eps[0]["trips"] == 0 and not eps[0]["tripped"]
+    _assert_hold_from_attach_to_run(log)
+
+
+@pytest.mark.slow
+@pytest.mark.regression
+@pytest.mark.timeout(300)
+def test_resume_against_a_mujoco_default_start_has_no_stale_cmd(tmp_path, monkeypatch):
+    """The --resume path attaches the same way: a stopped run (trip in episode 0, fake servo) resumed against a fresh
+    ``servo --backend mujoco`` with its default start reaches the next episode without STALE_CMD."""
+    _short_episodes(monkeypatch)
+    policy = _export(tmp_path / "p.pt")
+    servo = ServoChild(tmp_path, "fake", "--fake-start", "rest")
+    with monkeypatch.context() as m:
+        _inject(m, "trip", at_episode=0)
+        try:
+            assert _deploy(policy, servo, tmp_path / "deploy", "--episodes", "2") == dp.EXIT_HALTED
+        finally:
+            assert servo.stop() == 0
+    run, eps1, _s = _run_dir(tmp_path / "deploy")
+    assert len(eps1) == 1
+    log = _record_cmds(monkeypatch)
+    servo2 = ServoChild(tmp_path, "mujoco")
+    try:
+        code = dp.main(["--resume", str(run), "--shm-name", servo2.name, "--wait-servo-s", "60"])
+    finally:
+        assert servo2.stop() == 0
+    _run, eps, summary = _run_dir(tmp_path / "deploy")
+    assert code == dp.EXIT_OK, summary["halted"]
+    assert len(eps) == 2 and eps[1]["trips"] == 0 and not eps[1]["tripped"] and summary["halted"] is None
+    _assert_hold_from_attach_to_run(log)
+
