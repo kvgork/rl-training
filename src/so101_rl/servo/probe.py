@@ -16,6 +16,10 @@ moved, and nothing is ever written to a servo:
   refuses (:class:`ProbeRefused`); while the probe holds it, a servo start fails with exit 4.
 * **Torque is reported, never changed.** ``Torque_Enable`` (address 40) is read back and returned.
 
+* **Calibration registers, read only.** :func:`read_calibration` uses the same lock + link + ping path to read
+  ``ID`` (5), ``Min_Position_Limit`` (9), ``Max_Position_Limit`` (11) and ``Homing_Offset`` (31, decoded) of the six
+  motors; ``safety.calib_check`` (pixi task ``calib-check``) compares them with the calibration JSON.
+
 Usage: ``python -m so101_rl.servo.probe [--port /dev/ttyACM0] [--calibration PATH] [--reads 5]`` (pixi task
 ``joint-probe``) prints the ticks, the joint angles and the homing-offset check as JSON. ``--reads`` must be >= 1;
 ``--timeout`` bounds the whole probe in wall-clock seconds.
@@ -27,7 +31,8 @@ import argparse
 import json
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -39,6 +44,9 @@ from so101_rl.servo.bus import BLOCK_ADDR, BLOCK_LEN, BlockRead
 from so101_rl.servo.shm import SerialPortLock, ServoAlreadyRunning
 
 BAUD = 1_000_000
+ADDR_ID = 5  # 1 byte (EEPROM)
+ADDR_MIN_POSITION_LIMIT = 9  # 2 bytes (EEPROM), unsigned ticks
+ADDR_MAX_POSITION_LIMIT = 11  # 2 bytes (EEPROM), unsigned ticks
 ADDR_HOMING_OFFSET = 31  # 2 bytes, sign bit 11 (STS series)
 ADDR_TORQUE_ENABLE = 40  # 1 byte
 _SIGN_BIT_POS = 15
@@ -160,6 +168,10 @@ class ScsReadOnlyLink:
         return None if reader is None else {i: int(reader.getData(i, address, 1)) for i in self._ids}
 
 
+_ADAPTER_U16 = {ADDR_MIN_POSITION_LIMIT: "Min_Position_Limit", ADDR_MAX_POSITION_LIMIT: "Max_Position_Limit"}
+_ADAPTER_U8 = {ADDR_ID: "ID", ADDR_TORQUE_ENABLE: "Torque_Enable"}
+
+
 class BusReadAdapter:
     """A ``servo.bus.Bus`` (e.g. ``FakeBus``) seen through :class:`ReadOnlyLink`: only ``connect`` / ``disconnect``
     / ``ping_all`` / ``read_block`` / ``read_reg`` of the bus are ever called. Used by the tests."""
@@ -181,6 +193,8 @@ class BusReadAdapter:
         return self._bus.read_block(out)
 
     def read_u16(self, address: int) -> dict[int, int] | None:
+        if address in _ADAPTER_U16:
+            return {i: int(self._bus.read_reg(_ADAPTER_U16[address], i)) for i in self._ids}
         if address != ADDR_HOMING_OFFSET:
             return None
         out = {}
@@ -190,9 +204,87 @@ class BusReadAdapter:
         return out
 
     def read_u8(self, address: int) -> dict[int, int] | None:
-        if address != ADDR_TORQUE_ENABLE:
+        if address not in _ADAPTER_U8:
             return None
-        return {i: int(self._bus.read_reg("Torque_Enable", i)) for i in self._ids}
+        return {i: int(self._bus.read_reg(_ADAPTER_U8[address], i)) for i in self._ids}
+
+
+def _deadline_checker(timeout_s: float) -> Callable[[str], None]:
+    if not timeout_s > 0:
+        raise ValueError("timeout_s must be > 0")
+    deadline = time.monotonic() + float(timeout_s)
+
+    def check(what: str) -> None:
+        if time.monotonic() > deadline:
+            raise ProbeRefused(f"probe timed out after {timeout_s:g} s ({what})")
+
+    return check
+
+
+@contextmanager
+def _read_only_session(
+    port: str,
+    ids: tuple[int, ...],
+    link_factory: Callable[[str, tuple[int, ...]], ReadOnlyLink] | None,
+    check_deadline: Callable[[str], None],
+) -> Iterator[ReadOnlyLink]:
+    """Take the servo's port lock (refuse if the servo holds it), open the read-only link, ping every motor (refuse
+    a silent one), yield the link; close the link and release the lock on the way out."""
+    try:
+        lock = SerialPortLock(port)
+    except ServoAlreadyRunning as e:
+        raise ProbeRefused(f"the servo process owns {port}; the probe never shares the bus ({e})") from e
+    try:
+        link = (link_factory or (lambda p, i: ScsReadOnlyLink(p, i)))(port, ids)
+        link.open()
+        try:
+            pings = link.ping_all()
+            check_deadline("ping")
+            silent = [i for i in ids if not pings.get(i, False)]
+            if silent:
+                raise ProbeRefused(f"motors {silent} do not answer a ping (servo power off? wrong ID?)")
+            yield link
+        finally:
+            link.close()
+    finally:
+        lock.release()
+
+
+def read_calibration(
+    calibration: dict[str, MotorCalibration],
+    *,
+    port: str,
+    link_factory: Callable[[str, tuple[int, ...]], ReadOnlyLink] | None = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> dict[str, MotorCalibration]:
+    """The calibration registers of the six motors (addressed by the ids in ``calibration``), read without a single
+    write: ``ID``, ``Homing_Offset`` (sign-magnitude decoded), ``Min/Max_Position_Limit``. ``drive_mode`` is not a
+    servo register and is copied from ``calibration`` (see ``safety.calib_check``). Raises :class:`ProbeRefused`
+    when the servo process owns ``port``, the port cannot be opened, a motor does not answer or a read fails."""
+    check_deadline = _deadline_checker(timeout_s)
+    ids = tuple(calibration[n].id for n in JOINT_NAMES)
+    with _read_only_session(port, ids, link_factory, check_deadline) as link:
+        regs = {
+            "id": link.read_u8(ADDR_ID),
+            "homing_offset": link.read_u16(ADDR_HOMING_OFFSET),
+            "range_min": link.read_u16(ADDR_MIN_POSITION_LIMIT),
+            "range_max": link.read_u16(ADDR_MAX_POSITION_LIMIT),
+        }
+        check_deadline("calibration register reads")
+    failed = [k for k, v in regs.items() if v is None]
+    if failed:
+        raise ProbeRefused(f"calibration register read failed: {failed}")
+    out = {}
+    for n in JOINT_NAMES:
+        i = calibration[n].id
+        out[n] = MotorCalibration(
+            id=int(regs["id"][i]),
+            drive_mode=calibration[n].drive_mode,  # not stored on the servo
+            homing_offset=_decode_sm(int(regs["homing_offset"][i]), _SIGN_BIT_HOMING),
+            range_min=int(regs["range_min"][i]),
+            range_max=int(regs["range_max"][i]),
+        )
+    return out
 
 
 @dataclass(frozen=True, eq=False)
@@ -237,42 +329,20 @@ def probe_joints(
     process owns ``port``, a motor does not answer, a read fails, or (``require_still``) the arm moves."""
     if n_reads < 1:
         raise ValueError("n_reads must be >= 1")
-    if not timeout_s > 0:
-        raise ValueError("timeout_s must be > 0")
-    deadline = time.monotonic() + float(timeout_s)
-
-    def _check_deadline(what: str) -> None:
-        if time.monotonic() > deadline:
-            raise ProbeRefused(f"probe timed out after {timeout_s:g} s ({what})")
+    _check_deadline = _deadline_checker(timeout_s)
 
     ids = tuple(calibration[n].id for n in JOINT_NAMES)
-    try:
-        lock = SerialPortLock(port)
-    except ServoAlreadyRunning as e:
-        raise ProbeRefused(f"the servo process owns {port}; the probe never shares the bus ({e})") from e
-    try:
-        link = (link_factory or (lambda p, i: ScsReadOnlyLink(p, i)))(port, ids)
-        link.open()
-        try:
-            pings = link.ping_all()
-            _check_deadline("ping")
-            silent = [i for i in ids if not pings.get(i, False)]
-            if silent:
-                raise ProbeRefused(f"motors {silent} do not answer a ping (servo power off?)")
-            blocks = []
-            for _ in range(n_reads):
-                b = BlockRead()
-                if not link.read_block(b):
-                    raise ProbeRefused("block read failed")
-                blocks.append(b)
-                _check_deadline(f"block read {len(blocks)}/{n_reads}")
-            raw_h = link.read_u16(ADDR_HOMING_OFFSET)
-            raw_t = link.read_u8(ADDR_TORQUE_ENABLE)
-            _check_deadline("register reads")
-        finally:
-            link.close()
-    finally:
-        lock.release()
+    with _read_only_session(port, ids, link_factory, _check_deadline) as link:
+        blocks = []
+        for _ in range(n_reads):
+            b = BlockRead()
+            if not link.read_block(b):
+                raise ProbeRefused("block read failed")
+            blocks.append(b)
+            _check_deadline(f"block read {len(blocks)}/{n_reads}")
+        raw_h = link.read_u16(ADDR_HOMING_OFFSET)
+        raw_t = link.read_u8(ADDR_TORQUE_ENABLE)
+        _check_deadline("register reads")
     pos = np.stack([b.position for b in blocks]).astype(np.int64)
     ticks = np.rint(np.median(pos, axis=0)).astype(np.int32)
     spread = (pos.max(axis=0) - pos.min(axis=0)).astype(np.int32)

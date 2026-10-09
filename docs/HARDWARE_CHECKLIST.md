@@ -244,10 +244,17 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 ## H7 - Calibration read-back on the real arm
 
 - **Needs:** `calib-check` (2.4).
-- **Procedure:** `pixi run calib-check` (all joints match). Then run against a **deliberately corrupted copy** of
-  the calibration JSON (`homing_offset` +1).
-- **Artifact:** `runs/hw/calib-check-<ts>.json {ok: true, broken_copy_rejected: true}`.
-- **Pass:** real calibration OK; corrupted copy refused, no torque enable.
+- **Procedure:** stop the servo process first (calib-check refuses while it holds the port, exit 2). `pixi run
+  calib-check` (read-only: pings and reads ID, Homing_Offset, Min/Max_Position_Limit; never writes, never enables
+  torque; `--port` / `--calibration` override `so101.yaml`). It prints a per-joint file/servo table; exit 0 = all
+  joints match. Then run against a **deliberately corrupted copy** of the calibration JSON (`homing_offset` +1):
+  `cp <calibration_path> /tmp/broken.json`, edit one `homing_offset`, `pixi run calib-check --calibration
+  /tmp/broken.json` → exit 1 naming that joint and `homing_offset`. Exit 2 = could not read (port missing, servo
+  holds the port, a motor silent).
+- **Artifact:** `runs/hw/calib-check-<ts>.json` (`ok: true`, the per-joint file/servo values) for the real
+  calibration; the corrupted-copy run writes `runs/hw/failed/calib-check-<ts>.json` (`ok: false`, `mismatches`).
+  Failed runs go to `failed/` so they never satisfy the `sysid-excite --backend real` artifact gate.
+- **Pass:** real calibration exit 0; corrupted copy exit 1 with the field named; no register write, no torque enable.
 - **Shown-to-fail:** the corrupted copy is the failure variant.
 
 ## H8 - Hand-eye calibration and table fiducial

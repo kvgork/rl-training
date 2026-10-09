@@ -11,11 +11,25 @@ servo EEPROM and are compared. ``drive_mode`` is NOT stored on the STS3215; ever
 and prove nothing. It is therefore not compared. A wrong ``drive_mode`` (a joint moving the wrong way) can only
 be caught by a motion-sign test: command a small delta on each joint and check the sign of the Present_Position
 change. That test belongs to the hardware track / the servo core (H-track, U3), not to this register check.
+
+CLI (pixi task ``calib-check``, H7): ``python -m so101_rl.safety.calib_check [--port P] [--calibration JSON]
+[--timeout S] [--out-dir runs/hw]``. READ-ONLY on the bus: the registers come from ``servo.probe.read_calibration``
+(the read-only probe link: PING / READ / SYNC_READ only, no write method; it refuses while the servo process holds
+the port lock). This module never touches the serial bus itself. Prints a per-joint table and writes
+``<out-dir>/calib-check-<ts>.json`` on a match, ``<out-dir>/failed/calib-check-<ts>.json`` otherwise (so a failed
+run never satisfies a gate that only looks for ``<out-dir>/calib-check-*.json``, e.g. ``sysid-excite --backend
+real``). Exit 0 = every joint matches, 1 = mismatch, 2 = unable to read (calibration file unreadable, port missing,
+port held by the servo, a motor silent, a read failed).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import argparse
+import datetime as dt
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from so101_rl.config import JOINT_NAMES, MotorCalibration
 from so101_rl.servo.bus import Bus
@@ -63,3 +77,88 @@ def require_calibration(bus: Bus, expected: dict[str, MotorCalibration]) -> None
     report = check_calibration(bus, expected)
     if not report.ok:
         raise CalibrationMismatch(report)
+
+
+# --------------------------------------------------------------------------------------------- CLI (H7)
+EXIT_OK, EXIT_MISMATCH, EXIT_UNREADABLE = 0, 1, 2
+
+
+class _Readback:
+    """The registers already read by the probe, seen as the one ``Bus`` method ``check_calibration`` calls."""
+
+    def __init__(self, regs: dict[str, MotorCalibration]) -> None:
+        self._regs = regs
+
+    def read_calibration_regs(self) -> dict[str, MotorCalibration]:
+        return self._regs
+
+
+def _table(expected: dict[str, MotorCalibration], actual: dict[str, MotorCalibration], report: CalibReport) -> str:
+    cols = ("id", "homing_offset", "range_min", "range_max")
+    head = f"{'joint':<14}" + "".join(f"{c + ' file/servo':>26}" for c in cols) + "  result"
+    lines = [head, "-" * len(head)]
+    for n, want in expected.items():
+        got = actual.get(n)
+        cells = "".join(
+            f"{f'{getattr(want, c)}/' + ('-' if got is None else str(getattr(got, c))):>26}" for c in cols
+        )
+        bad = n in report.mismatches
+        lines.append(f"{n:<14}{cells}  {'MISMATCH ' + report.mismatches[n][0] if bad else 'ok'}")
+    return "\n".join(lines)
+
+
+def _write(result: dict, out_dir: Path, ok: bool) -> Path:
+    root = out_dir if ok else out_dir / "failed"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"calib-check-{dt.datetime.now(dt.UTC).strftime('%Y%m%d-%H%M%S')}.json"
+    path.write_text(json.dumps(result, indent=2, sort_keys=True))
+    return path
+
+
+def main(argv: list[str] | None = None, *, link_factory=None) -> int:
+    """See the module docstring. ``link_factory`` is the probe's link hook (tests pass a ``FakeBus`` adapter)."""
+    from so101_rl.config import load_calibration, load_config
+    from so101_rl.servo.probe import DEFAULT_TIMEOUT_S, ProbeRefused, read_calibration
+
+    ap = argparse.ArgumentParser(prog="python -m so101_rl.safety.calib_check", description=__doc__.split("\n")[0])
+    ap.add_argument("--port", default=None, help="default: so101.yaml port")
+    ap.add_argument("--calibration", default=None, help="calibration JSON (default: so101.yaml calibration_path)")
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="wall-clock bound for the read, s")
+    ap.add_argument("--out-dir", type=Path, default=Path("runs/hw"), help="artifact directory (default runs/hw)")
+    args = ap.parse_args(argv)
+    if not args.timeout > 0:
+        ap.error("--timeout must be > 0")
+
+    result: dict = {"ok": False, "port": None, "calibration_path": None, "joints": {}, "mismatches": {}}
+    try:
+        cfg = load_config(calibration=load_calibration(Path(args.calibration)) if args.calibration else None)
+        cal_path = Path(args.calibration or cfg.calibration_path).expanduser()
+        result["calibration_path"] = str(cal_path)
+        expected = load_calibration(cal_path)
+        port = args.port or cfg.port
+        result["port"] = port
+        actual = read_calibration(expected, port=port, link_factory=link_factory, timeout_s=args.timeout)
+    except (ProbeRefused, OSError, ConnectionError, ValueError, KeyError) as e:
+        result.update(exit_code=EXIT_UNREADABLE, error=f"{type(e).__name__}: {e}")
+        print(f"calib-check: unable to read the calibration ({e})", file=sys.stderr)
+        print(f"calib-check: wrote {_write(result, args.out_dir, ok=False)}", file=sys.stderr)
+        return EXIT_UNREADABLE
+
+    report = check_calibration(_Readback(actual), expected)
+    code = EXIT_OK if report.ok else EXIT_MISMATCH
+    result.update(
+        ok=report.ok,
+        exit_code=code,
+        joints={n: {"file": asdict(expected[n]), "servo": asdict(actual[n])} for n in expected if n in actual},
+        mismatches={m: {"field": f, "file": a, "servo": b} for m, (f, a, b) in report.mismatches.items()},
+        note="drive_mode is not a servo register and is not compared",
+    )
+    print(f"calibration: {result['calibration_path']}\nport: {result['port']}")
+    print(_table(expected, actual, report))
+    print("calib-check: " + ("PASS (all joints match)" if report.ok else f"FAIL ({len(report.mismatches)} mismatch)"))
+    print(f"calib-check: wrote {_write(result, args.out_dir, ok=report.ok)}")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

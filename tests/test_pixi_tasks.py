@@ -46,3 +46,20 @@ def test_marker_expressions_are_not_tautologies():
                     continue
                 assert not re.search(rf"\b{marker}\b\s+or\s+not\s+{marker}\b|\bnot\s+{marker}\s+or\s+{marker}\b", expr), (
                     name, expr)
+
+
+def test_every_python_m_task_has_a_cli_entry_point():
+    """`python -m <module>` on a module without a `__main__` guard imports it and exits 0 silently, which looks like
+    a pass (the `calib-check` bug, 2026-10-09)."""
+    silent = []
+    for name, task in TASKS.items():
+        argv = shlex.split(_cmd(task) or "")
+        if argv[:2] != ["python", "-m"]:
+            continue
+        rel = ROOT / Path("src", *argv[2].split("."))
+        if (rel / "__main__.py").exists():
+            continue
+        src = rel.with_suffix(".py").read_text()
+        if not re.search(r"^if __name__ == [\"']__main__[\"']:", src, re.MULTILINE):
+            silent.append(f"{name}: {argv[2]} has no `if __name__ == \"__main__\":`")
+    assert not silent, silent
