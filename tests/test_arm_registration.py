@@ -11,12 +11,12 @@ import numpy as np
 import pytest
 from camera_synth import perturbed, render_rgbd, with_pose
 
-from so101_rl.config import load_calibration
+from so101_rl.config import load_calibration, ticks_to_rad
 from so101_rl.perception import camera_calibrate
 from so101_rl.perception.arm_registration import rotation_angle_deg
 from so101_rl.perception.camera_calib import load_camera_calib, save_camera_calib
 from so101_rl.perception.camera_calibrate import Capture, calibrate
-from so101_rl.perception.table_plane import depth_to_points, fit_table_plane
+from so101_rl.perception.table_plane import PlaneFit, depth_to_points, fit_table_plane, refit_in_workspace
 from so101_rl.servo.probe import ProbeRefused
 from so101_rl.sim.arm_cloud import ArmSurface, qpos_from_ticks
 from so101_rl.sim.model import TABLE_Z_M, load_model
@@ -71,6 +71,18 @@ def test_arm_shape_recovers_the_true_camera_and_passes_the_gate(scene):
     assert err_t < 3.0 and err_r < 0.5
     assert res.rms_mm <= 5.0 and res.tip_px_err <= 8.0 and res.coverage >= 0.5
     assert len(res.seeds) >= 3  # several seeds were refined
+    assert res.icp6_converged  # fixed subsample + Tukey-weighted trim: the 6-DOF ICP settles (2026-10-09)
+    d = res.diagnostics
+    print(json.dumps({k: v for k, v in d.items() if k != "icp_information"}, default=float))
+    # the synthetic table is level in the base frame: no tilt, the table where it is assumed, no joint offsets
+    assert d["plane_in_base"]["tilt_deg"] < 0.5
+    assert abs(d["plane_in_base"]["table_z_at_base_origin_mm"] - TABLE_Z_M * 1000) < 3.0
+    assert d["table_plane_used"] == "workspace" and d["workspace_vs_global_plane"]["angle_deg"] < 0.3
+    alt = d["level_base_alternative"]
+    assert abs(alt["table_z_minus_assumed_mm"]) < 3.0
+    assert all(abs(v) < 1.0 for k, v in alt["offsets_deg"].items() if k != "wrist_roll"), alt["offsets_deg"]
+    axes = d["icp_information"]["rotation_axes_base"]
+    assert len(axes) == 3 and all(a["sigma_deg"] > 0 for a in axes)
 
 
 def test_wrong_joint_angles_fail_the_gate(scene):
@@ -80,8 +92,14 @@ def test_wrong_joint_angles_fail_the_gate(scene):
     bad[1] += 160
     bad[2] -= 160
     res, _, _ = calibrate(model, CAL, c0, [Capture(rgb, frames, bad)], TABLE_Z_M, bootstrap=0)
-    print(json.dumps({k: v for k, v in res.to_json().items() if k not in ("seeds", "T_base_color")}, default=float))
+    print(json.dumps({k: v for k, v in res.to_json().items() if k not in ("seeds", "T_base_color", "diagnostics")}, default=float))
     assert not res.passed
+    # the level-base alternative (diagnostics) finds both injected joint errors and the right table height
+    err = np.degrees(ticks_to_rad(bad, CAL) - ticks_to_rad(TICKS, CAL))
+    alt = res.diagnostics["level_base_alternative"]
+    assert alt["offsets_deg"]["shoulder_lift"] == pytest.approx(-err[1], abs=1.0)
+    assert alt["offsets_deg"]["elbow_flex"] == pytest.approx(-err[2], abs=1.0)
+    assert abs(alt["table_z_minus_assumed_mm"]) < 3.0 and alt["rms_mm"] < 3.0
 
 
 @pytest.mark.parametrize("joint,delta", [(1, 70), (2, -70)], ids=["shoulder+70", "elbow-70"])
@@ -94,6 +112,11 @@ def test_small_joint_error_fails_the_gate(scene, joint, delta):
     res, _, _ = calibrate(model, CAL, c0, [Capture(rgb, frames, bad)], TABLE_Z_M, bootstrap=0)
     assert not res.passed, res.to_json()["gate"]
     assert res.n_inliers >= 1000 and min(res.visible_samples) >= 500  # it failed on the fit, not on a vacuous input
+    if joint == 1:
+        # the level-base alternative names the culprit: shoulder_lift back by the injected error
+        err_deg = math.degrees(float(ticks_to_rad(bad, CAL)[1] - ticks_to_rad(TICKS, CAL)[1]))
+        got = res.diagnostics["level_base_alternative"]["offsets_deg"]["shoulder_lift"]
+        assert got == pytest.approx(-err_deg, abs=1.5), (got, err_deg)
 
 
 def test_report_carries_the_new_gates_on_a_passing_run(scene):
@@ -179,3 +202,56 @@ def test_camera_calibrate_keeps_the_file_on_fail_and_on_refusal(tmp_path, scene)
     assert rc == 1 and cam_yaml.read_text() == before
     rc, cam_yaml, before = _fake_main(tmp_path / "b", scene, TICKS, probe_exc=ProbeRefused("motors [1] do not answer"))
     assert rc == 3 and cam_yaml.read_text() == before
+
+
+def test_replay_from_capture_is_report_only(tmp_path, scene):
+    """``--from-capture`` re-runs a saved capture offline: no probe, no camera, and calib/camera.yaml is never written
+    (even on PASS: the camera may have moved since)."""
+    c0, T_true, _, rgb, frames = scene
+    src = tmp_path / "runs" / "20261009-000000"
+    src.mkdir(parents=True)
+    np.savez_compressed(src / "capture_0.npz", rgb=rgb, depth=frames, ticks=TICKS)  # what camera-calibrate saves
+    cam_yaml = tmp_path / "camera.yaml"
+    save_camera_calib(c0, cam_yaml)
+    before = cam_yaml.read_text()
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("replay touched the hardware")
+
+    rc = camera_calibrate.main(
+        ["--method", "arm-shape", "--camera-yaml", str(cam_yaml), "--out-dir", str(tmp_path / "replay"),
+         "--calibration", str(Path(__file__).parent / "data" / "so101_follower.calib.json"), "--from-capture", str(src)],
+        probe=forbidden, camera=forbidden, wait=forbidden,
+    )  # fmt: skip
+    assert rc == 0 and cam_yaml.read_text() == before
+    out = next((tmp_path / "replay").iterdir())
+    assert out.name.endswith("-replay")
+    rep = json.loads((out / "report.json").read_text())
+    assert rep["passed"] and rep["replay_of"] == str(src) and rep["ticks"] == [TICKS.tolist()]
+    np.testing.assert_allclose(np.array(rep["T_base_color"])[:3, 3], T_true[:3, 3], atol=0.003)
+    assert (out / "capture_0.npz").exists() and (out / "overlay_0.png").exists()
+    assert camera_calibrate.main(["--method", "arm-shape", "--camera-yaml", str(cam_yaml), "--from-capture", str(tmp_path / "empty")]) == 2
+
+
+def test_workspace_plane_ignores_a_surface_outside_the_workspace(scene):
+    """A big tilted surface away from the arm (a person, the bed) outvotes the table in the global RANSAC; the refit on
+    the workspace around the base finds the table."""
+    c0 = scene[0]
+    T = c0.T_base_color
+    rng = np.random.default_rng(0)
+    xy = rng.uniform(-0.35, 0.35, size=(30_000, 2))
+    table = np.c_[xy, np.full(len(xy), TABLE_Z_M)]
+    far = rng.uniform([0.45, -0.6], [0.9, 0.6], size=(60_000, 2))
+    slope = math.tan(math.radians(4.0))
+    other = np.c_[far, TABLE_Z_M + 0.004 + slope * (far[:, 0] - 0.45)]  # 4 deg, meets the table's band at its edge
+    pb = np.concatenate([table, other])
+    Ti = np.linalg.inv(T)
+    pts = pb @ Ti[:3, :3].T + Ti[:3, 3]
+    up_true = Ti[:3, :3] @ np.array([0.0, 0.0, 1.0])
+    glob = fit_table_plane(pts)
+    assert math.degrees(math.acos(min(1.0, float(glob.normal_up @ up_true)))) > 2.0  # the global fit took the slope
+    first = PlaneFit(glob.normal_up, glob.height_m, glob.inlier_fraction, glob.inliers)
+    ws = refit_in_workspace(pts, first, T, band_m=0.05)
+    assert ws is not None
+    assert math.degrees(math.acos(min(1.0, float(ws.normal_up @ up_true)))) < 0.2
+    assert ws.height_m == pytest.approx(T[2, 3] - TABLE_Z_M, abs=0.001)

@@ -10,7 +10,14 @@ rest.
    (the seeds).
 2. **Planar ICP** (x, y, yaw; point-to-plane on the model normals, trimmed) from every seed.
 3. **6-DOF ICP** from the best planar result, point-to-plane, trimmed at 15 -> 8 mm, model visibility (back-face
-   culling + a z-buffer) recomputed every outer iteration.
+   culling + a z-buffer) recomputed every outer iteration. Each trim stage runs until the step is below
+   ``ICP_CONV_ROT_RAD`` / ``ICP_CONV_TRANS_M`` (or ``icp6_stage_iters``); ``icp6_converged`` means the final (8 mm)
+   stage converged. Two things make it converge (the 2026-10-09 rig runs: 30/30 iterations "not converged" while
+   the pose had settled after ~10, the step jittering at ~0.05 deg / 0.1 mm): the scene subsample is FIXED (one random
+   key per scene point, drawn once) instead of redrawn every iteration, and the correspondences are weighted by a
+   Tukey biweight of their distance (``(1 - (d / trim)^2)^2``, times the 5 mm Huber weight of the point-to-plane
+   residual) instead of a hard 0/1 trim, so a point crossing the trim radius no longer flips the problem (a hard trim
+   left a 2-cycle of ~0.05 deg).
 4. **Metrics / gate** (:class:`ArmShapeResult`): the RMS point-to-point distance from every scene point within
    2 cm of the visible model to the nearest model sample (<= 5 mm; NOT the trimmed ICP residual, which is small by
    construction: with the shoulder and elbow 0.25 rad wrong the 8 mm-trimmed point-to-plane RMS was 2.6 mm, this
@@ -19,6 +26,13 @@ rest.
    plane-vs-6-DOF agreement (camera height within 5 mm, tilt within 2 deg), and the FK gripper tip projected into the
    colour image within 8 px of an arm pixel at the tip's depth (+-20 mm). Bootstrap over the correspondences gives
    the uncertainty (2 sigma).
+5. **Diagnostics** (``ArmShapeResult.diagnostics``, report only, no gate): where the table plane lies in the base
+   frame under the 6-DOF pose (the axis and angle of the plane-vs-6-DOF tilt, the table height at the base origin),
+   the information matrix of the final point-to-plane problem (rotation axes in the base frame with their 1-sigma, and
+   the angle between the tilt axis and the weakest one: a disagreement about a well-constrained axis is not ICP
+   noise), and the **level-base alternative**: the plane-constrained pose with a free height plus zero offsets of
+   shoulder_lift, elbow_flex, wrist_flex and wrist_roll. When that fits as well as the 6-DOF pose, a single pose cannot
+   tell a tilted base from joint-zero (calibration) errors: shoulder_lift and a tilt about base y correlate at ~0.9.
 
 **Degeneracy.** A shoulder_pan error is indistinguishable from a camera yaw about the base's vertical axis (only
 the static base mesh breaks the symmetry, weakly): 60 ticks of pan error moved the result 39 mm with identical
@@ -31,6 +45,7 @@ Nearest neighbours use chunked ``torch.cdist`` on the CPU (no scipy in the envir
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -48,8 +63,15 @@ MAX_TIP_PX = 8.0
 ABOVE_TABLE_M = 0.008
 MIN_INLIERS = 1000  # scene arm points within GATE_TRIM_M of the visible model: an RMS over fewer points proves little
 MIN_VISIBLE_SAMPLES = 500  # visible model surface samples per observation (a sliver of overlap cannot pin 6 DOF)
-MIN_ICP_ITERS = 3  # 6-DOF ICP Gauss-Newton steps taken (or converged: step < ICP_CONVERGED after >= 1 step)
-ICP_CONVERGED = 1e-6
+MIN_ICP_ITERS = 3  # 6-DOF ICP Gauss-Newton steps taken (or converged after >= 1 step)
+# 6-DOF ICP convergence: the Gauss-Newton step is below 1e-4 rad (0.006 deg) AND 1e-5 m, two orders of magnitude under
+# the bootstrap uncertainty (~0.15 deg / 0.4 mm on the rig).
+ICP_CONV_ROT_RAD = 1e-4
+ICP_CONV_TRANS_M = 1e-5
+ICP_STAGE_ITERS = 40  # per trim stage (15 mm, then 8 mm)
+# Diagnostic joint-offset fit (level-base alternative): the joints whose zero error mimics a camera tilt.
+OFFSET_JOINTS = ("shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+TICKS_PER_DEG = 4096 / 360.0
 
 
 @dataclass
@@ -60,6 +82,8 @@ class Observation:
     model_nrm: np.ndarray  # [M, 3]
     tip_base: np.ndarray  # [3] FK gripper tip
     depth_m: np.ndarray  # [H, W] aligned depth (median), for the tip check
+    # (pts, nrm) of the model with zero offsets [rad] added to OFFSET_JOINTS; diagnostics only (None: skipped)
+    model_fn: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None
 
 
 @dataclass
@@ -81,6 +105,7 @@ class ArmShapeResult:
     min_inliers: int = MIN_INLIERS
     min_visible_samples: int = MIN_VISIBLE_SAMPLES
     min_icp_iters: int = MIN_ICP_ITERS
+    diagnostics: dict = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -112,6 +137,7 @@ class ArmShapeResult:
             "passed": self.passed,
             "failures": self.failures,
             "seeds": self.seeds,
+            "diagnostics": self.diagnostics,
         }
 
 
@@ -176,6 +202,7 @@ class ArmShapeRegistration:
         # levelled scene points (plane frame with x = y = yaw = 0): above the table only
         self.T0 = plane_constrained_pose(plane.normal_up, plane.height_m, self.table_z, 0.0, 0.0, 0.0)
         self.scene: list[np.ndarray] = []
+        self._keys: list[np.ndarray] = []  # fixed subsampling priority per scene point (module docstring, step 3)
         for o in obs:
             h = o.pts_cam @ plane.normal_up + plane.height_m
             keep = (h > ABOVE_TABLE_M) & (h < 0.6)
@@ -183,6 +210,7 @@ class ArmShapeRegistration:
             if len(q) > 40_000:
                 q = q[self.rng.choice(len(q), 40_000, replace=False)]
             self.scene.append(q)
+            self._keys.append(self.rng.random(len(q)))
 
     def pose(self, x: float, y: float, yaw: float) -> np.ndarray:
         return plane_constrained_pose(self.plane.normal_up, self.plane.height_m, self.table_z, x, y, yaw)
@@ -238,19 +266,21 @@ class ArmShapeRegistration:
         """Scene points of observation ``oi`` in the base frame under the full pose ``T`` (T_base_color)."""
         return _apply(T @ np.linalg.inv(self.T0), self.scene[oi])
 
-    def _gather(self, T: np.ndarray, trim_m: float, *, max_pts: int = 6000):
-        S, M, N = [], [], []
+    def _gather(self, T: np.ndarray, trim_m: float, *, max_pts: int = 6000, with_dist: bool = False):
+        """(scene, model, normal) correspondences within ``trim_m`` (plus their distances with ``with_dist``)."""
+        S, M, N, D = [], [], [], []
         for oi, o in enumerate(self.obs):
             vis = visible_model(T, o.model_pts, o.model_nrm, self.intr)
             mp, mn = o.model_pts[vis], o.model_nrm[vis]
             if len(mp) < 20:
                 continue
             s = self._scene_base(T, oi)
-            # keep the scene points near the model's bounding box
+            # keep the scene points near the model's bounding box; subsample by the fixed keys (deterministic in T)
             lo, hi = mp.min(0) - 0.03, mp.max(0) + 0.03
-            s = s[((s >= lo) & (s <= hi)).all(1)]
+            inb = ((s >= lo) & (s <= hi)).all(1)
+            s = s[inb]
             if len(s) > max_pts:
-                s = s[self.rng.choice(len(s), max_pts, replace=False)]
+                s = s[np.argpartition(self._keys[oi][inb], max_pts)[:max_pts]]
             if len(s) == 0:
                 continue
             d, j = _nn(s, mp)
@@ -258,9 +288,12 @@ class ArmShapeRegistration:
             S.append(s[keep])
             M.append(mp[j[keep]])
             N.append(mn[j[keep]])
+            D.append(d[keep])
         if not S:
-            return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
-        return np.concatenate(S), np.concatenate(M), np.concatenate(N)
+            out = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0))
+        else:
+            out = (np.concatenate(S), np.concatenate(M), np.concatenate(N), np.concatenate(D))
+        return out if with_dist else out[:3]
 
     def icp_planar(self, x: float, y: float, yaw: float, *, iters: int = 25) -> tuple[float, float, float]:
         for it in range(iters):
@@ -283,21 +316,24 @@ class ArmShapeRegistration:
                 break
         return x, y, yaw
 
-    def icp_6dof(self, T: np.ndarray, *, iters: int = 30, trims: tuple[float, float] = (0.015, 0.008)) -> np.ndarray:
-        """Point-to-plane ICP in 6 DOF. ``self.icp6_iterations`` / ``icp6_converged`` record what ran: 0 iterations
-        means the correspondence set was empty at the start (the pose returned is the input, unrefined)."""
+    def icp_6dof(self, T: np.ndarray, *, stage_iters: int = ICP_STAGE_ITERS, trims: tuple[float, ...] = (0.015, 0.008)) -> np.ndarray:
+        """Point-to-plane ICP in 6 DOF, one stage per trim radius, each until converged (module docstring, step 3) or
+        ``stage_iters``. ``self.icp6_iterations`` / ``icp6_converged`` record what ran: 0 iterations means the
+        correspondence set was empty at the start (the pose returned is the input, unrefined); converged means the
+        LAST stage converged."""
         T = T.copy()
         self.icp6_iterations, self.icp6_converged = 0, False
-        for it in range(iters):
-            trim = trims[0] if it < iters // 2 else trims[1]
-            s, m, n = self._gather(T, trim)
-            if len(s) < 30:
-                break
-            T = self._step6(T, s, m, n) @ T
-            self.icp6_iterations += 1
-            if self._last_step < ICP_CONVERGED:
-                self.icp6_converged = True
-                break
+        for trim in trims:
+            self.icp6_converged = False
+            for _ in range(stage_iters):
+                s, m, n, d = self._gather(T, trim, with_dist=True)
+                if len(s) < 30:
+                    return T
+                T = self._step6(T, s, m, n, (1.0 - (d / trim) ** 2) ** 2) @ T
+                self.icp6_iterations += 1
+                if self._last_rot < ICP_CONV_ROT_RAD and self._last_trans < ICP_CONV_TRANS_M:
+                    self.icp6_converged = True
+                    break
         return T
 
     def visible_counts(self, T: np.ndarray) -> list[int]:
@@ -316,7 +352,7 @@ class ArmShapeRegistration:
         dT = np.eye(4)
         dT[:3, :3] = _rotvec(dx[:3])
         dT[:3, 3] = dx[3:]
-        self._last_step = float(np.abs(dx).max())
+        self._last_rot, self._last_trans = float(np.linalg.norm(dx[:3])), float(np.linalg.norm(dx[3:]))
         return dT
 
     # ---------------------------------------------------------------- metrics
@@ -339,16 +375,18 @@ class ArmShapeRegistration:
         return rms, float(np.mean(covs)), len(s)
 
     def bootstrap(self, T: np.ndarray, *, n: int = 20) -> tuple[float, float]:
-        s, m, nr = self._gather(T, 0.008, max_pts=20_000)
+        trim = 0.008
+        s, m, nr, d = self._gather(T, trim, max_pts=20_000, with_dist=True)
         if len(s) < 30:
             return math.inf, math.inf
+        w = (1.0 - (d / trim) ** 2) ** 2  # the weights of the final ICP stage, so T is (nearly) a fixed point
         ts, rs = [], []
         for _ in range(n):
             idx = self.rng.integers(0, len(s), len(s))
             Tb = np.eye(4)
             for _k in range(5):
                 ss = _apply(Tb, s[idx])
-                Tb = self._step6(Tb, ss, m[idx], nr[idx]) @ Tb
+                Tb = self._step6(Tb, ss, m[idx], nr[idx], w[idx]) @ Tb
             Tf = Tb @ T
             ts.append(Tf[:3, 3])
             rs.append(rotation_angle_deg(Tf[:3, :3] @ T[:3, :3].T))
@@ -375,28 +413,154 @@ class ArmShapeRegistration:
             worst = max(worst, float(np.min(np.linalg.norm(px - uv, axis=1))))
         return worst
 
+    # ---------------------------------------------------------------- diagnostics (report only, no gate)
+    def plane_in_base(self, T: np.ndarray) -> dict:
+        """The table plane in the base frame under ``T``: its up normal, the tilt against base +z (angle, and the
+        rotation axis taking base +z onto the normal), the direction the table descends along, its slope and its
+        height at the base origin."""
+        n_b = T[:3, :3] @ self.plane.normal_up
+        p0 = _apply(T, (-self.plane.height_m * self.plane.normal_up)[None])[0]  # foot of the camera on the plane
+        z0 = p0[2] + (n_b[0] * p0[0] + n_b[1] * p0[1]) / n_b[2]
+        ax = np.cross([0.0, 0.0, 1.0], n_b)
+        sn = float(np.linalg.norm(ax))
+        down = n_b[:2] / max(float(np.hypot(n_b[0], n_b[1])), 1e-12)
+        return {
+            "normal_base": n_b.tolist(),
+            "tilt_deg": math.degrees(math.atan2(sn, float(n_b[2]))),
+            "tilt_axis_base": (ax / max(sn, 1e-12)).tolist(),
+            "descends_toward_base_xy": down.tolist(),
+            "slope_mm_per_100mm": 100.0 * float(np.hypot(n_b[0], n_b[1]) / n_b[2]),
+            "table_z_at_base_origin_mm": 1000.0 * float(z0),
+            "table_z_assumed_mm": 1000.0 * self.table_z,
+        }
+
+    def information(self, T: np.ndarray) -> dict:
+        """The point-to-plane information matrix at ``T`` (8 mm trim): rotation axes (base frame, translation
+        marginalised) and translation axes (rotation marginalised), weakest first, each with its 1-sigma for the
+        observed residual spread. A LOWER BOUND on the real uncertainty (residuals are spatially correlated)."""
+        s, m, n = self._gather(T, 0.008, max_pts=20_000)
+        if len(s) < 30:
+            return {}
+        J = np.concatenate([np.cross(s, n), n], 1)
+        r = ((s - m) * n).sum(1)
+        w = 1.0 / np.maximum(1.0, np.abs(r) / 0.005)
+        A = J.T @ (J * w[:, None])
+        sig = float(np.sqrt(np.sum(w * r**2) / np.sum(w)))
+        Arr = A[:3, :3] - A[:3, 3:] @ np.linalg.solve(A[3:, 3:], A[3:, :3])
+        Att = A[3:, 3:] - A[3:, :3] @ np.linalg.solve(A[:3, :3], A[:3, 3:])
+        er, Vr = np.linalg.eigh(Arr)
+        et, Vt = np.linalg.eigh(Att)
+        return {
+            "residual_sigma_mm": 1000.0 * sig,
+            "rotation_axes_base": [{"axis": Vr[:, k].tolist(), "sigma_deg": math.degrees(sig / math.sqrt(er[k]))} for k in range(3)],
+            "translation_axes_base": [{"axis": Vt[:, k].tolist(), "sigma_mm": 1000.0 * sig / math.sqrt(et[k])} for k in range(3)],
+        }
+
+    def level_base_alternative(self, T_plane: np.ndarray, *, iters: int = 40, eps: float = 1e-3) -> dict | None:
+        """Fit the plane-constrained pose (x, y, yaw) with a FREE height plus zero offsets of :data:`OFFSET_JOINTS`
+        (shared by all observations), from ``T_plane``. The competing explanation of a plane-vs-6-DOF tilt: a level
+        base whose FK is off. None when an observation has no ``model_fn``."""
+        if any(o.model_fn is None for o in self.obs):
+            return None
+        k = len(OFFSET_JOINTS)
+        delta = np.zeros(k)
+        T = T_plane.copy()
+        for it in range(iters):
+            trim = 0.015 if it < iters // 2 else 0.008
+            Js, rs = [], []
+            for oi, o in enumerate(self.obs):
+                mp, mn = o.model_fn(delta)
+                dms = [(o.model_fn(delta + eps * np.eye(k)[j])[0] - mp) / eps for j in range(k)]
+                idx = np.nonzero(visible_model(T, mp, mn, self.intr))[0]
+                if len(idx) < 20:
+                    continue
+                sc = self._scene_base(T, oi)
+                lo, hi = mp[idx].min(0) - 0.03, mp[idx].max(0) + 0.03
+                inb = ((sc >= lo) & (sc <= hi)).all(1)
+                sc = sc[inb]
+                if len(sc) > 6000:
+                    sc = sc[np.argpartition(self._keys[oi][inb], 6000)[:6000]]
+                d, j = _nn(sc, mp[idx])
+                keep = d < trim
+                sc, mi = sc[keep], idx[j[keep]]
+                nn = mn[mi]
+                rs.append(((sc - mp[mi]) * nn).sum(1))
+                cols = [nn[:, 0], nn[:, 1], nn[:, 1] * sc[:, 0] - nn[:, 0] * sc[:, 1], nn[:, 2]]
+                cols += [-(nn * dm[mi]).sum(1) for dm in dms]
+                Js.append(np.stack(cols, 1))
+            if not Js or sum(len(r) for r in rs) < 30:
+                return None
+            J, r = np.concatenate(Js), np.concatenate(rs)
+            w = 1.0 / np.maximum(1.0, np.abs(r) / 0.005)
+            dx = -np.linalg.solve(J.T @ (J * w[:, None]) + 1e-8 * np.eye(4 + k), J.T @ (w * r))
+            dT = np.eye(4)
+            dT[:3, :3] = rot_z(dx[2])
+            dT[:3, 3] = (dx[0], dx[1], dx[3])
+            T = dT @ T
+            delta += dx[4:]
+        saved = [(o.model_pts, o.model_nrm) for o in self.obs]
+        try:
+            for o in self.obs:
+                o.model_pts, o.model_nrm = o.model_fn(delta)
+            rms, cov, nin = self.metrics(T)
+        finally:
+            for o, (mp, mn) in zip(self.obs, saved, strict=True):
+                o.model_pts, o.model_nrm = mp, mn
+        table_z = float(T[2, 3] - self.plane.height_m)
+        return {
+            "rms_mm": rms,
+            "coverage": cov,
+            "n_inliers": nin,
+            "table_z_mm": 1000.0 * table_z,
+            "table_z_minus_assumed_mm": 1000.0 * (table_z - self.table_z),
+            "offsets_deg": {n: math.degrees(float(d)) for n, d in zip(OFFSET_JOINTS, delta, strict=True)},
+            "offsets_ticks_approx": {n: math.degrees(float(d)) * TICKS_PER_DEG for n, d in zip(OFFSET_JOINTS, delta, strict=True)},
+            "T_base_color": T.tolist(),
+        }
+
+    def diagnostics(self, T: np.ndarray, T_plane: np.ndarray) -> dict:
+        """Report-only diagnostics of the final pose ``T`` (module docstring, step 5)."""
+        pb = self.plane_in_base(T)
+        info = self.information(T)
+        out = {"plane_in_base": pb, "icp_information": info}
+        if info and pb["tilt_deg"] > 1e-6:
+            weakest = np.array(info["rotation_axes_base"][0]["axis"])
+            c = abs(float(weakest @ np.array(pb["tilt_axis_base"])))
+            out["tilt_axis_vs_weakest_rotation_deg"] = math.degrees(math.acos(min(1.0, c)))
+        alt = self.level_base_alternative(T_plane)
+        if alt is not None:
+            out["level_base_alternative"] = alt
+        return out
+
     # ---------------------------------------------------------------- driver
-    def run(
-        self,
-        *,
-        bootstrap: int = 20,
-        keep_seeds: int = 6,
-        min_inliers: int = MIN_INLIERS,
-        min_visible_samples: int = MIN_VISIBLE_SAMPLES,
-        min_icp_iters: int = MIN_ICP_ITERS,
-    ) -> ArmShapeResult:
-        seeds = self.coarse(keep=keep_seeds)
+    def register(self, *, keep_seeds: int = 6, seeds: list[tuple[float, float, float, float]] | None = None) -> tuple[np.ndarray, list[dict]]:
+        """Steps 1-3: coarse seeds (or the given ``(score, x, y, yaw)`` seeds), planar ICP from each, 6-DOF ICP from
+        the best. Returns the 6-DOF pose and the refined seeds, best first."""
+        seeds = self.coarse(keep=keep_seeds) if seeds is None else seeds
         if not seeds:
             raise ValueError("no seed: no scene points above the table near any arm hypothesis")
         refined = []
         for sc, x, y, yaw in seeds:
             x2, y2, yaw2 = self.icp_planar(x, y, yaw)
             T = self.pose(x2, y2, yaw2)
-            rms, cov, nin = self.metrics(T)
+            rms, cov, _nin = self.metrics(T)
             refined.append({"coarse_score": sc, "x": x2, "y": y2, "yaw_deg": math.degrees(yaw2), "rms_mm": rms, "coverage": cov, "T": T})
         refined.sort(key=lambda r: (-(r["coverage"] >= 0.3), r["rms_mm"] / max(r["coverage"], 1e-3)))
+        return self.icp_6dof(refined[0]["T"]), refined
+
+    def run(
+        self,
+        *,
+        bootstrap: int = 20,
+        keep_seeds: int = 6,
+        seeds: list[tuple[float, float, float, float]] | None = None,
+        min_inliers: int = MIN_INLIERS,
+        min_visible_samples: int = MIN_VISIBLE_SAMPLES,
+        min_icp_iters: int = MIN_ICP_ITERS,
+        diagnostics: bool = True,
+    ) -> ArmShapeResult:
+        T, refined = self.register(keep_seeds=keep_seeds, seeds=seeds)
         best = refined[0]
-        T = self.icp_6dof(best["T"])
         rms, cov, nin = self.metrics(T)
         # plane agreement
         h6 = T[2, 3] - self.table_z
@@ -430,7 +594,8 @@ class ArmShapeRegistration:
         if not tip <= MAX_TIP_PX:
             fails.append(f"FK tip reprojects {tip:.1f} px from the arm > {MAX_TIP_PX} px")
         seeds_json = [{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in r.items()} for r in refined]
+        diag = self.diagnostics(T, best["T"]) if diagnostics else {}
         return ArmShapeResult(
             T, rms, cov, nin, dh, dt, tip, ut, ur, seeds_json, fails, vis_counts, iters6, conv6,
-            min_inliers, min_visible_samples, min_icp_iters,
+            min_inliers, min_visible_samples, min_icp_iters, diag,
         )  # fmt: skip

@@ -134,7 +134,7 @@ dashboard = "python -m so101_rl.viz.dashboard"   # --logdir runs/ (default), loc
 # Camera parity unit SUC (plans/camera-parity-plan.md): calib/camera.yaml is the one source of the D435 model.
 joint-probe = "python -m so101_rl.servo.probe"   # read-only: ping + block read, never writes, refuses next to the servo
 camera-intrinsics = "python -m so101_rl.perception.camera_intrinsics"   # --serial --out calib/camera.yaml
-camera-calibrate = { cmd = "python -m so101_rl.perception.camera_calibrate", env = { MUJOCO_GL = "egl" } }   # --method arm-shape [--poses K]
+camera-calibrate = { cmd = "python -m so101_rl.perception.camera_calibrate", env = { MUJOCO_GL = "egl" } }   # --method arm-shape [--poses K] [--from-capture DIR]
 camera-overlay = { cmd = "python -m so101_rl.perception.camera_overlay", env = { MUJOCO_GL = "egl" } }
 camera-distractors = "python -m so101_rl.perception.distractors"
 # MVP (plans/mvp-plan.md): sim reach trainer (M1-M4) and the minimal lab connector (M5).
