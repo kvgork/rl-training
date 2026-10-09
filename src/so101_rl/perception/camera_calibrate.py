@@ -5,7 +5,9 @@
 
 Per pose: the read-only joint probe (``servo/probe.py``; refuses if the servo process owns the port, never writes a
 register) and ``--frames`` aligned colour + depth frames (``D435Camera``, streaming only). With ``--poses K > 1``
-the operator moves the arm BY HAND with torque off between poses (attended; optional). Then:
+the operator moves the arm BY HAND with torque off between poses (attended; optional): the prompt
+(:func:`hand_pose_prompt`) asks to turn the base ~60 deg (>= 45) with the arm left folded, the second pose that best
+separates a tilted base from joint-zero errors (``diagnostics.tilt_vs_offsets``). Then:
 
 1. the table plane (``perception/table_plane.py``) on the per-pixel median depth of the first pose;
 2. the arm-shape registration (``perception/arm_registration.py``) of the FK surface at the probed angles against
@@ -14,7 +16,8 @@ the operator moves the arm BY HAND with torque off between poses (attended; opti
    registration, so people / the bed / far clutter cannot tilt it), and the registration again on that plane;
 4. the gate (RMS <= 5 mm, model coverage >= 0.8, plane-vs-6-DOF <= 5 mm / 2 deg, FK tip <= 8 px), plus report-only
    diagnostics (``report.json`` ``diagnostics``: the plane in the base frame, the tilt axis, the ICP information,
-   the level-base / joint-offset alternative, the global-vs-workspace plane).
+   the level-base / joint-offset alternative, the tilt + joint-offset joint fit with its verdict
+   ``tilt_vs_offsets`` (printed as one line), the global-vs-workspace plane).
 
 ``--from-capture DIR`` replays the ``capture_<k>.npz`` files (colour, depth frames, probed ticks) of an earlier run:
 no probe, no camera, no bus. It is REPORT-ONLY: it never writes ``calib/camera.yaml`` (the camera may have moved
@@ -66,6 +69,23 @@ from so101_rl.perception.table_plane import (
 )
 
 RUNS = Path("runs/camera-calib")
+# The hand-moved pose that best separates a tilted base from joint-zero errors (``tilt_vs_offsets``; 2026-10-10
+# synthetic study, ARCHITECTURE §5): what matters is the BASE TURN (the shoulder_lift axis then lies at an angle to the
+# tilt axis); raising the upper arm adds little. A torque-off arm must stay put by itself: keep the folded rest posture.
+SECOND_POSE_TURN_DEG = 60
+SECOND_POSE_MIN_TURN_DEG = 45
+
+
+def hand_pose_prompt(k: int, n: int) -> str:
+    """The operator prompt before hand-moved pose ``k`` (0-based, ``k >= 1``) of ``n``. Either turn direction works
+    equally well (synthetic study); a third pose turns the other way."""
+    where = "either way" if k == 1 else "the other way, past the first pose"
+    return (
+        f"pose {k + 1}/{n}: BY HAND, torque stays off: turn the base about {SECOND_POSE_TURN_DEG} deg {where} "
+        f"from the first pose (at least {SECOND_POSE_MIN_TURN_DEG} deg: this turn is what separates a tilted base from "
+        "joint-zero errors). Leave the arm folded as at rest with the gripper on the table; do not lift the upper arm "
+        "unless it stays up by itself. Keep the whole arm in the camera's view, let go, then press Enter "
+    )
 
 
 @dataclass
@@ -206,6 +226,22 @@ def updated_calib(calib: CameraCalib, res: ArmShapeResult, plane: PlaneFit, n_fr
     return calib.with_pose(pose, tp)
 
 
+def tilt_vs_offsets_line(res: ArmShapeResult) -> str:
+    """One line for the operator: the tilt-vs-joint-offset verdict of the diagnostics (report only)."""
+    t = res.diagnostics.get("tilt_vs_offsets")
+    if not t:
+        return "tilt vs joint offsets: not computed"
+    o = t["offsets_deg"]
+    line = (
+        f"tilt vs joint offsets: {t['verdict']} (separation VIF {t['separation_vif']:.2f}, needs <= {t['max_separation_vif']}); "
+        f"base tilt {t['tilt_deg']:.2f} deg, table z {t['table_z_mm']:.1f} mm; offsets shoulder_lift {o['shoulder_lift']:+.2f}, "
+        f"elbow_flex {o['elbow_flex']:+.2f}, wrist_flex {o['wrist_flex']:+.2f} deg"
+    )
+    if t["verdict"] == "ambiguous":
+        line += f"; to separate them rerun with --poses 2 (second pose: base turned ~{SECOND_POSE_TURN_DEG} deg)"
+    return line
+
+
 def load_captures(run_dir: Path) -> list[Capture]:
     """The ``capture_<k>.npz`` files of an earlier ``camera-calibrate`` run, in pose order."""
     files = sorted(Path(run_dir).glob("capture_*.npz"), key=lambda p: int(p.stem.split("_")[1]))
@@ -253,7 +289,7 @@ def main(
     captures = []
     for k in range(a.poses):
         if k > 0:
-            do_wait(f"pose {k + 1}/{a.poses}: move the arm BY HAND (torque stays off), let go, then press Enter ")
+            do_wait(hand_pose_prompt(k, a.poses))
         try:
             ticks = np.asarray(do_probe(), dtype=np.int32)
         except ProbeRefused as e:
@@ -271,6 +307,7 @@ def main(
     out = a.out_dir / ts
     save_artifacts(out, res, plane, obs, captures, calib, {"poses": a.poses, "frames": a.frames, "ticks": [c.ticks.tolist() for c in captures]})
     print(json.dumps({k: v for k, v in res.to_json().items() if k not in ("seeds", "diagnostics")}, indent=1, default=float))
+    print(tilt_vs_offsets_line(res))
     if not res.passed:
         print(f"camera-calibrate: GATE FAIL ({'; '.join(res.failures)}); {a.camera_yaml} NOT changed; artifacts {out}", file=sys.stderr)
         return 1
@@ -296,6 +333,7 @@ def _replay(a: argparse.Namespace, calib: CameraCalib) -> int:
              "replay_of": str(a.from_capture)}  # fmt: skip
     save_artifacts(out, res, plane, obs, captures, calib, extra)
     print(json.dumps({k: v for k, v in res.to_json().items() if k not in ("seeds", "diagnostics")}, indent=1, default=float))
+    print(tilt_vs_offsets_line(res))
     verdict = "PASS" if res.passed else f"GATE FAIL ({'; '.join(res.failures)})"
     print(f"camera-calibrate (replay of {a.from_capture}): {verdict}; report-only, {a.camera_yaml} NOT changed; artifacts {out}")
     return 0 if res.passed else 1
