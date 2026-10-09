@@ -6,6 +6,7 @@ from .loader import (
     is_verified_on_hardware,
     load_calibration,
     load_config,
+    load_geometry,
     load_tasks_config,
     parse_tasks,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "is_verified_on_hardware",
     "load_calibration",
     "load_config",
+    "load_geometry",
     "load_tasks_config",
     "parse_tasks",
     "rad_to_ticks",

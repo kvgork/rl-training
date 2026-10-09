@@ -58,22 +58,26 @@ safe_state:
   rest_ticks: [2050, 2200, 2301, 2745, 2040, 2065]
   torque_off_order: [gripper, wrist_roll, wrist_flex, elbow_flex, shoulder_lift, shoulder_pan]
   # Transit zone for the ramps between rest and home (review B1, safety/transit.py), metres, base frame.
-  table_z_m: -0.02                # table top (same value as sim TABLE_Z_M)
+  # THE table height (base frame). The only place it is written: the box floor and gripper floor below, the transit
+  # floor, the goal / zone heights (env/tasks.py) and the sim scene table (sim/model.py TABLE_Z_M) all follow it.
+  table_z_m: -0.02                # table top
   table_clearance_m: 0.005        # the ramp target's tip never goes below table_z_m + this
   transit_zone_m: 0.05            # below floor + this, joints that lower the tip wait for the lifting joints
   home_box_margin_m: 0.010        # FK(home) at least this far inside every box face
   rest_tolerance_ticks: 100       # reenergize starts within this of rest (arm joints), or per start_min_tip_z_m
   # Re-energise start rule (plan §10 2026-10-06): away from rest the tip must be inside the box AND at least this
-  # high (the old 0.010 m floor, 3 cm above the table). Independent of the running box floor box.z[0] = -0.015.
+  # high (the old 0.010 m floor, 3 cm above the table). Independent of the running box floor (box z[0]).
   start_min_tip_z_m: 0.010
 
 box:                              # metres, base frame (from LIT DEFAULT_BOX)
   x: [0.08, 0.34]
   y: [-0.22, 0.22]
-  z: [-0.015, 0.28]               # floor = table + 5 mm (plan §10 2026-10-06): the jaws can reach a die on the table
+  # z = [safe_state.table_z_m + floor_above_table_m, z_max_m] (loader-derived; -0.015 at the shipped table):
+  floor_above_table_m: 0.005      # floor = table + 5 mm (plan §10 2026-10-06): the jaws can reach a die on the table
+  z_max_m: 0.28
   present_tolerance_m: 0.005      # BOX_PRESENT trips only this far outside the box (review S3); targets: exact box
   # Gripper floor (plan §10 2026-10-06 / 2026-10-07): the LOWEST wrist/gripper point (so101_kinematics.yaml
-  # floor_points) stays >= safe_state.table_z_m + this (1 mm above the table); the tip keeps z[0] = -0.015.
+  # floor_points) stays >= safe_state.table_z_m + this (1 mm above the table); the tip keeps the box floor z[0].
   gripper_floor_clearance_m: 0.001
   gripper_present_tolerance_m: 0.002  # BOX_PRESENT for the gripper points: <= ~1 mm into the table
 
