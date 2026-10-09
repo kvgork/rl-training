@@ -19,13 +19,21 @@ from typing import TYPE_CHECKING, Final
 import mujoco
 import numpy as np
 
+from so101_rl.config.loader import load_geometry
+
 if TYPE_CHECKING:
     from so101_rl.perception.camera_calib import CameraCalib
 
 ASSETS: Final[Path] = Path(__file__).resolve().parents[3] / "assets"
 SCENE_XML: Final[Path] = ASSETS / "so101" / "so101_rl_scene.xml"
 
-TABLE_Z_M: Final[float] = -0.02  # must match the table geom in so101_rl_scene.xml (test-enforced)
+# The table height is config ``safe_state.table_z_m`` (the ONE source, ``config.load_geometry``). The scene XML is
+# authored with its table at -0.02; ``build_spec`` moves the table and everything that sits on it (the zone and
+# fiducial sites, the tray, the die body and the die z of every keyframe) by ``TABLE_Z_M - <authored table z>``.
+TABLE_Z_M: Final[float] = load_geometry()[0]
+TABLE_ATTACHED_SITES: Final[tuple[str, ...]] = ("zone", "fiducial")
+TABLE_ATTACHED_BODIES: Final[tuple[str, ...]] = ("tray", "die")
+DIE_JOINT: Final[str] = "die_free"
 DIE_EDGE_M: Final[float] = 0.016
 ZONE_EDGE_M: Final[float] = 0.060
 
@@ -54,8 +62,43 @@ def _camera_calib(camera: CameraCalib | Path | str | bool | None) -> CameraCalib
     return load_camera_calib(None if camera in (None, True) else Path(camera))
 
 
-def build_spec(scene_xml: Path = SCENE_XML, *, camera: CameraCalib | Path | str | bool | None = None) -> mujoco.MjSpec:
+def _place_table(spec: mujoco.MjSpec, table_z_m: float) -> None:
+    """Move the table and what sits on it so the table top is at ``table_z_m`` (see ``TABLE_Z_M``)."""
+    table = spec.geom("table")
+    dz = float(table_z_m) - float(table.pos[2])
+    if dz == 0.0:
+        return
+    table.pos = [table.pos[0], table.pos[1], float(table_z_m)]
+    for name in TABLE_ATTACHED_SITES:
+        site = spec.site(name)
+        site.pos = [site.pos[0], site.pos[1], site.pos[2] + dz]
+    for name in TABLE_ATTACHED_BODIES:
+        body = spec.body(name)
+        body.pos = [body.pos[0], body.pos[1], body.pos[2] + dz]
+    adr = 0  # qpos address of the die's free joint (joints in spec order; free 7, ball 4, else 1)
+    for j in spec.joints:
+        if j.name == DIE_JOINT:
+            break
+        adr += {mujoco.mjtJoint.mjJNT_FREE: 7, mujoco.mjtJoint.mjJNT_BALL: 4}.get(j.type, 1)
+    else:
+        raise ValueError(f"scene: joint {DIE_JOINT!r} missing")
+    for key in spec.keys:
+        q = list(key.qpos)
+        if len(q) > adr + 2:
+            q[adr + 2] += dz
+            key.qpos = q
+
+
+def build_spec(
+    scene_xml: Path = SCENE_XML,
+    *,
+    camera: CameraCalib | Path | str | bool | None = None,
+    table_z_m: float | None = None,
+) -> mujoco.MjSpec:
+    """The RL scene with the jaw primitives, the tip site, the D435 cameras (``camera``: see :func:`_camera_calib`)
+    and the table at ``table_z_m`` (default ``TABLE_Z_M`` = config ``safe_state.table_z_m``)."""
     spec = mujoco.MjSpec.from_file(str(scene_xml))
+    _place_table(spec, TABLE_Z_M if table_z_m is None else table_z_m)
     jaw_default = spec.find_default(JAW_COL_CLASS)
     if jaw_default is None:
         raise ValueError(f"{scene_xml}: default class {JAW_COL_CLASS!r} missing")
@@ -84,11 +127,15 @@ def build_spec(scene_xml: Path = SCENE_XML, *, camera: CameraCalib | Path | str 
 
 
 def load_model(
-    scene_xml: Path = SCENE_XML, *, camera: CameraCalib | Path | str | bool | None = None
+    scene_xml: Path = SCENE_XML,
+    *,
+    camera: CameraCalib | Path | str | bool | None = None,
+    table_z_m: float | None = None,
 ) -> tuple[mujoco.MjModel, mujoco.MjData]:
-    """Compile the RL scene with the D435 cameras of ``calib/camera.yaml`` (``camera``: see :func:`build_spec`).
-    Resolves mesh paths relative to ``assets/``; returns ``(model, data)`` at keyframe ``rest``."""
-    model = build_spec(Path(scene_xml), camera=camera).compile()
+    """Compile the RL scene with the D435 cameras of ``calib/camera.yaml`` (``camera``: see :func:`build_spec`) and
+    the table at ``table_z_m`` (default: the config's). Resolves mesh paths relative to ``assets/``; returns
+    ``(model, data)`` at keyframe ``rest``."""
+    model = build_spec(Path(scene_xml), camera=camera, table_z_m=table_z_m).compile()
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, model.key("rest").id)
     mujoco.mj_forward(model, data)

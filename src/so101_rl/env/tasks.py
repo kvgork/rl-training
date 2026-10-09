@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
 
-from so101_rl.config.loader import load_tasks_config
+from so101_rl.config.loader import load_geometry, load_tasks_config
 from so101_rl.config.schema import RewardSpec, TasksConfig, WorkspaceBox
 
 from .obs import DIE_OBS, REACH_OBS, PolicyObsLayout
@@ -118,7 +118,7 @@ class GoalBounds:
 class ZoneSpec:
     center_xy_m: tuple[float, float]
     half_edge_m: float = 0.030
-    z_table_m: float = -0.02
+    z_table_m: float  # config safe_state.table_z_m (the one table height; load_geometry)
     max_height_m: float  # centroid at most this far above ``desired`` (the resting height) counts (config: 16 mm)
 
     def goal_xyz(self) -> np.ndarray:
@@ -174,9 +174,12 @@ _ZONE_CENTER_XY_M: Final[tuple[float, float]] = (0.22, 0.10)  # scene site `zone
 _ZONE_HALF_EDGE_M: Final[float] = 0.030
 
 
-def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
+def task_from_config(name: str, tasks: TasksConfig, geometry: tuple[float, WorkspaceBox] | None = None) -> TaskSpec:
     """Build the FS4 task ``name`` with the configurable part from ``tasks`` (``cfg.tasks`` or
-    ``load_tasks_config()``). Raises :class:`~so101_rl.env.reward.RewardSpecError` for an invalid reward."""
+    ``load_tasks_config()``) and ``geometry`` = ``(table_z_m, box)`` (default: ``load_geometry()`` of the shipped
+    yaml, so the goal box and the zone height follow ``safe_state.table_z_m``). Raises
+    :class:`~so101_rl.env.reward.RewardSpecError` for an invalid reward."""
+    table_z_m, box = geometry if geometry is not None else load_geometry()
     if name == "reach":
         tc = tasks.reach
         return TaskSpec(
@@ -189,7 +192,7 @@ def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
             settle_m=None,
             reward=tc.reward,
             trip_penalty=tc.trip_penalty,
-            goal_bounds=GoalBounds(box=WorkspaceBox()),  # schema defaults == so101.yaml box (test-enforced)
+            goal_bounds=GoalBounds(box=box),
             zone=None,
             die_start=None,
             start_pose="home",
@@ -199,7 +202,7 @@ def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
         if tc.max_height_m is None or tc.settle_mm is None:
             raise ValueError("tasks.die_to_zone needs max_height_m and settle_mm")
         zone = ZoneSpec(
-            center_xy_m=_ZONE_CENTER_XY_M, half_edge_m=_ZONE_HALF_EDGE_M, z_table_m=-0.02, max_height_m=tc.max_height_m
+            center_xy_m=_ZONE_CENTER_XY_M, half_edge_m=_ZONE_HALF_EDGE_M, z_table_m=table_z_m, max_height_m=tc.max_height_m
         )
         return TaskSpec(
             name="die_to_zone",
@@ -211,7 +214,7 @@ def task_from_config(name: str, tasks: TasksConfig) -> TaskSpec:
             settle_m=tc.settle_mm / 1000.0,
             reward=tc.reward,
             trip_penalty=tc.trip_penalty,
-            goal_bounds=GoalBounds(box=WorkspaceBox()),
+            goal_bounds=GoalBounds(box=box),
             zone=zone,
             # NEEDS H9: placeholder start well
             die_start=DieStartSpec(well_center_xy_m=(0.20, -0.05), sigma_xy_m=0.005, measured_on_hardware=False),

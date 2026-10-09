@@ -33,6 +33,12 @@ rest.
    noise), and the **level-base alternative**: the plane-constrained pose with a free height plus zero offsets of
    shoulder_lift, elbow_flex, wrist_flex and wrist_roll. When that fits as well as the 6-DOF pose, a single pose cannot
    tell a tilted base from joint-zero (calibration) errors: shoulder_lift and a tilt about base y correlate at ~0.9.
+   **Tilt vs offsets** (``tilt_vs_offsets``, 2026-10-10): the 6-DOF pose and the joint offsets fitted TOGETHER, with
+   the separation VIF (how much the free offsets inflate the tilt's sigma; pose geometry only) and a verdict
+   (``tilted_base`` / ``joint_offsets`` / ``both`` / ``neither``, or ``ambiguous`` when the VIF is above
+   :data:`MAX_SEPARATION_VIF`). A second pose with the base TURNED (the shoulder_lift axis then lies at an angle to
+   the tilt axis) is what separates them: one rest pose VIF ~3, + the base turned 45 deg ~2.0, 60 deg ~1.5-1.7;
+   raising the upper arm adds little.
 
 **Degeneracy.** A shoulder_pan error is indistinguishable from a camera yaw about the base's vertical axis (only
 the static base mesh breaks the symmetry, weakly): 60 ticks of pan error moved the result 39 mm with identical
@@ -72,6 +78,13 @@ ICP_STAGE_ITERS = 40  # per trim stage (15 mm, then 8 mm)
 # Diagnostic joint-offset fit (level-base alternative): the joints whose zero error mimics a camera tilt.
 OFFSET_JOINTS = ("shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 TICKS_PER_DEG = 4096 / 360.0
+# Tilt-vs-offset verdict (diagnostics ``tilt_vs_offsets``, report only). The separation VIF is pose geometry only
+# (2026-10-10 synthetic study, rest pose + a second pose): one pose ~2.2-3.1 (rig: 2.5-4.7), base turned 30 deg ~2.4,
+# 45 deg ~2.0, 60 deg ~1.5-1.7. The significance levels sit above the bias an unmodelled cable + a 1.5 % depth scale
+# put on the fit (two poses: tilt <= 0.3 deg, offsets <= 1.35 deg), not at the statistical sigma (~0.03 deg).
+MAX_SEPARATION_VIF = 2.2
+TILT_SIGNIFICANT_DEG = 1.5
+OFFSET_SIGNIFICANT_DEG = 2.0
 
 
 @dataclass
@@ -456,66 +469,150 @@ class ArmShapeRegistration:
             "translation_axes_base": [{"axis": Vt[:, k].tolist(), "sigma_mm": 1000.0 * sig / math.sqrt(et[k])} for k in range(3)],
         }
 
-    def level_base_alternative(self, T_plane: np.ndarray, *, iters: int = 40, eps: float = 1e-3) -> dict | None:
-        """Fit the plane-constrained pose (x, y, yaw) with a FREE height plus zero offsets of :data:`OFFSET_JOINTS`
-        (shared by all observations), from ``T_plane``. The competing explanation of a plane-vs-6-DOF tilt: a level
-        base whose FK is off. None when an observation has no ``model_fn``."""
+    def _offset_problem(self, T: np.ndarray, delta: np.ndarray, trim: float, *, eps: float = 1e-3, max_pts: int = 6000):
+        """Point-to-plane linearisation of the pose-plus-joint-offset model at (``T``, ``delta``): (J [N, 6 + k],
+        r [N], distances [N]). Pose columns: (omega, t) of a left perturbation in the base frame (as :meth:`_step6`);
+        offset columns: the model motion per rad of each :data:`OFFSET_JOINTS` offset (finite differences)."""
+        k = len(OFFSET_JOINTS)
+        Js, rs, ds = [], [], []
+        for oi, o in enumerate(self.obs):
+            assert o.model_fn is not None
+            mp, mn = o.model_fn(delta)
+            dms = [(o.model_fn(delta + eps * np.eye(k)[j])[0] - mp) / eps for j in range(k)]
+            idx = np.nonzero(visible_model(T, mp, mn, self.intr))[0]
+            if len(idx) < 20:
+                continue
+            sc = self._scene_base(T, oi)
+            lo, hi = mp[idx].min(0) - 0.03, mp[idx].max(0) + 0.03
+            inb = ((sc >= lo) & (sc <= hi)).all(1)
+            sc = sc[inb]
+            if len(sc) > max_pts:
+                sc = sc[np.argpartition(self._keys[oi][inb], max_pts)[:max_pts]]
+            d, j = _nn(sc, mp[idx])
+            keep = d < trim
+            sc, mi = sc[keep], idx[j[keep]]
+            nn = mn[mi]
+            rs.append(((sc - mp[mi]) * nn).sum(1))
+            ds.append(d[keep])
+            Js.append(np.concatenate([np.cross(sc, nn), nn, np.stack([-(nn * dm[mi]).sum(1) for dm in dms], 1)], 1))
+        if not Js:
+            return np.zeros((0, 6 + k)), np.zeros(0), np.zeros(0)
+        return np.concatenate(Js), np.concatenate(rs), np.concatenate(ds)
+
+    def offset_fit(self, T0: np.ndarray, *, level: bool, iters: int = 40) -> dict | None:
+        """Fit the camera pose TOGETHER with zero offsets of :data:`OFFSET_JOINTS` (shared by all observations),
+        from ``T0``. ``level``: the pose keeps the table plane's roll / pitch (free x, y, yaw and height: the level-base
+        explanation); otherwise all 6 DOF are free (tilt and offsets at once: separable only from several poses at
+        different pan angles, :meth:`tilt_vs_offsets`). None when an observation has no ``model_fn``.
+
+        ``cov`` is the Gauss-Newton covariance of the parameters for the observed (Huber-weighted) residual spread,
+        independent points assumed: a LOWER BOUND (depth noise is spatially correlated); its correlations are exact."""
         if any(o.model_fn is None for o in self.obs):
             return None
         k = len(OFFSET_JOINTS)
+        free = np.array([2, 3, 4, 5] if level else [0, 1, 2, 3, 4, 5]).tolist() + list(range(6, 6 + k))
         delta = np.zeros(k)
-        T = T_plane.copy()
+        T = T0.copy()
+        A = np.eye(len(free))
+        sig = math.nan
         for it in range(iters):
             trim = 0.015 if it < iters // 2 else 0.008
-            Js, rs = [], []
-            for oi, o in enumerate(self.obs):
-                mp, mn = o.model_fn(delta)
-                dms = [(o.model_fn(delta + eps * np.eye(k)[j])[0] - mp) / eps for j in range(k)]
-                idx = np.nonzero(visible_model(T, mp, mn, self.intr))[0]
-                if len(idx) < 20:
-                    continue
-                sc = self._scene_base(T, oi)
-                lo, hi = mp[idx].min(0) - 0.03, mp[idx].max(0) + 0.03
-                inb = ((sc >= lo) & (sc <= hi)).all(1)
-                sc = sc[inb]
-                if len(sc) > 6000:
-                    sc = sc[np.argpartition(self._keys[oi][inb], 6000)[:6000]]
-                d, j = _nn(sc, mp[idx])
-                keep = d < trim
-                sc, mi = sc[keep], idx[j[keep]]
-                nn = mn[mi]
-                rs.append(((sc - mp[mi]) * nn).sum(1))
-                cols = [nn[:, 0], nn[:, 1], nn[:, 1] * sc[:, 0] - nn[:, 0] * sc[:, 1], nn[:, 2]]
-                cols += [-(nn * dm[mi]).sum(1) for dm in dms]
-                Js.append(np.stack(cols, 1))
-            if not Js or sum(len(r) for r in rs) < 30:
+            J, r, d = self._offset_problem(T, delta, trim)
+            if len(r) < 30:
                 return None
-            J, r = np.concatenate(Js), np.concatenate(rs)
-            w = 1.0 / np.maximum(1.0, np.abs(r) / 0.005)
-            dx = -np.linalg.solve(J.T @ (J * w[:, None]) + 1e-8 * np.eye(4 + k), J.T @ (w * r))
+            J = J[:, free]
+            w = 1.0 / np.maximum(1.0, np.abs(r) / 0.005) * (1.0 - (d / trim) ** 2) ** 2
+            A = J.T @ (J * w[:, None])
+            sig = float(np.sqrt(np.sum(w * r**2) / np.sum(w)))
+            dx = np.zeros(6 + k)
+            dx[free] = -np.linalg.solve(A + 1e-8 * np.eye(len(free)), J.T @ (w * r))
             dT = np.eye(4)
-            dT[:3, :3] = rot_z(dx[2])
-            dT[:3, 3] = (dx[0], dx[1], dx[3])
+            dT[:3, :3] = _rotvec(dx[:3])
+            dT[:3, 3] = dx[3:6]
             T = dT @ T
-            delta += dx[4:]
+            delta += dx[6:]
+            if np.abs(dx).max() < 1e-6:
+                break
+        cov = np.full((6 + k, 6 + k), 0.0)
+        cov[np.ix_(free, free)] = sig**2 * np.linalg.inv(A + 1e-12 * np.eye(len(free)))
+        info = np.zeros((6 + k, 6 + k))
+        info[np.ix_(free, free)] = A / sig**2
         saved = [(o.model_pts, o.model_nrm) for o in self.obs]
         try:
             for o in self.obs:
                 o.model_pts, o.model_nrm = o.model_fn(delta)
-            rms, cov, nin = self.metrics(T)
+            rms, coverage, nin = self.metrics(T)
         finally:
             for o, (mp, mn) in zip(self.obs, saved, strict=True):
                 o.model_pts, o.model_nrm = mp, mn
         table_z = float(T[2, 3] - self.plane.height_m)
+        sd = np.sqrt(np.diag(cov))
         return {
             "rms_mm": rms,
-            "coverage": cov,
+            "coverage": coverage,
             "n_inliers": nin,
             "table_z_mm": 1000.0 * table_z,
             "table_z_minus_assumed_mm": 1000.0 * (table_z - self.table_z),
-            "offsets_deg": {n: math.degrees(float(d)) for n, d in zip(OFFSET_JOINTS, delta, strict=True)},
-            "offsets_ticks_approx": {n: math.degrees(float(d)) * TICKS_PER_DEG for n, d in zip(OFFSET_JOINTS, delta, strict=True)},
+            "offsets_deg": {n: math.degrees(float(v)) for n, v in zip(OFFSET_JOINTS, delta, strict=True)},
+            "offsets_sigma_deg": {n: math.degrees(float(v)) for n, v in zip(OFFSET_JOINTS, sd[6:], strict=True)},
+            "offsets_ticks_approx": {n: math.degrees(float(v)) * TICKS_PER_DEG for n, v in zip(OFFSET_JOINTS, delta, strict=True)},
             "T_base_color": T.tolist(),
+            "_T": T,
+            "_cov": cov,
+            "_info": info,
+        }
+
+    def level_base_alternative(self, T_plane: np.ndarray, *, iters: int = 40) -> dict | None:
+        """The plane-constrained pose with a FREE height plus zero offsets of :data:`OFFSET_JOINTS`, from ``T_plane``:
+        the competing explanation of a plane-vs-6-DOF tilt, a level base whose FK is off (:meth:`offset_fit`)."""
+        fit = self.offset_fit(T_plane, level=True, iters=iters)
+        return None if fit is None else {k: v for k, v in fit.items() if not k.startswith("_")}
+
+    def tilt_vs_offsets(self, T: np.ndarray) -> dict | None:
+        """Base tilt AND joint-zero offsets fitted together (:meth:`offset_fit` with all 6 pose DOF free, from the
+        6-DOF pose ``T``), with a verdict (module docstring, step 5). None when an observation has no ``model_fn``.
+
+        ``separation_vif``: how much freeing the joint offsets inflates the 1-sigma of the tilt about base y (the
+        axis a shoulder_lift error mimics at pan 0): sqrt(var(tilt | offsets free) / var(tilt | offsets fixed)). It
+        depends only on the arm poses and the camera, not on the noise. Above :data:`MAX_SEPARATION_VIF` the poses
+        cannot tell the two apart (one pose: ~3; a second pose with the base turned 45 / 60 deg: ~1.8-2.0 / ~1.6), and
+        the verdict is ``ambiguous`` whatever the fit says. Otherwise the verdict is ``tilted_base``, ``joint_offsets``,
+        ``both`` or ``neither`` by :data:`TILT_SIGNIFICANT_DEG` / :data:`OFFSET_SIGNIFICANT_DEG`."""
+        fit = self.offset_fit(T, level=False)
+        if fit is None:
+            return None
+        cov, info = fit["_cov"], fit["_info"]
+        pb = self.plane_in_base(fit["_T"])
+        n = np.asarray(pb["normal_base"])
+        var_fixed = float(np.linalg.inv(info[:6, :6] + 1e-12 * np.eye(6))[1, 1])
+        vif = math.sqrt(float(cov[1, 1]) / max(var_fixed, 1e-30))
+        offs = {j: v for j, v in fit["offsets_deg"].items() if j != "wrist_roll"}  # wrist_roll: barely visible, report only
+        tilt_sig = pb["tilt_deg"] >= TILT_SIGNIFICANT_DEG
+        off_sig = max(abs(v) for v in offs.values()) >= OFFSET_SIGNIFICANT_DEG
+        if vif > MAX_SEPARATION_VIF:
+            verdict = "ambiguous"
+        else:
+            verdict = {(True, False): "tilted_base", (False, True): "joint_offsets", (True, True): "both"}.get((tilt_sig, off_sig), "neither")
+        c = cov[[0, 1, 6, 8]][:, [0, 1, 6, 8]]
+        sd = np.sqrt(np.diag(c))
+        return {
+            "verdict": verdict,
+            "separation_vif": vif,
+            "max_separation_vif": MAX_SEPARATION_VIF,
+            "rms_mm": fit["rms_mm"],
+            "coverage": fit["coverage"],
+            "tilt_deg": pb["tilt_deg"],
+            "tilt_about_base_x_deg": math.degrees(math.atan2(-n[1], n[2])),
+            "tilt_about_base_y_deg": math.degrees(math.atan2(n[0], n[2])),
+            "tilt_sigma_deg": {"x": math.degrees(float(sd[0])), "y": math.degrees(float(sd[1]))},
+            "table_z_mm": pb["table_z_at_base_origin_mm"],
+            "table_z_minus_assumed_mm": pb["table_z_at_base_origin_mm"] - 1000.0 * self.table_z,
+            "offsets_deg": fit["offsets_deg"],
+            "offsets_sigma_deg": fit["offsets_sigma_deg"],
+            "offsets_ticks_approx": fit["offsets_ticks_approx"],
+            "corr_tilt_y_shoulder_lift": float(c[1, 2] / max(sd[1] * sd[2], 1e-30)),
+            "sigma_note": "Gauss-Newton 1-sigma for independent points: a lower bound (depth errors are spatially correlated)",
+            "T_base_color": fit["T_base_color"],
         }
 
     def diagnostics(self, T: np.ndarray, T_plane: np.ndarray) -> dict:
@@ -530,6 +627,9 @@ class ArmShapeRegistration:
         alt = self.level_base_alternative(T_plane)
         if alt is not None:
             out["level_base_alternative"] = alt
+        tvo = self.tilt_vs_offsets(T)
+        if tvo is not None:
+            out["tilt_vs_offsets"] = tvo
         return out
 
     # ---------------------------------------------------------------- driver

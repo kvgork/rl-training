@@ -20,6 +20,7 @@ from typing import Protocol
 
 import numpy as np
 
+from so101_rl.config.loader import load_geometry
 from so101_rl.config.schema import WorkspaceBox
 from so101_rl.perception.camera import DEFAULT_SERIAL, FakeCamera, Intrinsics
 from so101_rl.perception.camera_calib import load_camera_calib
@@ -131,7 +132,7 @@ def _dry_run(out: Path, n_poses: int, seed: int) -> int:
     T_true = calib.T_base_color
     rig = SyntheticRig(T_true, intr, tracker)
     rng = np.random.default_rng(seed)
-    cands = sample_box_points(WorkspaceBox(), 200, rng)
+    cands = sample_box_points(load_geometry()[1], 200, rng)
     he = run_calibration(rig, cands, n_poses=n_poses, camera_serial="dry-run")
     save_hand_eye(he, out)
     load_hand_eye(out)  # the artifact must pass its own gate

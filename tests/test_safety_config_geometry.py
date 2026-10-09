@@ -98,8 +98,8 @@ def test_home_outside_the_box_is_rejected(tmp_path, calibration):
 def test_home_inside_but_closer_than_the_margin_is_rejected(tmp_path, calibration, fk, cfg):
     home = np.asarray(cfg.safe_state.home_ticks)
     z = tip(fk, home)[2]
-    # move the box floor up to 5 mm below the home tip: inside, but not 10 mm inside
-    _rejects(tmp_path, calibration, lambda r: r["box"].update(z=[float(z) - 0.005, 0.28]), "inside the box")
+    # move the box top down to 5 mm above the home tip: inside, but not 10 mm inside
+    _rejects(tmp_path, calibration, lambda r: r["box"].update(z_max_m=float(z) + 0.005), "inside the box")
 
 
 def test_rest_below_the_table_floor_is_rejected(tmp_path, calibration):
@@ -125,7 +125,7 @@ def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
     def mut(raw):
         raw["safe_state"]["rest_ticks"] = [2050, 2264, 2481, 2993, 2040, 2065]
         raw["safe_state"]["table_z_m"] = 0.0025
-        raw["box"]["z"] = [0.010, 0.28]  # the loader needs table_z_m < box.z[0] (shipped floor: -0.015)
+        raw["box"]["floor_above_table_m"] = 0.0075  # box floor z[0] = table + this = 0.010
         raw["safe_state"]["start_min_tip_z_m"] = 0.0125  # >= table + 1 cm (loader rule)
 
     probs = _problems(tmp_path, calibration, mut)
@@ -136,12 +136,10 @@ def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
 
 def test_transit_dip_is_rejected(tmp_path, calibration):
     """Raise the table 5 mm above the rest tip: the replay starts below the floor (plain transit would sit there /
-    dip), and says so with the dip message, not only the rest-floor one. (The box floor is raised with it: the
-    loader requires table_z_m < box.z[0], and the shipped floor -0.015 is below this table.)"""
+    dip), and says so with the dip message, not only the rest-floor one. (The box floor follows the table.)"""
 
     def mut(raw):
-        raw["safe_state"]["table_z_m"] = -0.012
-        raw["box"]["z"] = [-0.007, 0.28]
+        raw["safe_state"]["table_z_m"] = -0.012  # the box floor follows: table + 5 mm = -0.007
 
     probs = _problems(tmp_path, calibration, mut)
     assert any("rest -> home transit dips" in p for p in probs)
@@ -260,15 +258,24 @@ def test_explicit_chain_bypasses_the_cache(cfg, calibration):
 
 
 # ---- table_z_m sanity range, in the (pure) loader --------------------------------------------------------------
-@pytest.mark.parametrize("bad", [-0.25, -0.015, 0.010, 0.05])  # -0.015: equal to the shipped box floor
+@pytest.mark.parametrize("bad", [-0.25, 0.03, 0.05])
 def test_table_z_is_range_checked_by_the_loader(tmp_path, calibration, bad):
     with pytest.raises(ValueError, match="table_z_m"):
         load_config(_variant(tmp_path, lambda r: r["safe_state"].update(table_z_m=bad)), calibration=calibration)
 
 
-def test_table_just_below_the_box_floor_is_accepted(tmp_path, calibration):
-    cfg = load_config(_variant(tmp_path, lambda r: r["safe_state"].update(table_z_m=-0.0151)), calibration=calibration)
-    assert cfg.safe_state.table_z_m < cfg.box.z[0] == -0.015
+@pytest.mark.parametrize("bad", [0.0, -0.001, 0.06])
+def test_box_floor_offset_is_range_checked_by_the_loader(tmp_path, calibration, bad):
+    with pytest.raises(ValueError, match="floor_above_table_m"):
+        load_config(_variant(tmp_path, lambda r: r["box"].update(floor_above_table_m=bad)), calibration=calibration)
+
+
+def test_both_box_floors_follow_the_table(tmp_path, calibration):
+    """safe_state.table_z_m is the one table height: the tip floor (table + 5 mm) and the gripper floor (table + 1 mm)
+    are derived from it, never written twice (the recalibration what-if of 2026-10-10: table at -5 mm)."""
+    cfg = load_config(_variant(tmp_path, lambda r: r["safe_state"].update(table_z_m=-0.005)), calibration=calibration)
+    assert cfg.box.z == (0.0, 0.28)
+    assert cfg.box.gripper_floor_z_m == pytest.approx(-0.004)
 
 
 # ---- dependency direction: config is a leaf ----------------------------------------------------------------------
