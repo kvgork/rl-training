@@ -1,6 +1,7 @@
 """``camera-calibrate --method arm-shape``: camera-only extrinsics of the D435 (camera parity C.2).
 
 ``pixi run camera-calibrate --method arm-shape [--poses K] [--frames 10]``
+``pixi run camera-calibrate --method arm-shape --from-capture runs/camera-calib/<ts>`` (offline replay)
 
 Per pose: the read-only joint probe (``servo/probe.py``; refuses if the servo process owns the port, never writes a
 register) and ``--frames`` aligned colour + depth frames (``D435Camera``, streaming only). With ``--poses K > 1``
@@ -9,14 +10,23 @@ the operator moves the arm BY HAND with torque off between poses (attended; opti
 1. the table plane (``perception/table_plane.py``) on the per-pixel median depth of the first pose;
 2. the arm-shape registration (``perception/arm_registration.py``) of the FK surface at the probed angles against
    the depth cloud, constrained by the plane, from several seeds;
-3. the gate (RMS <= 5 mm, model coverage >= 0.8, plane-vs-6-DOF <= 5 mm / 2 deg, FK tip <= 8 px).
+3. the table plane again on the workspace only (``refit_in_workspace``: 6-35 cm from the base axis under the first
+   registration, so people / the bed / far clutter cannot tilt it), and the registration again on that plane;
+4. the gate (RMS <= 5 mm, model coverage >= 0.8, plane-vs-6-DOF <= 5 mm / 2 deg, FK tip <= 8 px), plus report-only
+   diagnostics (``report.json`` ``diagnostics``: the plane in the base frame, the tilt axis, the ICP information,
+   the level-base / joint-offset alternative, the global-vs-workspace plane).
+
+``--from-capture DIR`` replays the ``capture_<k>.npz`` files (colour, depth frames, probed ticks) of an earlier run:
+no probe, no camera, no bus. It is REPORT-ONLY: it never writes ``calib/camera.yaml`` (the camera may have moved
+since the capture), whatever the gate says; artifacts go to ``runs/camera-calib/<ts>-replay/``.
 
 Artifacts go to ``runs/camera-calib/<ts>/``: ``report.json``, ``scene_<k>.ply`` / ``model_<k>.ply`` (base frame,
 registered), ``overlay_<k>.png`` (the colour frame with the registered model points and the FK tip), and the raw
 capture ``capture_<k>.npz``. ``calib/camera.yaml`` is rewritten (pose method ``arm-shape``, residual, bootstrap
 uncertainty, table plane; intrinsics untouched) ONLY when the gate passes; otherwise the previous file stays.
 
-Exit codes: 0 PASS (file written), 1 gate FAIL (nothing written), 3 hardware refused (probe or camera).
+Exit codes: 0 PASS (file written; replay: nothing written), 1 gate FAIL (nothing written), 3 hardware refused (probe
+or camera), 2 usage (also: no capture in the ``--from-capture`` directory).
 """
 
 from __future__ import annotations
@@ -24,6 +34,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,7 +42,12 @@ from pathlib import Path
 
 import numpy as np
 
-from so101_rl.perception.arm_registration import ArmShapeRegistration, ArmShapeResult, Observation
+from so101_rl.perception.arm_registration import (
+    OFFSET_JOINTS,
+    ArmShapeRegistration,
+    ArmShapeResult,
+    Observation,
+)
 from so101_rl.perception.camera_calib import (
     CAMERA_YAML,
     CameraCalib,
@@ -41,7 +57,13 @@ from so101_rl.perception.camera_calib import (
     save_camera_calib,
     today,
 )
-from so101_rl.perception.table_plane import PlaneFit, depth_to_points, fit_table_plane, median_depth
+from so101_rl.perception.table_plane import (
+    PlaneFit,
+    depth_to_points,
+    fit_table_plane,
+    median_depth,
+    refit_in_workspace,
+)
 
 RUNS = Path("runs/camera-calib")
 
@@ -77,6 +99,7 @@ def observations(model, calibration, calib: CameraCalib, captures: list[Capture]
     from so101_rl.sim.arm_cloud import ArmSurface, qpos_from_ticks
 
     surf = ArmSurface(model)
+    adr = np.array([model.jnt_qposadr[model.joint(n).id] for n in OFFSET_JOINTS])
     obs = []
     plane = None
     for cap in captures:
@@ -86,15 +109,46 @@ def observations(model, calibration, calib: CameraCalib, captures: list[Capture]
             plane = fit_table_plane(pts)
         q = qpos_from_ticks(model, cap.ticks, calibration)
         mp, mn = surf.points(q)
-        obs.append(Observation(pts, pix, mp, mn, surf.site(q, "gripper_tip"), dm))
+
+        def model_fn(delta: np.ndarray, q: np.ndarray = q) -> tuple[np.ndarray, np.ndarray]:
+            qq = q.copy()
+            qq[adr] += delta
+            return surf.points(qq)
+
+        obs.append(Observation(pts, pix, mp, mn, surf.site(q, "gripper_tip"), dm, model_fn))
     assert plane is not None
     return obs, plane
 
 
-def calibrate(model, calibration, calib: CameraCalib, captures: list[Capture], table_z_m: float, *, seed: int = 0, bootstrap: int = 20) -> tuple[ArmShapeResult, PlaneFit, list[Observation]]:
+def _plane_json(p: PlaneFit) -> dict:
+    return {"normal_up_color": p.normal_up.tolist(), "height_m": p.height_m, "inlier_fraction": p.inlier_fraction}
+
+
+def calibrate(
+    model, calibration, calib: CameraCalib, captures: list[Capture], table_z_m: float, *, seed: int = 0,
+    bootstrap: int = 20, workspace_plane: bool = True, diagnostics: bool = True,
+) -> tuple[ArmShapeResult, PlaneFit, list[Observation]]:  # fmt: skip
+    """Register (module docstring, steps 1-4). With ``workspace_plane`` a first registration on the global plane
+    places the base, the plane is refitted on the workspace (``refit_in_workspace``), and the registration runs again
+    on it; the plane returned is the one the gate used."""
     obs, plane = observations(model, calibration, calib, captures)
+    plane_global = plane
+    seeds = None
+    if workspace_plane:
+        T1, refined = ArmShapeRegistration(obs, plane, calib.color, table_z_m, seed=seed).register()
+        ws = refit_in_workspace(obs[0].pts_cam, plane, T1, seed=seed)
+        if ws is not None:
+            plane = ws
+            # the plane moved little: the first pass's refined (x, y, yaw) seed the second, without a new coarse search
+            seeds = [(r["coarse_score"], r["x"], r["y"], math.radians(r["yaw_deg"])) for r in refined]
     reg = ArmShapeRegistration(obs, plane, calib.color, table_z_m, seed=seed)
-    return reg.run(bootstrap=bootstrap), plane, obs
+    res = reg.run(bootstrap=bootstrap, seeds=seeds, diagnostics=diagnostics)
+    if diagnostics:
+        res.diagnostics["table_plane_global"] = _plane_json(plane_global)
+        res.diagnostics["table_plane_used"] = "workspace" if plane is not plane_global else "global"
+        ang = float(np.degrees(np.arccos(np.clip(plane.normal_up @ plane_global.normal_up, -1.0, 1.0))))
+        res.diagnostics["workspace_vs_global_plane"] = {"angle_deg": ang, "height_mm": 1000.0 * (plane.height_m - plane_global.height_m)}
+    return res, plane, obs
 
 
 def write_ply(path: Path, pts: np.ndarray) -> None:
@@ -133,11 +187,7 @@ def save_artifacts(out: Path, res: ArmShapeResult, plane: PlaneFit, obs: list[Ob
             f"arm-shape {verdict}: rms {res.rms_mm:.2f} mm  coverage {res.coverage:.2f}  tip {res.tip_px_err:.1f} px",
             f"plane dh {res.plane_height_err_mm:.1f} mm  dtilt {res.plane_tilt_err_deg:.2f} deg",
         ])  # fmt: skip
-    rep = {
-        **res.to_json(),
-        "table_plane": {"normal_up_color": plane.normal_up.tolist(), "height_m": plane.height_m, "inlier_fraction": plane.inlier_fraction},
-        **extra,
-    }
+    rep = {**res.to_json(), "table_plane": _plane_json(plane), **extra}
     (out / "report.json").write_text(json.dumps(rep, indent=1, default=float))
 
 
@@ -154,6 +204,16 @@ def updated_calib(calib: CameraCalib, res: ArmShapeResult, plane: PlaneFit, n_fr
     )
     tp = TablePlane(plane.normal_up, plane.height_m, plane.inlier_fraction, n_frames, today())
     return calib.with_pose(pose, tp)
+
+
+def load_captures(run_dir: Path) -> list[Capture]:
+    """The ``capture_<k>.npz`` files of an earlier ``camera-calibrate`` run, in pose order."""
+    files = sorted(Path(run_dir).glob("capture_*.npz"), key=lambda p: int(p.stem.split("_")[1]))
+    out = []
+    for f in files:
+        with np.load(f) as z:
+            out.append(Capture(z["rgb"], z["depth"].astype(np.float32), np.asarray(z["ticks"], dtype=np.int32)))
+    return out
 
 
 def main(
@@ -176,10 +236,14 @@ def main(
     ap.add_argument("--port", default=None)
     ap.add_argument("--calibration", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--from-capture", type=Path, default=None, metavar="DIR",
+                    help="replay the capture_<k>.npz of an earlier run offline (no probe, no camera); report-only")  # fmt: skip
     a = ap.parse_args(argv)
     if a.poses < 1 or a.frames < 1:
         ap.error("--poses and --frames must be >= 1")
     calib = load_camera_calib(a.camera_yaml)
+    if a.from_capture is not None:
+        return _replay(a, calib)
     cfg = load_config()
     cal = load_calibration(Path(a.calibration or cfg.calibration_path).expanduser())
     port = a.port or cfg.port
@@ -206,13 +270,35 @@ def main(
     ts = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out = a.out_dir / ts
     save_artifacts(out, res, plane, obs, captures, calib, {"poses": a.poses, "frames": a.frames, "ticks": [c.ticks.tolist() for c in captures]})
-    print(json.dumps({k: v for k, v in res.to_json().items() if k != "seeds"}, indent=1, default=float))
+    print(json.dumps({k: v for k, v in res.to_json().items() if k not in ("seeds", "diagnostics")}, indent=1, default=float))
     if not res.passed:
         print(f"camera-calibrate: GATE FAIL ({'; '.join(res.failures)}); {a.camera_yaml} NOT changed; artifacts {out}", file=sys.stderr)
         return 1
     save_camera_calib(updated_calib(calib, res, plane, a.frames, a.poses), a.camera_yaml)
     print(f"camera-calibrate: PASS; wrote {a.camera_yaml}; artifacts {out}")
     return 0
+
+
+def _replay(a: argparse.Namespace, calib: CameraCalib) -> int:
+    from so101_rl.config import load_calibration, load_config
+    from so101_rl.sim.model import TABLE_Z_M, load_model
+
+    captures = load_captures(a.from_capture)
+    if not captures:
+        print(f"camera-calibrate: no capture_<k>.npz in {a.from_capture}", file=sys.stderr)
+        return 2
+    cal = load_calibration(Path(a.calibration or load_config().calibration_path).expanduser())
+    model = load_model(camera=False)[0]
+    res, plane, obs = calibrate(model, cal, calib, captures, TABLE_Z_M, seed=a.seed)
+    ts = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    out = a.out_dir / f"{ts}-replay"
+    extra = {"poses": len(captures), "frames": int(captures[0].depth_frames.shape[0]), "ticks": [c.ticks.tolist() for c in captures],
+             "replay_of": str(a.from_capture)}  # fmt: skip
+    save_artifacts(out, res, plane, obs, captures, calib, extra)
+    print(json.dumps({k: v for k, v in res.to_json().items() if k not in ("seeds", "diagnostics")}, indent=1, default=float))
+    verdict = "PASS" if res.passed else f"GATE FAIL ({'; '.join(res.failures)})"
+    print(f"camera-calibrate (replay of {a.from_capture}): {verdict}; report-only, {a.camera_yaml} NOT changed; artifacts {out}")
+    return 0 if res.passed else 1
 
 
 if __name__ == "__main__":
