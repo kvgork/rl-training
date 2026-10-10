@@ -6,8 +6,10 @@
 Per pose: the read-only joint probe (``servo/probe.py``; refuses if the servo process owns the port, never writes a
 register) and ``--frames`` aligned colour + depth frames (``D435Camera``, streaming only). With ``--poses K > 1``
 the operator moves the arm BY HAND with torque off between poses (attended; optional): the prompt
-(:func:`hand_pose_prompt`) asks to turn the base ~60 deg (>= 45) with the arm left folded, the second pose that best
-separates a tilted base from joint-zero errors (``diagnostics.tilt_vs_offsets``). Then:
+(:func:`hand_pose_prompt`) asks to turn ONLY the base ~60 deg (>= 45), the second pose that best separates a tilted
+base from joint-zero errors (``diagnostics.tilt_vs_offsets``). The arm needs no particular posture: any posture that
+stays put by itself with torque off and the gripper resting on the table (e.g. upper arm leaning forward, wrist bent
+down), the whole arm incl. the gripper in the image and the operator out of view. Then:
 
 1. the table plane (``perception/table_plane.py``) on the per-pixel median depth of the first pose;
 2. the arm-shape registration (``perception/arm_registration.py``) of the FK surface at the probed angles against
@@ -71,7 +73,8 @@ from so101_rl.perception.table_plane import (
 RUNS = Path("runs/camera-calib")
 # The hand-moved pose that best separates a tilted base from joint-zero errors (``tilt_vs_offsets``; 2026-10-10
 # synthetic study, ARCHITECTURE §5): what matters is the BASE TURN (the shoulder_lift axis then lies at an angle to the
-# tilt axis); raising the upper arm adds little. A torque-off arm must stay put by itself: keep the folded rest posture.
+# tilt axis); raising the upper arm adds little. Any posture that stays put by itself with torque off will do (gripper
+# resting on the table); only the base turn changes between poses.
 SECOND_POSE_TURN_DEG = 60
 SECOND_POSE_MIN_TURN_DEG = 45
 
@@ -81,10 +84,11 @@ def hand_pose_prompt(k: int, n: int) -> str:
     equally well (synthetic study); a third pose turns the other way."""
     where = "either way" if k == 1 else "the other way, past the first pose"
     return (
-        f"pose {k + 1}/{n}: BY HAND, torque stays off: turn the base about {SECOND_POSE_TURN_DEG} deg {where} "
+        f"pose {k + 1}/{n}: BY HAND, torque stays off: turn ONLY the base about {SECOND_POSE_TURN_DEG} deg {where} "
         f"from the first pose (at least {SECOND_POSE_MIN_TURN_DEG} deg: this turn is what separates a tilted base from "
-        "joint-zero errors). Leave the arm folded as at rest with the gripper on the table; do not lift the upper arm "
-        "unless it stays up by itself. Keep the whole arm in the camera's view, let go, then press Enter "
+        "joint-zero errors); leave the other joints as they are. The arm needs no particular posture, only one that "
+        "stays put by itself with the gripper resting on the table (e.g. upper arm leaning forward, wrist bent down). "
+        "The whole arm including the gripper must be in the camera's view. Let go, step out of view, then press Enter "
     )
 
 

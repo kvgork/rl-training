@@ -14,6 +14,11 @@ Failure semantics mirror the real bus (U3 review item 13):
 * ``set_torque``, ``read_reg`` and ``write_reg`` are acked single-motor transactions: a missing or unpowered motor
   fails them.
 
+Homing (``servo.zero_adjust``): the plant state is ``Present_Position``. Writing ``Homing_Offset`` shifts it the way
+the STS3215 does (``Present_Position = Actual_Position - Homing_Offset``, lerobot ``_get_half_turn_homings``): the
+physical arm stays put, its reading moves by ``old - new``. Out-of-range values raise ``ValueError`` like lerobot's
+sign-magnitude encoder (``Homing_Offset`` beyond +-2047) or a 12-bit register (limits outside 0..4095).
+
 Power (U3 review item 1): ``FakeBus(power=...)`` takes a callable that says whether the servo side of the relay is
 live (``FakeMcu.relay_closed``). While it is False every motor is silent (pings and reads fail, torque drops to
 off), and after it turns True the motors need ``boot_ms`` before they answer, like STS3215s booting behind the
@@ -36,6 +41,7 @@ from so101_rl.servo.timing import Clock
 _MAX_SUBSTEP_S = 0.01
 _TICK_MAX = 4095
 _DEFAULT_TICK = 2047
+_HOMING_MAX = 2047  # Homing_Offset: sign-magnitude, sign bit 11
 _DEFAULT_VOLTAGE_DV = 120
 _FACTORY_RETURN_DELAY = 250  # STS3215 factory value; configure() must bring it to 0
 
@@ -177,6 +183,7 @@ class FakeBus:
             self._regs[("Max_Position_Limit", c.id)] = c.range_max
             self._regs[("ID", c.id)] = c.id
             self._regs[("Return_Delay_Time", c.id)] = _FACTORY_RETURN_DELAY
+            self._regs[("Lock", c.id)] = 0  # as lerobot's disable_torque leaves it
         self.connected = False
         self._power = power  # None = always powered (bench supply, no relay model)
         self._boot_ns = round(boot_ms * 1e6)
@@ -185,6 +192,7 @@ class FakeBus:
         self.written_goals: list[np.ndarray] = []
         self.written_goal_t_ns: list[int] = []
         self.torque_events: list[tuple[int, bool, tuple[int, ...]]] = []
+        self.reg_writes: list[tuple[str, int, int]] = []  # (register, motor id, value) of every write_reg
 
     # -- plant ---------------------------------------------------------------------------------
     def _joint_index(self, joint: str | int) -> int:
@@ -339,9 +347,22 @@ class FakeBus:
         if self._silent(motor_id):
             raise ConnectionError(f"motor {motor_id} does not answer")
         if name == "Torque_Enable":
+            if self.record_writes:
+                self.reg_writes.append((name, int(motor_id), int(value)))
             self.set_torque(bool(value), [motor_id])
             return
+        if name == "Homing_Offset":
+            if abs(int(value)) > _HOMING_MAX:
+                raise ValueError(f"Homing_Offset {value} exceeds the sign-magnitude range +-{_HOMING_MAX}")
+            j = int(np.flatnonzero(self._ids == motor_id)[0])
+            shift = self._regs[(name, motor_id)] - int(value)  # Present = Actual - Homing_Offset
+            self._pos[j] += shift
+            self._goal[j] += shift
+        if name in ("Min_Position_Limit", "Max_Position_Limit") and not 0 <= int(value) <= _TICK_MAX:
+            raise ValueError(f"{name} {value} outside 0..{_TICK_MAX}")
         self._regs[(name, motor_id)] = int(value)
+        if self.record_writes:
+            self.reg_writes.append((name, int(motor_id), int(value)))
 
     def write_registers(self, registers: RegisterConfig) -> None:
         """Mirror of ``FeetechBus.write_registers``: every F1 register to every motor."""

@@ -113,5 +113,6 @@ def test_one_pose_is_ambiguous(fitted):
 
 def test_hand_pose_prompt_asks_for_the_separating_turn():
     p = camera_calibrate.hand_pose_prompt(1, 2)
-    assert "pose 2/2" in p and "turn the base about 60 deg" in p and "at least 45 deg" in p and "torque stays off" in p
+    assert "pose 2/2" in p and "turn ONLY the base about 60 deg" in p and "at least 45 deg" in p and "torque stays off" in p
+    assert "folded" not in p and "stays put by itself" in p and "including the gripper" in p and "out of view" in p
     assert "other way" in camera_calibrate.hand_pose_prompt(2, 3)
