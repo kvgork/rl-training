@@ -83,3 +83,18 @@ def calib_json_path(tmp_path):
     dst = tmp_path / "so101_follower.json"
     shutil.copy(DATA / "so101_follower.calib.json", dst)
     return dst
+
+
+PROVISIONAL_CAMERA = DATA / "camera_provisional_2026-10-07.yaml"
+
+
+@pytest.fixture(scope="module")
+def provisional_camera():
+    """Pin ``load_camera_calib()`` to the 2026-10-07 provisional pose (a copy of the old calib/camera.yaml). The
+    synthetic die / tracker / registration scenes were laid out for that view; calib/camera.yaml now holds the
+    measured pose (2026-10-10), from which some of their fixed die positions are out of view or occluded."""
+    from so101_rl.perception import camera_calib
+
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(camera_calib, "CAMERA_YAML", PROVISIONAL_CAMERA)
+        yield PROVISIONAL_CAMERA

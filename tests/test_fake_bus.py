@@ -46,10 +46,19 @@ def test_plant_converges_to_goal():
 
 def test_plant_holds_without_torque():
     clock = FakeClock()
-    bus = FakeBus(clock, initial_ticks=[2000] * 6)
+    bus = FakeBus(clock, initial_ticks=[2000] * 6, goal_enables_torque=False)
     bus.write_goal(_goal(3000))
     out = _run(bus, clock, 1.0)
     assert np.all(out.position == 2000)
+
+
+def test_goal_write_switches_torque_on_like_the_sts3215():
+    """Found on the arm 2026-10-10: a Goal_Position write turns torque on; FakeBus does the same by default."""
+    clock = FakeClock()
+    bus = FakeBus(clock, initial_ticks=[2000] * 6)
+    assert not bus.torque_enabled().any()
+    bus.write_goal(_goal(2000))
+    assert bus.torque_enabled().all() and bus.read_reg("Torque_Enable", 1) == 1
 
 
 def test_plant_is_rate_limited():

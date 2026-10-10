@@ -339,6 +339,7 @@ def test_dataclass_replace_keeps_reward_validation():
 
 
 # ---- provisional camera pose is refused unless the caller opts in (review finding: training on a placeholder)
+@pytest.mark.usefixtures("provisional_camera")
 def test_provisional_camera_pose_refused_by_default(scene, mcfg, mcal):
     from so101_rl.perception.camera_calib import CameraNotCalibrated, load_camera_calib
 

@@ -8,6 +8,7 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import math
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -32,8 +33,11 @@ from so101_rl.sim.d435 import (
 from so101_rl.sim.model import DIE_EDGE_M, TABLE_Z_M, build_spec, load_model
 from so101_rl.sim.sim_tracker import NO_NOISE, CameraModel, Occluders, SimDieTracker
 
+# the synthetic scenes were laid out for the provisional camera view (see conftest.provisional_camera)
+pytestmark = pytest.mark.usefixtures("provisional_camera")
+
 CPU = torch.device("cpu")
-CALIB = load_camera_calib()
+CALIB = load_camera_calib(Path(__file__).parent / "data" / "camera_provisional_2026-10-07.yaml")  # = provisional_camera
 
 
 def _renderer(model, w, h):

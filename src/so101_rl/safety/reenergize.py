@@ -117,8 +117,8 @@ def reenergize(
     Raises ``TimeoutError`` (motors missing, block read failing, heartbeat gap, homing not reached),
     ``CalibrationMismatch``, ``UnsafeStartPose``, ``ReenergizeAborted`` (``should_abort()``) or ``RuntimeError``
     (register / goal read-back differs, torque on before the register writes, hot or faulted motor, bus write
-    failed). After step 5 every failure turns torque
-    off before it propagates, except a ``ReenergizeAborted`` with ``hand_over_on_abort=True``: then torque stays on
+    failed). From step 4's goal write on (the STS3215
+    switches torque on with a Goal_Position write) every failure turns torque off before it propagates, except a ``ReenergizeAborted`` with ``hand_over_on_abort=True``: then torque stays on
     (``exc.torque_on``) for the caller's safe-state hand-over. The order is asserted by tests/test_reenergize.py.
     """
     motors = _ordered(calibration)
@@ -179,23 +179,27 @@ def reenergize(
             tick_hook(True)
         return True
 
-    wait_until("a successful block read", first_good_tick, pre_deadline)
-    last_good_ns = clock.monotonic_ns()
-    present = block.position.copy()
-    for (name, _), motor_id, want in zip(motors, ids, present, strict=True):
-        got = bus.read_reg("Goal_Position", motor_id)
-        if got != int(want):
-            raise RuntimeError(f"re-energise: Goal_Position of {name} reads {got}, expected present {int(want)}")
-
-    # 5. only now
-    check_abort()
+    # From step 4's write_goal on, torque may already be ON: the STS3215 switches torque on with any Goal_Position
+    # write (found on the arm 2026-10-10). Every failure from here on therefore turns torque off.
+    torque_on_requested = False
     try:
+        wait_until("a successful block read", first_good_tick, pre_deadline)
+        last_good_ns = clock.monotonic_ns()
+        present = block.position.copy()
+        for (name, _), motor_id, want in zip(motors, ids, present, strict=True):
+            got = bus.read_reg("Goal_Position", motor_id)
+            if got != int(want):
+                raise RuntimeError(f"re-energise: Goal_Position of {name} reads {got}, expected present {int(want)}")
+
+        # 5. only now
+        check_abort()
+        torque_on_requested = True
         if not bus.set_torque(True):
             raise RuntimeError("re-energise: set_torque(True) failed")
         # 6. ramp home through the transit zone, same step and tracking clamp as the safe-state ramp
         _ramp_home(bus, cfg, clock, block, present, timeout_s, fk, tick_hook, last_good_ns, gap_ns, check_abort)
     except BaseException as exc:
-        if hand_over_on_abort and isinstance(exc, ReenergizeAborted):
+        if hand_over_on_abort and isinstance(exc, ReenergizeAborted) and torque_on_requested:
             exc.torque_on = True  # stop during the ramp: the caller ramps to rest (plan section 10, 2026-10-02)
             raise
         if not torque_off_retry(bus):

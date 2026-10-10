@@ -21,6 +21,9 @@ from so101_rl.servo.probe import ProbeRefused
 from so101_rl.sim.arm_cloud import ArmSurface, qpos_from_ticks
 from so101_rl.sim.model import TABLE_Z_M, load_model
 
+# the synthetic scenes were laid out for the provisional camera view (see conftest.provisional_camera)
+pytestmark = pytest.mark.usefixtures("provisional_camera")
+
 CAL = load_calibration(Path(__file__).parent / "data" / "so101_follower.calib.json")
 TICKS = np.array([2050, 1500, 2500, 2700, 2040, 2300], dtype=np.int32)
 

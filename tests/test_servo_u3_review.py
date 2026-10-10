@@ -394,7 +394,9 @@ def _ramp_stop_harness(cfg, calibration, *, stop_after_ms=1500, cut_after_ms=Non
 
     def should_abort():
         now = hn.clock.monotonic_ns()
-        if t["stop"] is None and hn.bus.torque_enabled().any():
+        # from the explicit torque-on (step 5), not from torque_enabled(): step 4's goal write already switches
+        # torque on (STS3215), and a stop before step 5 is the "never energises" path, not the ramp hand-over
+        if t["stop"] is None and any(on for on, _ in t["torque"]):
             t["stop"] = now + stop_after_ms * MS
         hit = t["stop"] is not None and now >= t["stop"]
         if hit and t["pos_at_stop"] is None:
@@ -417,7 +419,7 @@ def test_item7_stop_during_the_boot_ramp_hands_over_to_the_safe_state_sequence(c
     assert isinstance(hn.core.last_error, ReenergizeAborted) and hn.core.last_error.torque_on
     rest = np.asarray(cfg.safe_state.rest_ticks)
     assert np.abs(t["pos_at_stop"][:5] - rest[:5]).max() > 100  # the ramp had really left rest
-    offs = [ts for on, ts in t["torque"] if not on]
+    offs = [ts for on, ts in t["torque"] if not on and ts >= t["stop"]]  # the boot ticks' torque-offs come earlier
     assert offs and min(offs) > t["stop"] + 1_000_000_000  # no torque off in place: the hand-over ramp ran (> 1 s)
     np.testing.assert_allclose(hn.bus._pos[:5], rest[:5], atol=30)  # ended at rest
     assert not hn.bus.torque_enabled().any()
@@ -446,7 +448,7 @@ def test_item7_stop_before_torque_on_never_energises(cfg, calibration):
 def test_item7_second_stop_during_the_handover_cuts_torque_within_one_tick(cfg, calibration):
     hn, t = _ramp_stop_harness(cfg, calibration, cut_after_ms=500)
     t_cut = t["stop"] + 500 * MS
-    offs = [ts for on, ts in t["torque"] if not on]
+    offs = [ts for on, ts in t["torque"] if not on and ts >= t["stop"]]  # the boot ticks' torque-offs come earlier
     assert offs and t_cut <= min(offs) <= t_cut + hn.period  # torque off within one tick of the escalation
     assert not hn.bus.torque_enabled().any()
     rest = np.asarray(cfg.safe_state.rest_ticks)

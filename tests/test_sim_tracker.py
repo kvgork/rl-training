@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import replace
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -20,12 +21,15 @@ from so101_rl.sim.sim_tracker import (
     TrackerOut,
 )
 
+# the synthetic scenes were laid out for the provisional camera view (see conftest.provisional_camera)
+pytestmark = pytest.mark.usefixtures("provisional_camera")
+
 CPU = torch.device("cpu")
 DIE_Z = TABLE_Z_M + 0.008
 FAR = 1.0  # jaws / tip far away (no occlusion)
 
 
-CALIB = load_camera_calib()
+CALIB = load_camera_calib(Path(__file__).parent / "data" / "camera_provisional_2026-10-07.yaml")  # = provisional_camera
 CAM = CameraModel.from_calib(CALIB)
 DCAM = CameraModel.from_calib(CALIB, "depth")
 

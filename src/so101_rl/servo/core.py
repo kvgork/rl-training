@@ -23,10 +23,12 @@ Tick order
    HOLD              re-write the last target (no extrapolation)
    SAFE_STOPPING     ``SafeStateSequencer.start`` (from present) / ``next`` -> write or torque off; ``done`` ->
                      ``sm.notify_safe_done()``
-   TORQUE_OFF        torque off (idempotent) and goal = present, so the MCU stays armed during the thermal dwell
-                     and a re-energise never snaps to a stale goal
-   CHECK             torque off and goal = present; on ``reenergize_requested`` the FULL ``reenergize`` runs right
-                     after this tick's heartbeat (heartbeat immediately before, review obligation)
+   TORQUE_OFF        torque off every tick (idempotent, acked: it is this tick's write for the heartbeat, so the
+                     MCU stays armed during the thermal dwell). NEVER a goal write: on the STS3215 a Goal_Position
+                     write switches torque back on (found on the arm 2026-10-10). Re-energise writes goal = present
+                     itself before torque on, so a stale goal is never snapped to.
+   CHECK             as TORQUE_OFF; on ``reenergize_requested`` the FULL ``reenergize`` runs right after this
+                     tick's heartbeat (heartbeat immediately before, review obligation)
    LATCHED           torque off every tick; no goal writes and NO heartbeat: the MCU drops the relay (the latch
                      needs a human and the physical reset anyway)
    ================  =============================================================================================
@@ -401,7 +403,7 @@ class ServoCore:
                 raise StartupError(f"watchdog MCU latched again right after ARM (reason {st.reason})")
             if self._clock.monotonic_ns() - t_arm >= int(BOOT_HEARTBEAT_WINDOW_S * _NS):
                 torque_off_retry(self._bus)
-                what = "a good read + goal write + heartbeat" if answered else "every motor to answer a ping"
+                what = "a good read + torque-off + heartbeat" if answered else "every motor to answer a ping"
                 raise StartupError(f"no {what} within {BOOT_HEARTBEAT_WINDOW_S} s after ARM (servos not answering?)")
             nxt += self.period_ns
             self._clock.sleep_until(nxt)
@@ -452,15 +454,16 @@ class ServoCore:
         self._publish(self._clock.monotonic_ns(), False, False, False, TripCause.NONE, PHASE_BOOT, 0, 0)
 
     def _pre_reenergize_tick(self, phase: int) -> bool:
-        """Torque is off here: goal = present, then a heartbeat if the read and the write both succeeded. Returns
-        True when that heartbeat was sent and accepted."""
+        """Torque is off here and stays off: an acked torque-off (never a goal write: on the STS3215 that switches
+        torque on, and re-energise refuses a motor with torque on), then a heartbeat if the read and the torque-off
+        both succeeded. Returns True when that heartbeat was sent and accepted."""
         t0 = self._clock.monotonic_ns()
         ok = bool(self._bus.read_block(self.block)) and self.block.ok
         wrote = False
         hb = False
         if ok and clamp.check_range(self.block.position):
             self._target[...] = self.block.position
-            wrote = bool(self._bus.write_goal(self._target))
+            wrote = torque_off_retry(self._bus, attempts=1)
             if wrote:
                 hb = True
                 self._last_hb_ok = self._send_heartbeat() == HbSend.ACKED  # strict: only an ACK counts
@@ -627,11 +630,12 @@ class ServoCore:
             wrote = self._safe_tick(ok)
         elif state is SmState.LATCHED:
             torque_off_retry(self._bus, attempts=1)  # every tick, idempotent; no goal write, no heartbeat
-        else:  # TORQUE_OFF, CHECK, BOOT, IDLE_TORQUE_OFF: torque off, goal = present
-            torque_ok = torque_off_retry(self._bus, attempts=1) if out.torque_off_now else True
-            if ok and clamp.check_range(block.position):
+        else:  # TORQUE_OFF, CHECK, BOOT, IDLE_TORQUE_OFF: torque off every tick, never a goal write (STS3215:
+            # a Goal_Position write switches torque on); the acked torque-off is the tick's write for the heartbeat
+            torque_ok = torque_off_retry(self._bus, attempts=1)
+            if ok:
                 self._target[...] = block.position
-                wrote = bool(self._bus.write_goal(self._target)) and torque_ok
+                wrote = torque_ok
             if out.reenergize_requested:
                 self._reenergize_pending = True
 
