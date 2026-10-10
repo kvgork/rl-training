@@ -324,7 +324,7 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 ## H10 - 30-minute attended random-motion soak (Tier 0)
 
 - **Needs:** soak (3.3), H2-H7 passed.
-- **Procedure:** `REQUIRE_RT=1 pixi run soak --backend feetech --minutes 30` with the camera and a dummy MPPI
+- **Procedure:** `REQUIRE_RT=1 pixi run -e robot soak --backend feetech --minutes 30` with the camera and a dummy MPPI
   load process running (`stress-ng` on the other cores). **A human stands at the e-stop for the whole run.**
 - **Artifact:** `runs/soak-<ts>/report.json`.
 - **Pass:** `check_soak_report(strict=True)`: p99.9 overrun < 5 ms, zero heartbeat gaps > 200 ms, zero thermal
@@ -377,7 +377,7 @@ without them and without `--attended`. H6 (register proof) is recommended.
 - **Needs:** H2, H3, H5, H7 passed; `sysid-excite` (S2.2), dry-run first on sim:
   `pixi run -e cpu sysid-excite --backend sim --plan short --out runs/sysid/dry` (exit 0).
 - **Procedure:**
-  1. Terminal 1 (the servo owns the bus): `REQUIRE_RT=1 pixi run servo --backend feetech --heartbeat-port <mcu>
+  1. Terminal 1 (the servo owns the bus): `REQUIRE_RT=1 pixi run -e robot servo --backend feetech --heartbeat-port <mcu>
      --tick-log runs/sysid/<ts>/tick_log.bin`. Press the reset button when asked; wait for RUN at home.
   2. Terminal 2: `pixi run sysid-excite --backend real --attended --plan default --out runs/sysid/<ts>` (~10 min of
      arm motion; every segment starts and ends at the start pose and was previewed inside the box).
@@ -429,7 +429,7 @@ session. It does not go through the lab connector.
   (`pixi run lab gate-sign <training run>`; the eval run is refused). Status 2026-10-10: camera calibrated (`runs/camera-calib/20261010-165407`, overlay IoU 0.82) and the gate signed for the attempt-3 run `fastsac_sim-reach-20261008-125912-fefa` (eval `…130617-58ef`, `gate.json`). Dry run first against the sim servo: `pixi run -e cpu servo --backend
   mujoco` in terminal 1, then the terminal-2 command below without `--attended` (exit 0).
 - **Procedure:**
-  1. Terminal 1 (the servo owns the bus): `pixi run servo --backend feetech --heartbeat-port <mcu port> --tick-log
+  1. Terminal 1 (the servo owns the bus): `pixi run -e robot servo --backend feetech --heartbeat-port <mcu port> --tick-log
      runs/deploy/ticks-<ts>.bin --summary runs/deploy/servo-<ts>.json`. Do not press the reset button yet.
   2. Terminal 2: `pixi run -e cpu deploy-policy --policy runs/lab/<eval run>/policy.pt --protocol zero-shot --seed 7
      --attended`. Wait (~7 s) for "waiting for the servo to reach RUN".
@@ -450,7 +450,7 @@ session. It does not go through the lab connector.
   arm for the whole session and never leave it. H5 still applies (rest pose, foam under the reach space).
   1. Clear the reach space, foam down, hand on the power switch. Starting the servo energises the arm AT ONCE
      (there is no reset button to wait for): it ramps from rest to home within a few seconds.
-  2. Terminal 1: `pixi run servo --backend feetech --no-mcu --tick-log runs/deploy/ticks-<ts>.bin --summary
+  2. Terminal 1: `pixi run -e robot servo --backend feetech --no-mcu --tick-log runs/deploy/ticks-<ts>.bin --summary
      runs/deploy/servo-<ts>.json`.
   3. Terminal 2: `pixi run -e cpu deploy-policy --policy runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt
      --protocol zero-shot --seed 7 --attended --accept-no-watchdog`. It prints `NO WATCHDOG`, then the ladder runs as

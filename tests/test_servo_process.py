@@ -120,6 +120,25 @@ def test_feetech_backend_refuses_without_watchdog(monkeypatch, capsys):
     assert code == 2 and "watchdog MCU" in capsys.readouterr().err
 
 
+def test_feetech_backend_refuses_the_cuda_torch_environment(monkeypatch, capsys):
+    """lerobot imports torch; a CUDA build cannot be mapped after mlockall: refuse before any port is opened."""
+    from so101_rl.servo import feetech_bus, main
+
+    monkeypatch.setattr(feetech_bus, "FeetechBus", lambda *_a, **_k: pytest.fail("FeetechBus must not be constructed"))
+    monkeypatch.setattr(main, "run", lambda *a, **k: pytest.fail("must refuse before run()"))
+    monkeypatch.setattr(main, "_cuda_torch_installed", lambda: True)
+    code = main.main(["--backend", "feetech", "--no-mcu", "--calibration", str(CALIB), "--shm-name", _name()])
+    assert code == 2 and "pixi run -e robot servo" in capsys.readouterr().err
+
+
+def test_cuda_torch_detection_matches_the_installed_build():
+    import torch
+
+    from so101_rl.servo import main
+
+    assert main._cuda_torch_installed() == (torch.version.cuda is not None)
+
+
 @pytest.mark.slow
 def test_mujoco_backend_headless_runs_and_exits_0(tmp_path):
     summary = tmp_path / "summary.json"
@@ -578,6 +597,7 @@ def test_item14_cli_locks_the_feetech_bus_and_watchdog_ports(monkeypatch):
 
     seen = {}
     monkeypatch.setattr(main_mod, "run", lambda *a, **kw: seen.update(kw) or 0)
+    monkeypatch.setattr(main_mod, "_cuda_torch_installed", lambda: False)
     assert main_mod.main(["--backend", "feetech", "--calibration", str(CALIB), "--port", "/dev/fake-bus",
                           "--heartbeat-port", "/dev/fake-mcu"]) == 0
     assert seen["serial_ports"] == ("/dev/fake-bus", "/dev/fake-mcu")
