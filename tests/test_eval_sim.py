@@ -63,6 +63,30 @@ def test_evaluate_writes_eval_json(toy_ckpt, tmp_path):
     assert res.renders == ()
 
 
+def test_calibration_change_since_training_is_flagged(toy_ckpt, tmp_path, monkeypatch):
+    """The checkpoint carries the training env's calibration sha256; eval under another file warns and says so."""
+    import torch
+
+    d = torch.load(toy_ckpt, weights_only=True)
+    assert d["calibration_sha256"] is None  # the toy env records none
+    d["calibration_sha256"] = "a" * 64
+    torch.save(d, toy_ckpt)
+    for env_sha, changed in (("a" * 64, False), ("b" * 64, True), (None, None)):
+
+        def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, sha=env_sha):
+            env = ToyBatchedReachEnv(nworld, seed=seed)
+            env.metadata = {"calibration_sha256": sha}
+            return env
+
+        monkeypatch.setattr(eval_sim, "build_env", build)
+        if changed:
+            with pytest.warns(UserWarning, match="calibration file changed"):
+                res = eval_sim.evaluate(toy_ckpt, "reach", episodes=8, dr_stage=0, out_dir=tmp_path / "ev")
+        else:
+            res = eval_sim.evaluate(toy_ckpt, "reach", episodes=8, dr_stage=0, out_dir=tmp_path / "ev")
+        assert json.loads(res.eval_json.read_text())["calibration_changed_since_training"] is changed
+
+
 def test_run_episodes_counts_each_world_once():
     """A policy that succeeds fast must not be over-counted: exactly `episodes` episodes, one per world per round."""
     env = ToyBatchedReachEnv(16, seed=0, success_radius=10.0)  # every step succeeds

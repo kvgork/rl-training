@@ -70,6 +70,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -116,7 +117,7 @@ SERVO_MARKERS: Final[tuple[str, ...]] = ("so101_rl.servo.main", "so101-servo")
 # summary.json keys that describe the run as a whole (kept across resumes); the rest describe the latest invocation
 RUN_META_KEYS: Final[tuple[str, ...]] = (
     "policy", "policy_meta", "task", "protocol", "plan", "seed", "attended", "servo", "config", "calibration",
-    "tick_log", "started", "goals", "resumes",
+    "calibration_sha256", "calibration_changed_since_training", "tick_log", "started", "goals", "resumes",
 )  # fmt: skip
 
 
@@ -623,6 +624,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         from so101_rl.config.loader import DEFAULT_CONFIG_PATH
         from so101_rl.env.goals import BoxGoalSampler
         from so101_rl.env.tasks import REACH
+        from so101_rl.rl.eval_sim import CAL_CHANGED_MSG, calibration_changed
         from so101_rl.rl.policy_export import load_policy
         from so101_rl.safety.fk import KinematicChain, So101FK
 
@@ -659,6 +661,16 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         if args.calibration is not None and args.calibration.expanduser().resolve() != servo_cal:
             raise Refused(f"--calibration {args.calibration} differs from the servo's {servo_cal}")
         calibration = load_calibration(servo_cal)
+        cal_sha = hashlib.sha256(servo_cal.read_bytes()).hexdigest()
+        if orig is not None and orig.get("calibration_sha256") not in (None, cal_sha):
+            raise Refused(f"--resume: the calibration {servo_cal} changed since the run started (sha256 differs); "
+                          "start a new run")  # fmt: skip
+        cal_changed = calibration_changed(policy.meta.get("calibration_sha256"), cal_sha)
+        if cal_changed:
+            _log(f"WARNING: {CAL_CHANGED_MSG} ({servo_cal})")
+        elif cal_changed is None:
+            _log("note: the policy records no calibration sha256 (trained before it was recorded); "
+                 "make sure it was re-evaluated under the current calibration")  # fmt: skip
         cfg = dataclasses.replace(load_config(config_path, calibration=calibration), shm_name=shm_name)
         fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
         schedule = [s for s, n in plan for _ in range(n)]
@@ -685,6 +697,8 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
             "servo": servo_doc,
             "config": str(Path(config_path).resolve()),
             "calibration": str(servo_cal),
+            "calibration_sha256": cal_sha,
+            "calibration_changed_since_training": cal_changed,
             "tick_log": None if servo.tick_log is None else str(servo.tick_log),
             "started": started,
             "goals": None,  # drawn after the attach (below)

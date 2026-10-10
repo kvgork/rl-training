@@ -32,6 +32,7 @@ def test_roundtrip(toy_ckpt, tmp_path):
     np.testing.assert_allclose(a, actor(torch.from_numpy(x)).detach().numpy(), rtol=1e-6, atol=1e-6)
     assert pol(x[0]).shape == (pol.act_dim,)
     assert pol.meta["task_name"] == "reach" and pol.meta["export_version"] == EXPORT_VERSION
+    assert "calibration_sha256" in pol.meta  # None for the toy env; the sim env records the file's sha256
     raw = torch.load(out, weights_only=True)  # a plain dict: no pickled classes
     assert isinstance(raw, dict) and "actor" in raw
 

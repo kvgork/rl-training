@@ -30,6 +30,7 @@ import json
 import math
 import subprocess
 import time
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,7 +154,7 @@ def build_env(
     rnd = DomainRandomizer(spf.params, spf.dr, nworld, stage=stage, seed=seed + 1, device=dev)
     env = BatchedGoalEnv(cfg, cal, REACH, nworld, sim_params=spf.params, randomizer=rnd, model=model, seed=seed, device=dev)
     env.metadata.update({
-        "calibration": str(cal_path), "sim_params": str(sim_params), "sim_params_release": spf.meta.version,
+        "calibration": str(cal_path), "calibration_sha256": _sha256(cal_path), "sim_params": str(sim_params), "sim_params_release": spf.meta.version,
         "sim_params_verified": not spf.meta.verification_problems(MAX_RMS_PCT), "camera_pose_method": CAMERA_POSE_METHOD_REACH,
     })  # fmt: skip
     return env
@@ -248,6 +249,17 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+CAL_CHANGED_MSG = ("the calibration file changed since this policy was trained (sha256 differs): the sim it was "
+                   "trained in had other joint limits / zeros; re-evaluate before trusting it on the arm")
+
+
+def calibration_changed(trained: str | None, now: str | None) -> bool | None:
+    """True/False when both sha256 are known; None for a policy trained before the hash was recorded."""
+    if not trained or not now:
+        return None
+    return trained != now
+
+
 class _RenderEnv:
     """``viz.video.RolloutEnv`` over a small batched env: the policy input is FS3 obs + goal.
 
@@ -336,6 +348,9 @@ def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Pa
         meta = dict(getattr(env, "metadata", {}))
     finally:
         env.close()
+    cal_changed = calibration_changed(d.get("calibration_sha256"), meta.get("calibration_sha256"))
+    if cal_changed:
+        warnings.warn(f"{ckpt}: {CAL_CHANGED_MSG} ({meta.get('calibration')})", stacklevel=2)
     renders: list[Path] = []
     render_src = None
     if render > 0:
@@ -352,6 +367,7 @@ def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Pa
                  "final_stage": GATE_FINAL_STAGE, "numeric_passed": passed, "reasons": reasons,
                  "human_checklist": "pending (review_checklist.md; signed outside this tool)"},
         "camera_pose_method": CAMERA_POSE_METHOD_REACH, "render_camera_pose": render_src,
+        "calibration_changed_since_training": cal_changed,
         "renders": [str(p) for p in renders], "env": meta, "git_sha": git_sha(), "wall_s": time.monotonic() - t0,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }  # fmt: skip
