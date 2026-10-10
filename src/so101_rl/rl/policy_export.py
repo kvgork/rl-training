@@ -51,6 +51,7 @@ def export_policy(ckpt: Path, out: Path) -> Path:
         "log_std_bounds": [float(x) for x in sac["cfg"]["log_std_bounds"]],
         "actor": {k: v.detach().cpu().clone() for k, v in sac["actor"].items()},
         "sim_params_release": d.get("sim_params_release"),
+        "calibration_sha256": d.get("calibration_sha256"),
         "dr_stage": int(d.get("dr_stage", 0)),
         "env_step": int(d.get("env_step", 0)),
         "git_sha": str(d.get("git_sha", "unknown")),

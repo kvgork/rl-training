@@ -216,6 +216,41 @@ def test_attended_real_servo_gets_past_the_refusals(tmp_path, capsys, monkeypatc
     assert not (tmp_path / "out").exists()
 
 
+@pytest.mark.parametrize(
+    ("trained_sha", "expect"),
+    [(None, "records no calibration sha256"), ("0" * 64, "WARNING: the calibration file changed"), ("same", None)],
+)  # fmt: skip
+def test_calibration_hash_vs_training_is_reported(tmp_path, capsys, monkeypatch, pretend_servo, trained_sha, expect):
+    """The policy's calibration sha256 (recorded at training) vs the servo's file: a note, a warning or nothing;
+    never a refusal (the run fails only at the stubbed attach)."""
+    import hashlib
+
+    def attach(*_a, **_k):
+        raise RuntimeError("attach reached (test stub)")
+
+    monkeypatch.setattr(ShmBackend, "__init__", attach)
+    sha = hashlib.sha256(CALIB.read_bytes()).hexdigest() if trained_sha == "same" else trained_sha
+    name = pretend_servo("mujoco", "--calibration", str(CALIB))
+    assert dp.main(_args(_export(tmp_path / "p.pt", calibration_sha256=sha), name, tmp_path / "out")) == 2
+    err = capsys.readouterr().err
+    assert "attach reached" in err
+    for msg in ("records no calibration sha256", "WARNING: the calibration file changed"):
+        assert (msg in err) == (msg == expect)
+
+
+def test_resume_refuses_a_changed_calibration(tmp_path, capsys, no_hardware, pretend_servo):
+    policy = _export(tmp_path / "p.pt")
+    run = tmp_path / "run"
+    run.mkdir()
+    doc = _orig_summary(policy)
+    doc["calibration_sha256"] = "0" * 64
+    (run / "summary.json").write_text(json.dumps(doc))
+    name = pretend_servo("mujoco", "--calibration", str(CALIB))
+    assert dp.main(["--resume", str(run), "--shm-name", name, "--wait-servo-s", "0"]) == dp.EXIT_REFUSED
+    assert "calibration" in capsys.readouterr().err
+    assert not (run / "episodes.jsonl").exists()
+
+
 def test_config_must_match_the_servo(tmp_path, capsys, no_hardware, pretend_servo):
     from so101_rl.config.loader import DEFAULT_CONFIG_PATH
 
