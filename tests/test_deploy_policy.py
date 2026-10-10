@@ -200,6 +200,24 @@ def test_real_servo_with_no_mcu_is_refused(tmp_path, capsys, no_hardware, preten
     assert not (tmp_path / "out").exists()
 
 
+def test_accept_no_watchdog_needs_attended_and_gets_past_the_refusals(tmp_path, capsys, monkeypatch, pretend_servo):
+    """plan §10 2026-10-10: a real --no-mcu servo is accepted only with --attended AND --accept-no-watchdog (the
+    run then fails only at the stubbed attach, after a NO WATCHDOG warning)."""
+
+    def attach(*_a, **_k):
+        raise RuntimeError("attach reached (test stub)")
+
+    monkeypatch.setattr(ShmBackend, "__init__", attach)
+    name = pretend_servo("feetech", "--no-mcu", "--calibration", str(CALIB))
+    policy = _export(tmp_path / "p.pt")
+    assert dp.main(_args(policy, name, tmp_path / "out", "--accept-no-watchdog")) == dp.EXIT_REFUSED
+    assert "--attended" in capsys.readouterr().err
+    assert dp.main(_args(policy, name, tmp_path / "out", "--attended", "--accept-no-watchdog")) == dp.EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "NO WATCHDOG" in err and "attach reached" in err
+    assert not (tmp_path / "out").exists()
+
+
 def test_attended_real_servo_gets_past_the_refusals(tmp_path, capsys, monkeypatch, pretend_servo):
     """A real-looking servo with --attended: no refusal; the run fails only at the shm attach (stubbed), which is
     the first thing after the read-only checks (exit 2, nothing written, nothing sent)."""

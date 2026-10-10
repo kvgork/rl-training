@@ -27,7 +27,8 @@ scales the delta magnitude; the env then clips and maps it).
   ``/proc/<pid>/cmdline`` is parsed with the servo's OWN parser (``servo.main.build_parser``, no abbreviations), and
   fail-closed: anything but ``--backend mujoco`` / ``fake`` is the real arm and needs ``--attended`` (Tier 0: a human
   at the e-stop); a command line that does not parse cleanly (unknown or abbreviated options) is refused even with
-  ``--attended``, and so is a real servo started with ``--no-mcu``. The servo's ``--config`` (default for and
+  ``--attended``, and so is a real servo started with ``--no-mcu`` unless ``--accept-no-watchdog`` is also given (plan
+  §10 2026-10-10: attended only, the human's hand on the servo PSU's switch is the e-stop). The servo's ``--config`` (default for and
   checked against ours), ``--calibration`` (else its config's ``calibration_path``, resolved against the servo's
   cwd; the FK must use it, a different ``--calibration`` is refused) and ``--tick-log`` (into the summary) are
   taken from the same command line.
@@ -496,6 +497,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--calibration", type=Path, default=None, help="default: the running servo's")
     ap.add_argument("--shm-name", default=None, help="the running servo's shm segment (default: from config)")
     ap.add_argument("--attended", action="store_true", help="Tier 0: a human is at the e-stop (required on the arm)")
+    ap.add_argument("--accept-no-watchdog", action="store_true", help="with --attended: allow a real servo started "
+                    "with --no-mcu (no e-stop hardware; the human's hand on the servo power switch; plan §10 2026-10-10)")
     ap.add_argument("--protocol", choices=("single", "zero-shot"), default=None, help="default single")
     ap.add_argument("--speed-scale", type=float, default=None, choices=SPEED_LADDER, help="single protocol (0.5)")
     ap.add_argument("--episodes", type=int, default=None, help="single protocol (10)")
@@ -646,9 +649,13 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
                 f"the servo on shm {shm_name!r} (pid {servo.pid}, --backend {servo.backend}) drives the REAL arm: "
                 "Tier 0 needs a human at the e-stop; pass --attended"
             )
-        if servo.is_real and servo.no_mcu:
+        if servo.is_real and servo.no_mcu and not args.accept_no_watchdog:
             raise Refused(f"the REAL-arm servo (pid {servo.pid}) runs with --no-mcu (no watchdog MCU): restart it "
-                          "with the MCU (--heartbeat-port)")  # fmt: skip
+                          "with the MCU (--heartbeat-port), or pass --accept-no-watchdog with your hand on the "
+                          "servo power switch (plan §10 2026-10-10)")  # fmt: skip
+        if servo.is_real and servo.no_mcu:
+            _log("NO WATCHDOG: nothing cuts power if this PC or the servo process hangs; keep your hand on the "
+                 "servo power switch for the whole run")  # fmt: skip
         if orig is not None and bool(orig["servo"].get("real")) != servo.is_real:
             raise Refused(f"--resume: the run was on a {'REAL' if orig['servo'].get('real') else 'sim'} servo, this "
                           f"one is {'REAL' if servo.is_real else 'sim'}")  # fmt: skip
@@ -683,6 +690,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
 
     started = datetime.now().astimezone().isoformat(timespec="seconds")
     servo_doc = {"pid": servo.pid, "backend": servo.backend, "real": servo.is_real, "mcu": servo.mcu,
+                 "no_watchdog_accepted": bool(servo.is_real and servo.no_mcu),
                  "shm_name": shm_name, "cmdline": servo.cmdline}  # fmt: skip
     if orig is None:
         out = args.out_root / f"{datetime.now().astimezone():%Y%m%d-%H%M%S}-{os.urandom(2).hex()}"
