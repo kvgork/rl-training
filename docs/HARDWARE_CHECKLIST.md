@@ -424,7 +424,7 @@ session. It does not go through the lab connector.
 
 - **Parts:** the arm on its clamp, foam under the reach space, the e-stop in hand. Optional: tape over the orange tip
   marker.
-- **Needs:** H2, H3 (with FW1), H5 and H7 passed; the servo bus powered; the camera calibrated
+- **Needs:** H2, H3 (with FW1), H5 and H7 passed (H2/H3 not for the no-watchdog variant below); the servo bus powered; the camera calibrated
   (`pixi run camera-calibrate --method arm-shape` and `pixi run camera-overlay` passing); the sim exit gate signed
   (`pixi run lab gate-sign <training run>`; the eval run is refused). Status 2026-10-10: camera calibrated (`runs/camera-calib/20261010-165407`, overlay IoU 0.82) and the gate signed for the attempt-3 run `fastsac_sim-reach-20261008-125912-fefa` (eval `…130617-58ef`, `gate.json`). Dry run first against the sim servo: `pixi run -e cpu servo --backend
   mujoco` in terminal 1, then the terminal-2 command below without `--attended` (exit 0).
@@ -441,8 +441,25 @@ session. It does not go through the lab connector.
      keeps the finished episodes and continues the same goal list at the next episode; do not change `--policy`,
      `--seed`, `--protocol` or `--rung-episodes` (refused). A trip in the 0.5 or 0.75 rung still counts in that
      rung's advance check, so after the resume that rung is finished and the ladder stops there; a trip in the
-     full-speed rung is resumed to the end. A real servo started with `--no-mcu` is refused.
+     full-speed rung is resumed to the end. A real servo started with `--no-mcu` is refused (but see the no-watchdog
+     variant below).
   5. When done, Ctrl-C the servo (normal shutdown to rest).
+- **No-watchdog variant (plan §10 2026-10-10; until the H2/H3 parts exist).** No e-stop and no MCU: the e-stop is
+  your hand on a switch that cuts the servo supply (a switched power strip, or the PSU's DC plug within reach).
+  Nothing cuts power if the PC or the servo process hangs (the servos then hold their last goal), so you watch the
+  arm for the whole session and never leave it. H5 still applies (rest pose, foam under the reach space).
+  1. Clear the reach space, foam down, hand on the power switch. Starting the servo energises the arm AT ONCE
+     (there is no reset button to wait for): it ramps from rest to home within a few seconds.
+  2. Terminal 1: `pixi run servo --backend feetech --no-mcu --tick-log runs/deploy/ticks-<ts>.bin --summary
+     runs/deploy/servo-<ts>.json`.
+  3. Terminal 2: `pixi run -e cpu deploy-policy --policy runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt
+     --protocol zero-shot --seed 7 --attended --accept-no-watchdog`. It prints `NO WATCHDOG`, then the ladder runs as
+     in step 3 above (no button press). Resume as in step 4 with `--attended --accept-no-watchdog`.
+  4. Cut power at once on any contact with the table, the camera mount or a cable, on shaking, or on any motion you
+     did not expect; the arm then falls limp onto the foam. Afterwards restart from step 1 and `--resume`.
+  5. `summary.json` records `servo.mcu: false` and `servo.no_watchdog_accepted: true`; a pass in this variant is
+     marked as such in the results table and does not count for the Tier 1 (unattended) entry, which still needs
+     H2/H3.
 - **Artifact:** `runs/deploy/<ts>/{episodes.jsonl, summary.json}` and the servo tick log.
 - **Pass:** exit 0, and `summary.json` `verdict.finetune_eligible` true (Wilson 95 % lower bound >= 0.60 with n >= 50
   on the full-speed rung). Fill the results table.
