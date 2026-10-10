@@ -155,10 +155,14 @@ class ArmShapeResult:
 
 
 # ------------------------------------------------------------------------------------------------ helpers
-def _nn(a: np.ndarray, b: np.ndarray, chunk: int = 4096) -> tuple[np.ndarray, np.ndarray]:
-    """For each row of ``a``: (distance, index) of the nearest row of ``b``."""
+def _nn(a: np.ndarray, b: np.ndarray, max_elems: int = 1 << 24) -> tuple[np.ndarray, np.ndarray]:
+    """For each row of ``a``: (distance, index) of the nearest row of ``b``.
+
+    Each distance block holds at most ``max_elems`` floats (64 MB), whatever the size of ``b``.
+    """
     ta = torch.as_tensor(a, dtype=torch.float32)
     tb = torch.as_tensor(b, dtype=torch.float32)
+    chunk = max(1, max_elems // max(1, len(tb)))
     ds, ix = [], []
     for i in range(0, len(ta), chunk):
         d = torch.cdist(ta[i : i + chunk], tb)
