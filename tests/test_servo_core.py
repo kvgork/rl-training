@@ -327,13 +327,17 @@ def test_thermal_trip_goes_to_rest_then_torque_off(h):
     np.testing.assert_allclose(h.bus._pos[:5], np.asarray(h.cfg.safe_state.rest_ticks)[:5], atol=30)
 
 
-def test_torque_off_dwell_keeps_writing_goal_present_and_heartbeating(h):
+def test_torque_off_dwell_keeps_torque_off_and_heartbeating(h):
+    """The dwell re-sends torque off every tick (acked: the heartbeat's write) and never writes a goal, which on the
+    STS3215 would switch torque back on (found on the arm 2026-10-10)."""
     _thermal_trip_to_torque_off(h)
     h.bus.set_temperature("elbow_flex", 55.0)  # still above resume_c: the dwell has not started
+    n_goals = len(h.bus.written_goals)
     for _ in range(60):  # 2 s, twice the MCU timeout
         res = h.tick()
         assert res.wrote and res.hb_sent
-        np.testing.assert_array_equal(h.bus.written_goals[-1], h.core.block.position)
+        assert not h.bus.torque_enabled().any()
+    assert len(h.bus.written_goals) == n_goals
     assert h.mcu.armed and not h.mcu.latched
     assert h.core.state is SmState.TORQUE_OFF
 

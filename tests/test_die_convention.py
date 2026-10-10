@@ -21,6 +21,9 @@ from so101_rl.sim.d435 import COLOR_CAM
 from so101_rl.sim.model import DIE_EDGE_M, TABLE_Z_M, load_model
 from so101_rl.sim.sim_tracker import NO_NOISE, CameraModel, SimDieTracker, TrackerOut
 
+# the synthetic scenes were laid out for the provisional camera view (see conftest.provisional_camera)
+pytestmark = pytest.mark.usefixtures("provisional_camera")
+
 CPU = torch.device("cpu")
 # resting die positions clear of the arm at home: start well (hidden by its rim from the oblique camera), zone, two
 # more on the table

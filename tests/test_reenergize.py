@@ -314,6 +314,32 @@ def test_write_goal_false_during_ramp_raises_and_turns_torque_off(cfg, calibrati
     assert bus.log[-1] == "set_torque:False" and not bus.torque
 
 
+def test_goal_readback_failure_after_the_present_write_turns_torque_off(cfg, calibration, bus, clock):
+    """The STS3215 switches torque on with the step-4 goal = present write (found on the arm 2026-10-10), so a
+    failure between that write and step 5 must turn torque off too, never only after step 5."""
+    bus.goal_readback_error = True
+    with pytest.raises(RuntimeError, match="Goal_Position"):
+        reenergize(bus, cfg, calibration, clock, BlockRead())
+    assert "set_torque:True" not in bus.log and bus.log[-1] == "set_torque:False"
+
+
+def test_stop_between_the_present_write_and_torque_on_turns_torque_off_and_is_no_hand_over(cfg, calibration, bus,
+                                                                                            clock):  # fmt: skip
+    n = {"writes": 0}
+    real = bus.write_goal
+
+    def write_goal(goal):
+        n["writes"] += 1
+        return real(goal)
+
+    bus.write_goal = write_goal
+    with pytest.raises(ReenergizeAborted) as ei:
+        reenergize(bus, cfg, calibration, clock, BlockRead(), should_abort=lambda: n["writes"] > 0,
+                   hand_over_on_abort=True)  # fmt: skip
+    assert not getattr(ei.value, "torque_on", False)
+    assert "set_torque:True" not in bus.log and bus.log[-1] == "set_torque:False"
+
+
 def test_write_goal_present_false_raises_and_never_energises(cfg, calibration, bus, clock):
     bus.write_goal_results = [False]
     with pytest.raises(RuntimeError, match=r"write_goal\(present\) failed"):

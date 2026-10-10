@@ -94,8 +94,7 @@ class MiniCore:
         if self.out.state is SmState.RUN and self.out.use_policy:
             wrote = bool(self.bus.write_goal(self.v.target_ticks))
         elif self.out.torque_off_now and got:
-            self.bus.set_torque(False)
-            wrote = bool(self.bus.write_goal(self.block.position.copy()))  # keeps the heartbeat alive
+            wrote = bool(self.bus.set_torque(False))  # acked: keeps the heartbeat alive (never a goal write: STS3215)
         self.heartbeat(got and wrote)
         if self.out.reenergize_requested:
             self.energize()

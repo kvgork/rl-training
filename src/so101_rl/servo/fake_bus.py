@@ -154,6 +154,7 @@ class FakeBus:
         record_writes: bool = True,
         power: Callable[[], bool] | None = None,
         boot_ms: float = 0.0,
+        goal_enables_torque: bool = True,
     ) -> None:
         self.clock = clock
         self.plant = plant if plant is not None else FirstOrderPlant()
@@ -161,6 +162,9 @@ class FakeBus:
         self.thermal = thermal if thermal is not None else ThermalModel()
         self.load_gain = load_gain
         self.record_writes = record_writes  # False: no written_goals / torque_events growth (long soaks)
+        # STS3215 firmware: writing Goal_Position switches that motor's torque ON (found on the arm 2026-10-10:
+        # the boot tick's goal = present write left torque on before re-energise's torque-off check)
+        self.goal_enables_torque = goal_enables_torque
         self.calibration = calibration or {
             n: MotorCalibration(id=i + 1, drive_mode=0, homing_offset=0, range_min=0, range_max=_TICK_MAX)
             for i, n in enumerate(JOINT_NAMES)
@@ -303,6 +307,10 @@ class FakeBus:
         for j, motor_id in enumerate(self._ids):
             if not self._silent(int(motor_id)):  # un-acked sync write: a dead / unpowered motor is silent
                 self._goal[j] = float(goal[j])
+                if self.goal_enables_torque and not self._torque[j]:
+                    self._torque[j] = True  # STS3215: a Goal_Position write switches torque on
+                    if self.record_writes:
+                        self.torque_events.append((self.clock.monotonic_ns(), True, (int(motor_id),)))
         if self.record_writes:
             self.written_goals.append(goal.astype(np.int32, copy=True))
             self.written_goal_t_ns.append(self.clock.monotonic_ns())
