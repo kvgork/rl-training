@@ -257,6 +257,35 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 - **Pass:** real calibration exit 0; corrupted copy exit 1 with the field named; no register write, no torque enable.
 - **Shown-to-fail:** the corrupted copy is the failure variant.
 
+## H7a - Joint zeros from the 2-pose camera fit (`zero-adjust`, plan §10 2026-10-10)
+
+- **Needs:** H7 passing; the camera intrinsics (`calib/camera.yaml`); a `camera-calibrate --method arm-shape --poses 2`
+  run whose `report.json` `diagnostics.tilt_vs_offsets` says verdict `joint_offsets` (e.g. `runs/camera-calib/20261010-084545`:
+  shoulder_lift −4.94°, wrist_flex +1.00°, elbow_flex −0.16°). Offsets are `true = read + offset`.
+- **Camera poses (by hand, torque off):** pose 1 is whatever posture the arm holds by itself with torque off and the
+  gripper resting on the table (e.g. upper arm leaning forward, wrist bent down; it need NOT be folded as at rest).
+  Between poses turn ONLY the base, about 60° (at least 45°); leave the other joints. The whole arm including the
+  gripper must be in the image, and you out of view, when you press Enter.
+- **Procedure:**
+  1. Stop the servo process (`zero-adjust` refuses while it holds the port). Torque must be off on every motor.
+  2. Dry-run: `pixi run zero-adjust --from-report runs/camera-calib/<ts>`. It prints, per joint, the offset, Δticks,
+     Homing_Offset / Min / Max old → new and the present reading → predicted; joints under 0.5° are skipped. Nothing
+     is written. Check the signs: a negative shoulder_lift offset lowers its reading (Δ < 0), the homing offset rises.
+  3. Apply: `pixi run zero-adjust --from-report runs/camera-calib/<ts> --apply --attended`. Keep the arm still. It
+     backs up the calibration JSON (`<json>.bak-<ts>`), writes Lock / Homing_Offset / Min / Max_Position_Limit of the
+     chosen joints only, reads them back, checks the present reading moved by Δ (±2 ticks), writes the JSON and
+     re-compares. On a failure after a write (exit 3) it prints every write and the restore command
+     `pixi run zero-adjust --restore <backup> --apply --attended`; run it, then `pixi run calib-check`.
+  4. `pixi run calib-check` → exit 0 (the servo registers match the new JSON).
+  5. `pixi run camera-calibrate --method arm-shape --poses 2` again (same posture rules): every
+     |offset| in `tilt_vs_offsets` must now be < 1°.
+- **Artifact:** `runs/hw/zero-adjust-<ts>.json` (inputs, shifts, registers and present readings before / after, every
+  write, the backup path, the calib-check comparison); the new `runs/hw/calib-check-<ts>.json`; the new camera run.
+- **Pass:** apply exit 0, calib-check exit 0, the re-run camera fit shows all |offsets| < 1°.
+- **Note:** `so101.yaml` `rest_ticks` / `home_ticks` are tick values and are not changed: the physical pose they name
+  moves by Δ (shoulder_lift −56 ticks for the 2026-10-10 run, inside `rest_tolerance_ticks` 100). Re-check H5 if
+  the rest pose no longer settles. A second apply of the same report is refused (the JSON is newer than the report).
+
 ## H8 - Hand-eye calibration and table fiducial
 
 - **Parts:** red marker on the gripper tip; ArUco marker on the table in view of the camera.

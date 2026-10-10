@@ -133,6 +133,7 @@ viz-attach = "python -m so101_rl.viz.live_viewer attach"
 dashboard = "python -m so101_rl.viz.dashboard"   # --logdir runs/ (default), localhost:6006
 # Camera parity unit SUC (plans/camera-parity-plan.md): calib/camera.yaml is the one source of the D435 model.
 joint-probe = "python -m so101_rl.servo.probe"   # read-only: ping + block read, never writes, refuses next to the servo
+zero-adjust = "python -m so101_rl.servo.zero_adjust"   # joint zeros from camera-calibrate --poses 2; dry-run unless --apply --attended
 camera-intrinsics = "python -m so101_rl.perception.camera_intrinsics"   # --serial --out calib/camera.yaml
 camera-calibrate = { cmd = "python -m so101_rl.perception.camera_calibrate", env = { MUJOCO_GL = "egl" } }   # --method arm-shape [--poses K] [--from-capture DIR]
 camera-overlay = { cmd = "python -m so101_rl.perception.camera_overlay", env = { MUJOCO_GL = "egl" } }
