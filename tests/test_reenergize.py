@@ -15,12 +15,13 @@ from so101_rl.servo.bus import BlockRead
 from so101_rl.servo.timing import FakeClock
 
 S = 1_000_000_000
-NEAR_REST = [2060, 2190, 2310, 2740, 2047, 2300]  # within rest_tolerance_ticks of the shipped rest pose
+NEAR_REST = [2161, 838, 3061, 2849, 2210, 2050]  # within rest_tolerance_ticks of the shipped rest pose (H5, 2026-10-10)
 IN_BOX = [1900, 1300, 2600, 2700, 2047, 2300]  # tip inside the box, far from rest
 OUTSIDE = [2047, 2047, 2047, 2047, 2047, 2047]  # tip at x = 0.39 m: outside the box and far from rest
-# Fallen sideways (pan +44 deg from rest, arm folded down): tip (0.110, -0.070, 0.000) m, INSIDE the running box
-# (floor -0.015) but below the 0.010 m start floor, and far from rest. The pre-2026-10-07 rule accepted it.
-FALLEN = [2550, 1800, 2700, 2745, 2047, 2065]
+# Fallen sideways (pan +44 deg, arm folded down): tip (0.117, -0.076, 0.006) m, INSIDE the running box (floor
+# table + 5 mm = 0.0005 m at the measured table) but below the 0.010 m start floor, and far from rest. The
+# pre-2026-10-07 rule accepted it.
+FALLEN = [2550, 1750, 2700, 2745, 2047, 2065]
 
 
 class LoggingBus:
@@ -241,7 +242,7 @@ def test_start_pose_neither_near_rest_nor_in_box_is_refused_before_any_goal_or_t
 def test_fallen_pose_with_tip_near_the_table_is_refused_before_any_goal_or_torque(cfg, calibration, clock, fk):
     """Plan §10 2026-10-06 "Re-energise start rule": the lower running floor must not widen the start rule."""
     xyz = fk.gripper_xyz_from_ticks(np.asarray(FALLEN), np.zeros(3))
-    assert fk.in_box(xyz, cfg.box) and abs(xyz[2]) < 1e-3  # in the running box, tip at z = 0.0 m
+    assert fk.in_box(xyz, cfg.box) and xyz[2] < cfg.safe_state.start_min_tip_z_m  # in the running box, below the start floor
     rest = np.asarray(cfg.safe_state.rest_ticks)
     assert np.abs(np.asarray(FALLEN)[:5] - rest[:5]).max() > cfg.safe_state.rest_tolerance_ticks
     bus = LoggingBus(calibration, clock, present=FALLEN)

@@ -155,10 +155,12 @@ def _cpu_vs_warp(scene, cfg, nworld, nsteps, ctrl_fn, **kw):
 
     model = scene[0]
     data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, model.key("rest").id)
+    # home, not rest: the measured rest (plan §10 2026-10-10) is folded onto the joint stops, and a sinusoid around it
+    # would drive the arm into its limits instead of testing free-space stepping
+    mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
     mujoco.mj_forward(model, data)
     ws = _sim(scene, cfg.sim_warp, nworld, **kw)
-    _to_key(ws, model)
+    _to_key(ws, model, "home")
     err = np.zeros((nsteps, model.nq))
     for t in range(nsteps):
         c = ctrl_fn(t)
@@ -173,18 +175,18 @@ def _cpu_vs_warp(scene, cfg, nworld, nsteps, ctrl_fn, **kw):
 
 
 def _sinusoid(model):
-    rest = np.array(model.key("rest").ctrl)
+    home = np.array(model.key("home").ctrl)
     k = np.arange(1, 7) / 3
 
     def c(t):
-        return rest + 0.3 * np.sin(2 * np.pi * 0.5 * t * model.opt.timestep * k)
+        return home + 0.3 * np.sin(2 * np.pi * 0.5 * t * model.opt.timestep * k)
 
     return c
 
 
 @gpu
 def test_step_matches_cpu_300_steps(scene, cfg):
-    """S0 gate: CPU float64 vs MJWarp float32, sinusoid around rest, arm joints within 1e-6 rad over 300 steps."""
+    """S0 gate: CPU float64 vs MJWarp float32, sinusoid around home, arm joints within 1e-6 rad over 300 steps."""
     err = _cpu_vs_warp(scene, cfg, 4, 300, _sinusoid(scene[0]))
     arm = err[:, :6].max()
     print(f"max |dqpos| arm {arm:.3e} rad, die {err[:, 6:].max():.3e}")

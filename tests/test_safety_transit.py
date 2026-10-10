@@ -60,11 +60,11 @@ def test_floor_values_come_from_the_config(cfg, planner):
 
 
 def test_a_goal_through_the_table_is_held_at_the_floor(cfg, fk, planner):
-    """Goal 4 cm inside the table: the planner never emits a target below the floor and finally holds."""
+    """Goal ~2 cm inside the table: the planner never emits a target below the floor and finally holds."""
     rest = np.asarray(cfg.safe_state.rest_ticks, dtype=np.int32)
     sunk = rest.copy()
-    sunk[1] += 300
-    assert z(fk, sunk) < planner.floor_z - 0.03
+    sunk[1] += 400  # the folded rest pose bottoms out ~2 cm below the floor (H5 rest, 2026-10-10)
+    assert z(fk, sunk) < planner.floor_z - 0.015
     path = planner_path(planner, cfg.safe_state.home_ticks, sunk)
     assert min(z(fk, p) for p in path) >= planner.floor_z
     _n, _, reached = simulate_transit(planner, cfg.safe_state.home_ticks, sunk, 2000)
@@ -76,7 +76,7 @@ def test_a_goal_through_the_table_is_held_at_the_floor(cfg, fk, planner):
 def test_below_the_floor_only_moves_that_do_not_lower_the_tip_are_taken(cfg, fk, planner):
     rest = np.asarray(cfg.safe_state.rest_ticks, dtype=np.int32)
     low = rest.copy()
-    low[1] += 120  # start a little below the floor
+    low[1] += 200  # start a little below the floor
     assert z(fk, low) < planner.floor_z
     out = np.empty_like(low)
     planner.next_target(low, cfg.safe_state.home_ticks, out)  # home is up: lifting moves are allowed

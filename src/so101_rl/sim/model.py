@@ -62,6 +62,10 @@ def _camera_calib(camera: CameraCalib | Path | str | bool | None) -> CameraCalib
     return load_camera_calib(None if camera in (None, True) else Path(camera))
 
 
+WIDENED_JOINTS = ("shoulder_lift", "elbow_flex", "wrist_flex")
+WIDENED_RANGE_RAD = 1.92  # 110 deg; the calibrated ranges reach about -108 / +104 deg
+
+
 def _place_table(spec: mujoco.MjSpec, table_z_m: float) -> None:
     """Move the table and what sits on it so the table top is at ``table_z_m`` (see ``TABLE_Z_M``)."""
     table = spec.geom("table")
@@ -117,6 +121,16 @@ def build_spec(
     gripper = spec.body(FIXED_JAW_BODY)
     frame = spec.site("gripperframe")
     gripper.add_site(name="gripper_tip", pos=list(frame.pos), quat=list(frame.quat), size=[0.003, 0.003, 0.003], group=3)
+
+    # The upstream MJCF stops (+-100 deg on shoulder_lift, +-97/95 deg on elbow/wrist_flex) are narrower than the
+    # real arm's calibrated range (lerobot sweeps to the mechanical stops; the measured folded rest pose has
+    # shoulder_lift at -107 deg, plan §10 2026-10-10). Widen them so the sim can reach every calibrated pose; the
+    # safety pipeline clamps commands to the calibration limits on both backends.
+    for name in WIDENED_JOINTS:
+        lo, hi = spec.joint(name).range
+        spec.joint(name).range = [min(lo, -WIDENED_RANGE_RAD), max(hi, WIDENED_RANGE_RAD)]
+        act = spec.actuator(name)
+        act.ctrlrange = [min(act.ctrlrange[0], -WIDENED_RANGE_RAD), max(act.ctrlrange[1], WIDENED_RANGE_RAD)]
 
     calib = _camera_calib(camera)
     if calib is not None:

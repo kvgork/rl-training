@@ -29,9 +29,9 @@ T = TripCause
 CPU = torch.device("cpu")
 # tip at (0.284, 0, 0.198): inside the box (tests/test_pipeline.py)
 POSE = np.array([2047, 1395, 2699, 2047, 2047, 2047], dtype=np.int64)
-# shoulder_lift 2010: tip z ~ -0.009, 6 mm above the box floor (table + 5 mm = -0.015, plan §10 2026-10-06);
-# +45 ticks of lift leaves the box (was 1930 / z ~ 0.016 with the old 0.010 floor)
-LOW_POSE = np.array([2047, 2010, 2699, 2047, 2047, 2047], dtype=np.int64)
+# shoulder_lift 1958: tip z ~ 0.0066, 6 mm above the box floor (table + 5 mm = 0.0005 at the measured table,
+# plan §10 2026-10-10); +45 ticks of lift leaves the box
+LOW_POSE = np.array([2047, 1958, 2699, 2047, 2047, 2047], dtype=np.int64)
 # gripper pointing down over the table: tip z ~ -0.009 (6 mm above the tip floor), lowest gripper point ~ -0.0178
 # (1.2 mm above the gripper floor table + 1 mm): the random walk crosses the gripper floor with the tip still in the box
 GRIPPER_DOWN = np.array([2047, 2105, 2405, 2680, 2047, 2350], dtype=np.int64)

@@ -132,7 +132,8 @@ def test_action_delay_fifo_delays_by_n_ticks(calibration, cfg):
     start = _hold_ticks(bus)
     goal = start.copy()
     goal[0] += 100
-    ctrl0 = bus.ticks_to_q(start)
+    # the measured rest has the gripper at range_min, i.e. on the actuator's ctrlrange edge: compare clipped
+    ctrl0 = np.clip(bus.ticks_to_q(start), *model.actuator_ctrlrange[bus.act_ids].T)
     for i in range(3):
         bus.write_goal(goal)
         np.testing.assert_allclose(bus.data.ctrl[bus.act_ids], ctrl0, atol=1e-9, err_msg=f"write {i}")

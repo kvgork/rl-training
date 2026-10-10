@@ -169,7 +169,9 @@ def test_unidentifiable_pair_flagged(sines_run, prior):
     alone = fit_sim_params(train, held, prior=prior, fit=("kp",), fixed=("delay_ticks",), backend="cpu",
                            popsize=8, generations=15, seed=0, calibration=cal, cfg=cfg)
     assert alone.spread["kp"] < 0.5 and alone.unidentified == ["frictionloss"]  # only the fixed, unidentifiable one
-    np.testing.assert_allclose(alone.params.kp / prior.kp, 0.8, rtol=0.10)
+    np.testing.assert_allclose(alone.params.kp[:5] / prior.kp[:5], 0.8, rtol=0.10)
+    # the gripper's calibrated range shrank to 2010..3265 (2026-10-09 recalibration): less excitation, looser fit
+    np.testing.assert_allclose(alone.params.kp[5] / prior.kp[5], 0.8, rtol=0.15)
 
 
 def test_multiple_shooting_reinit(truth_run, truth):
@@ -204,7 +206,7 @@ def test_replay_reproduces_noise_free_truth(tmp_path, truth):
     model, data = load_model()
     sims = [replay_segment_cpu(s, model, data, cal, cfg, truth) for s in ds.segments]
     err = pooled_rms_pct(sims, ds.segments, cal)
-    assert err.max() < 0.06, err  # < ~1 tick rms (shoulder_lift ~0.9: re-init velocity from rounded ticks)
+    assert err.max() < 0.07, err  # < ~1.5 ticks rms (elbow ~1.4 at its 2201-tick range: re-init velocity from rounded ticks)
     sims0 = [replay_segment_cpu(s, model, data, cal, cfg, replace(truth, delay_ticks=0)) for s in ds.segments]
     assert pooled_rms_pct(sims0, ds.segments, cal).max() > 10 * err.max()
 

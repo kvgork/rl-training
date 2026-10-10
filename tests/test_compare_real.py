@@ -1,5 +1,6 @@
 """Sysid check: replay a logged episode (F8 layout) through the sim. Synthetic logs are produced from the sim itself."""
 
+import sys
 from pathlib import Path
 
 import h5py
@@ -11,6 +12,7 @@ from so101_rl.config import JOINT_NAMES
 from so101_rl.servo.bus import BlockRead
 from so101_rl.sim.compare_real import MAX_RMS_PCT, format_table, main, rms_joint_error_pct
 from so101_rl.sim.model import load_model
+from so101_rl.sim.model import load_model as _load_model
 from so101_rl.sim.mujoco_bus import MujocoBus
 
 N_STEPS = 40
@@ -157,11 +159,23 @@ def _simulate_with(calibration, cfg, target, params):
     return np.array(present)
 
 
-def test_sim_params_change_the_error(tmp_path, calibration, cfg):
+@pytest.fixture
+def pinned(cfg):
+    """The geometry this finding was pinned on (2026-10-06): the earlier arm calibration (its joint ranges normalise
+    the RMS %) and the table at -0.02 m. With the measured table (plan §10 2026-10-10) the 2047-centred sweep touches
+    it, and the wider calibrated pan range scales the % down; neither is what this test is about."""
+    from so101_rl.config import load_calibration
+
+    return load_calibration(Path(__file__).parent / "data" / "so101_follower.calib_2026-06.json"), cfg
+
+
+def test_sim_params_change_the_error(tmp_path, pinned, monkeypatch):
     """A log from an arm with kp x 0.5 and a 3-tick delay fails the gate under the prior and is ~0 % with matching
     --sim-params: the gate discriminates. kp alone moves the error measurably but far below the old 5 % gate (the MJCF
     servo is force-limited, its linear band is about ±2 ticks); on this trajectory it is just above the 1 % gate
     (plan §10 2026-10-06; measured 1.16 % on shoulder_pan, 2026-10-06 integration)."""
+    calibration, cfg = pinned
+    monkeypatch.setattr(sys.modules[__name__], "load_model", lambda: _load_model(table_z_m=-0.02))
     from dataclasses import replace
 
     from so101_rl.sim.sysid.params import SimParams

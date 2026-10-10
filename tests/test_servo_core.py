@@ -586,7 +586,7 @@ def test_tick_returns_the_same_preallocated_result(h):
 
 def test_build_servo_core_validates_the_safe_state_geometry(cfg, calibration):
     bad = dataclasses.replace(
-        cfg, safe_state=dataclasses.replace(cfg.safe_state, home_ticks=np.asarray(cfg.safe_state.rest_ticks))
+        cfg, safe_state=dataclasses.replace(cfg.safe_state, home_ticks=np.full(6, 2047))  # tip x 0.39 m: outside the box
     )
     clock = FakeClock()
     with pytest.raises(ValueError, match="safe_state"):

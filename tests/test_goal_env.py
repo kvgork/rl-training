@@ -326,8 +326,11 @@ def test_scripted_move_toward_goal_reaches_success_on_8_of_10_goals(reach_env):
         goal = obs["desired_goal"].astype(np.float64)
         for _ in range(REACH.episode_steps):
             obs, r, terminated, truncated, info = reach_env.step(_jacobian_action(reach_env, obs, goal))
+            if terminated and not info["is_success"]:  # a policy-caused trip is terminal too (trip penalty)
+                assert info["tripped"]
+                break
             if terminated:
-                assert info["is_success"] and np.linalg.norm(obs["achieved_goal"] - goal) <= 0.015 + 1e-6
+                assert np.linalg.norm(obs["achieved_goal"] - goal) <= 0.015 + 1e-6
                 assert r == pytest.approx(-REACH.reward.term("time").weight)
                 successes += 1
                 break

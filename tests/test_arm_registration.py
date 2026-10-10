@@ -135,7 +135,7 @@ def test_tiny_overlap_fails_the_gate(scene):
     c0, T_true, model, rgb, frames = scene
     pts, pix = depth_to_points(np.median(frames, axis=0), c0.color)
     p_base = pts @ T_true[:3, :3].T + T_true[:3, 3]
-    arm = p_base[:, 2] > TABLE_Z_M + 0.012
+    arm = p_base[:, 2] > TABLE_Z_M + 0.003  # every arm point, incl. the base foot that stands on the table
     v, u = pix[arm].T
     cu, cv = int(np.median(u)), int(np.median(v))
     mask = np.zeros(frames.shape[1:], bool)

@@ -55,12 +55,12 @@ safe_state:
   #       inside the box since the floor moved to table + 5 mm (plan §10 2026-10-06), above the table floor.
   # home: in-box PLACEHOLDER from the wave-1 review, tip (0.200, 0.000, 0.150) m, FK-checked by the loader.
   home_ticks: [2047, 960, 2700, 2748, 2047, 2047]
-  rest_ticks: [2050, 2200, 2301, 2745, 2040, 2065]
+  rest_ticks: [2151, 828, 3071, 2854, 2203, 2010]   # measured 2026-10-10 (joint-probe, torque off, after zero-adjust)
   torque_off_order: [gripper, wrist_roll, wrist_flex, elbow_flex, shoulder_lift, shoulder_pan]
   # Transit zone for the ramps between rest and home (review B1, safety/transit.py), metres, base frame.
   # THE table height (base frame). The only place it is written: the box floor and gripper floor below, the transit
   # floor, the goal / zone heights (env/tasks.py) and the sim scene table (sim/model.py TABLE_Z_M) all follow it.
-  table_z_m: -0.02                # table top
+  table_z_m: -0.0045              # table top (measured 2026-10-10, camera-calibrate 20261010-095104)
   table_clearance_m: 0.005        # the ramp target's tip never goes below table_z_m + this
   transit_zone_m: 0.05            # below floor + this, joints that lower the tip wait for the lifting joints
   home_box_margin_m: 0.010        # FK(home) at least this far inside every box face

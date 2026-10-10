@@ -217,6 +217,12 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 
 ## H5 - Rest pose, torque-off, sag map, stale-goal snap
 
+- **Status (2026-10-10):** the rest pose is measured (`rest_ticks` = [2151, 828, 3071, 2854, 2203, 2010], joint-probe
+  with torque off, after `zero-adjust`; plan §10 2026-10-10) and passes the geometry check at the measured table
+  (-0.0045 m). Still to do with the servo running (needs H2/H3): the torque-off "does not move" test, the sag map and
+  the stale-goal snap below. `verified_on_hardware` stays false until then. If the ramp into rest ever stalls on the
+  shoulder_lift / elbow stops (the pose sits 3 and 5 ticks inside them), back it off by ~20 ticks.
+
 - **Parts:** foam under the arm, camera recording the arm and the D435 mount.
 - **Needs:** safe-state (2.4), `servo --backend feetech` (3.2), keyframe (4.1).
 - **Procedure:** from `rest_ticks`, disable torque: the arm must not move (video). Sample limp falls from the box
