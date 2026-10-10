@@ -55,12 +55,12 @@ def test_shipped_home_is_inside_the_box_with_margin(cfg, fk):
 
 
 def test_shipped_rest_is_the_measured_pose_above_the_table(cfg, fk):
-    assert cfg.safe_state.rest_ticks.tolist() == [2050, 2200, 2301, 2745, 2040, 2065]
+    # plan §10 2026-10-10: rest measured on the arm (joint-probe, torque off) after the zero adjust; the table
+    # measured by camera-calibrate at z = -0.0045 m. The folded rest pose holds the tip ~26 mm above the table.
+    assert cfg.safe_state.rest_ticks.tolist() == [2151, 828, 3071, 2854, 2203, 2010]
     xyz = tip(fk, cfg.safe_state.rest_ticks)
-    np.testing.assert_allclose(xyz, [0.208, -0.001, -0.012], atol=0.002)
-    # plan §10 2026-10-06: the box floor is table + 5 mm (-0.015), so the rest pose lying on the table is now
-    # INSIDE the box (it was 2 cm below the old 0.010 floor)
-    assert cfg.box.z[0] == pytest.approx(cfg.safe_state.table_z_m + 0.005) == pytest.approx(-0.015)
+    np.testing.assert_allclose(xyz, [0.167, -0.022, 0.022], atol=0.002)
+    assert cfg.box.z[0] == pytest.approx(cfg.safe_state.table_z_m + 0.005) == pytest.approx(0.0005)
     assert fk.in_box(xyz, cfg.box)
     assert xyz[2] >= cfg.safe_state.table_z_m + cfg.safe_state.table_clearance_m
 
@@ -139,7 +139,8 @@ def test_transit_dip_is_rejected(tmp_path, calibration):
     dip), and says so with the dip message, not only the rest-floor one. (The box floor follows the table.)"""
 
     def mut(raw):
-        raw["safe_state"]["table_z_m"] = -0.012  # the box floor follows: table + 5 mm = -0.007
+        raw["safe_state"]["table_z_m"] = 0.02  # rest tip z ~0.022; the box floor follows: table + 5 mm = 0.025
+        raw["safe_state"]["start_min_tip_z_m"] = 0.03  # the loader keeps the start floor >= table + 1 cm
 
     probs = _problems(tmp_path, calibration, mut)
     assert any("rest -> home transit dips" in p for p in probs)
@@ -205,7 +206,7 @@ def test_bound_check_uses_the_calibration_limits(tmp_path, calibration):
     """A wider calibration (full 0..4095 on every joint) needs a longer bound; 20 s still covers it."""
     wide = {n: replace(c, range_min=0, range_max=4095) for n, c in calibration.items()}
     validate_geometry(load_config(calibration=wide), wide)  # shipped 20 s
-    _rejects(tmp_path, wide, lambda r: r["safe_state"].update(bound_s=17.0), "bound_s")
+    _rejects(tmp_path, wide, lambda r: r["safe_state"].update(bound_s=15.0), "bound_s")
 
 
 # ---- S10 / misc bounds ----------------------------------------------------------------------------------------

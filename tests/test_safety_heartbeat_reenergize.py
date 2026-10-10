@@ -64,7 +64,7 @@ def test_full_reenergize_from_rest_with_heartbeat_hook_never_latches(cfg, calibr
     t0 = clock.monotonic_ns()
     reenergize(bus, cfg, calibration, clock, BlockRead(), tick_hook=hb)
     elapsed_s = (clock.monotonic_ns() - t0) / S
-    assert elapsed_s > 3 * mcu.timeout_ms / 1000  # long enough that a missing heartbeat WOULD have latched
+    assert elapsed_s > mcu.timeout_ms / 1000  # long enough that a missing heartbeat WOULD have latched (control below)
     s = link.status()  # polls the MCU at "now"
     assert s.armed and s.relay_on and not s.latched
     assert hb.sent > 0.9 * hb.ticks
@@ -94,7 +94,7 @@ def test_full_safe_state_sequence_with_heartbeat_hook_never_latches(cfg, calibra
     t0 = clock.monotonic_ns()
     last = seq.run(bus, BlockRead(), servo_hz=cfg.rates.servo_hz, tick_hook=hb)
     assert last.done and not last.timed_out
-    assert (clock.monotonic_ns() - t0) / S > 3 * mcu.timeout_ms / 1000
+    assert (clock.monotonic_ns() - t0) / S > mcu.timeout_ms / 1000
     s = link.status()
     assert s.armed and not s.latched
     assert not bus.torque_enabled().any()

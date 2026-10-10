@@ -47,10 +47,10 @@ def test_matching_calibration_passes(calibration):
 
 
 def test_sign_magnitude_register_matches_negative_file_value(calibration):
-    """Register raw 2048 + 1647 decodes to -1647 and must MATCH the file's -1647."""
+    """Register raw 2048 + 1638 decodes to -1638 and must MATCH the file's -1638."""
     bus = RegBus(calibration)
-    assert calibration["shoulder_pan"].homing_offset == -1647
-    assert bus.raw["shoulder_pan"]["homing_offset"] == 2048 + 1647
+    assert calibration["shoulder_pan"].homing_offset == -1638
+    assert bus.raw["shoulder_pan"]["homing_offset"] == 2048 + 1638
     assert check_calibration(bus, calibration).ok
 
 
@@ -71,9 +71,9 @@ def test_homing_offset_plus_one_is_a_mismatch(calibration):
 
 def test_wrong_sign_of_a_negative_offset_is_a_mismatch(calibration):
     bus = RegBus(calibration)
-    bus.raw["shoulder_pan"]["homing_offset"] = 1647  # +1647 instead of -1647
+    bus.raw["shoulder_pan"]["homing_offset"] = 1638  # +1638 instead of -1638
     rep = check_calibration(bus, calibration)
-    assert rep.mismatches["shoulder_pan"] == ("homing_offset", -1647, 1647)
+    assert rep.mismatches["shoulder_pan"] == ("homing_offset", -1638, 1638)
 
 
 @pytest.mark.parametrize("field", ["range_min", "range_max", "id"])

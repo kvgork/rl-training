@@ -27,7 +27,10 @@ def _fk_goals(rig, spread):
     def sample(n, rng):
         off = rng.integers(-spread, spread + 1, size=(n, 6))
         off[:, 4:] = 0
-        return fk_tip_batch(fk, np.clip(home + off, cfg.joints.min_ticks, cfg.joints.max_ticks))
+        # inside the gate's IK limits (2 % shrunk): a goal only reachable at a joint stop is not "well posed"
+        lo, hi = np.asarray(cfg.joints.min_ticks), np.asarray(cfg.joints.max_ticks)
+        m = ((hi - lo) * 0.02).astype(np.int64)
+        return fk_tip_batch(fk, np.clip(home + off, lo + m, hi - m))
 
     return sample
 

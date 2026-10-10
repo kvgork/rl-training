@@ -45,7 +45,7 @@ from so101_rl.servo.heartbeat import FakeHeartbeatLink, FakeMcu
 from so101_rl.servo.shm import CmdMode, LocalIpc, new_cmd, new_state
 from so101_rl.servo.timing import FakeClock
 from so101_rl.sim.batched_servo import CHAIN_TRIP_BITS, STUCK_REPEAT_TICKS, BatchedServoChain, ChainOut
-from so101_rl.sim.model import jaw_collision_geom_ids, load_model
+from so101_rl.sim.model import DIE_EDGE_M, TABLE_Z_M, jaw_collision_geom_ids, load_model
 from so101_rl.sim.mujoco_bus import MujocoBus
 
 NS = 1_000_000_000
@@ -591,10 +591,18 @@ def test_layer_b_closed_loop(cpu_rig, parity_env, mcfg, mcal, kchain, idx):
 # seq6b 9.8e-4 rad and seq7b 1.1e-3 rad (shoulder vs lower_arm mesh self-contact plus the MJCF joint-range limit of
 # shoulder_lift: MJCF min = tick 909, calibrated limit 869), seq15e 1.7e-3 rad (alternating +-1: the actuators sit
 # in their force saturation +-3.35 N m on almost every tick). Smooth sequences agree to 1e-6..8e-5 rad. Not loosened:
-# a user decision (plan §10 2026-10-06 "Layer B parity tolerance"): strict xfails, only these three, each capped
+# a user decision (plan §10 2026-10-06 "Layer B parity tolerance", 2026-10-10 seq16e): strict xfails, only these four, each capped
 # at _B3_XFAIL_CEILING_RAD (2e-3 rad) so worse drift fails outright. With the gripper floor check (2026-10-07)
 # seq7b no longer touches the table (it drifted 4.9e-3 rad with jaw-table contact under the tip-only floor).
-_B3_XFAIL = {6: "self-contact + MJCF joint limit", 7: "self-contact + MJCF joint limit", 15: "actuator force saturation"}
+# seq16e 1.15e-4 rad (2026-10-10, plan §10 "Layer B parity: seq16e accepted"): with the recalibrated gripper range
+# (2010..3265, 15 % shorter) the alternating sequence presses the gripper on its closed MJCF joint limit for 18 ticks;
+# the f32/f64 limit constraint leaks into the elbow (4.6e-5 rad with the earlier 2011..3488 range).
+_B3_XFAIL = {
+    6: "self-contact + MJCF joint limit",
+    7: "self-contact + MJCF joint limit",
+    15: "actuator force saturation",
+    16: "gripper on its closed MJCF joint limit",
+}
 _B3_SEQ = [i for i in range(N_SEQ) if KIND[i] in (*CONTACT_FREE, "d")]
 # Ceiling for the xfail sequences: the drift may exceed 1e-4 rad (strict xfail) but never this (else a hard failure).
 _B3_XFAIL_CEILING_RAD = 2e-3
@@ -658,10 +666,12 @@ def test_layer_b_shown_to_fail_substeps(cpu_rig, mcfg, mcal, kchain):
 # Grasp pose (found by a kinematic search, S1.3): gripper pointing down over the table, jaw tips 1-2 mm above it,
 # the die resting between the open jaws (6 mm nearer the fixed jaw than the midpoint, faces aligned with the
 # closing direction). Arm ticks pan..roll, gripper ticks.
-GRASP_ARM_TICKS = (2047, 2110, 2410, 2640, 2047)
+# the grasp pose sits the same height above the table as before the table was measured (plan §10 2026-10-10:
+# table -0.02 -> -0.0045, the pose raised 15.5 mm with the jaw axis kept within 0.4 deg)
+GRASP_ARM_TICKS = (2047, 2058, 2390, 2708, 2047)
 GRASP_GRIPPER_OPEN = 2350
 GRASP_DIE_OFFSET_M = 0.006
-DIE_REST_Z = -0.012
+DIE_REST_Z = TABLE_Z_M + DIE_EDGE_M / 2
 
 
 def _grasp_state(model, cal) -> tuple[np.ndarray, np.ndarray]:
@@ -703,8 +713,8 @@ def _die_tip_dist(model, qpos: np.ndarray) -> float:
 
 
 def _layer_c(cfg, cal, *, cpu_die_mass_scale: float = 1.0) -> dict:
-    # the SHIPPED config: since plan §10 2026-10-06 the box floor is table + 5 mm (-0.015), so the grasp pose
-    # (FK tip z ~ -0.011) is inside the box (the test-local floor override of S1.3 is gone)
+    # the SHIPPED config: the box floor is table + 5 mm, so the grasp pose (FK tip ~4 mm above the table) is inside
+    # the box (the test-local floor override of S1.3 is gone)
     gcfg = cfg
     rig = CpuRig(gcfg, cal, die_mass_scale=cpu_die_mass_scale)
     q, ctrl = _grasp_state(rig.model, cal)

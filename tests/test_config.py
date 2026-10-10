@@ -62,8 +62,8 @@ def test_limits_intersection_narrowest_wins(cfg, calib):
     # wrist_roll calibration is the full turn -> config limits (0..4095) win there
     assert cfg.joints.min_ticks[4] == 0 and cfg.joints.max_ticks[4] == 4095
     # shoulder_pan: calibration is narrower than the config
-    assert cfg.joints.min_ticks[0] == calib["shoulder_pan"].range_min == 1426
-    assert cfg.joints.max_ticks[0] == calib["shoulder_pan"].range_max == 2735
+    assert cfg.joints.min_ticks[0] == calib["shoulder_pan"].range_min == 1393
+    assert cfg.joints.max_ticks[0] == calib["shoulder_pan"].range_max == 3062
 
 
 def test_limits_config_narrower_than_calibration(tmp_path, calib):
@@ -77,7 +77,7 @@ def test_limits_config_narrower_than_calibration(tmp_path, calib):
 
 def test_empty_intersection_rejected(tmp_path, calib):
     def mut(raw):
-        raw["joints"]["min_ticks"] = [3000, 0, 0, 0, 0, 0]  # above shoulder_pan range_max
+        raw["joints"]["min_ticks"] = [3100, 0, 0, 0, 0, 0]  # above shoulder_pan range_max
 
     with pytest.raises(ValueError, match="intersection"):
         load_config(_variant(tmp_path, mut), calibration=calib)

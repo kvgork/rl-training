@@ -171,4 +171,4 @@ def test_shipped_gripper_floor_values(setup):
     cfg = setup[0]
     assert cfg.box.gripper_floor_z_m == pytest.approx(cfg.safe_state.table_z_m + 0.001)
     assert cfg.box.gripper_present_tolerance_m == pytest.approx(0.002)
-    assert cfg.box.z[0] == pytest.approx(-0.015)  # the tip floor is unchanged
+    assert cfg.box.z[0] == pytest.approx(cfg.safe_state.table_z_m + 0.005)  # the tip floor: table + 5 mm

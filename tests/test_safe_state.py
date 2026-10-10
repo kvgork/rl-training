@@ -144,7 +144,7 @@ def test_a_rest_pose_the_transit_cannot_reach_times_out_instead_of_crossing_the_
     """The planner holds every joint rather than lower the tip through the floor; the bound then ends it."""
     clock = FakeClock()
     sunk = np.asarray(cfg.safe_state.rest_ticks).copy()
-    sunk[1] += 300  # shoulder further down: this "rest" puts the tip 4 cm into the table
+    sunk[1] += 300  # shoulder further down: this "rest" puts the tip ~1 cm below the floor
     xyz = np.zeros(3)
     floor = cfg.safe_state.table_z_m + cfg.safe_state.table_clearance_m
     assert fk.gripper_xyz_from_ticks(sunk, xyz)[2] < floor - 0.01

@@ -229,8 +229,8 @@ def test_failure_after_a_write_prints_restore_and_restore_works(tmp_path, capsys
     code = _main(tmp_path, bus, cal_path, port, "--joint", "shoulder_lift=-4.94", "--apply", "--attended")
     assert code == za.EXIT_WRITTEN_FAILED
     err = capsys.readouterr().err
-    assert "FAILED AFTER WRITING" in err and "Homing_Offset: -930 -> -874" in err and "--restore" in err
-    assert "MAYBE (it raised): shoulder_lift (id 2) Max_Position_Limit: 3159 -> 3103" in err
+    assert "FAILED AFTER WRITING" in err and "Homing_Offset: -881 -> -825" in err and "--restore" in err
+    assert "MAYBE (it raised): shoulder_lift (id 2) Max_Position_Limit: 3209 -> 3153" in err
     assert cal_path.read_text() == original  # no partial JSON
     (fail,) = (tmp_path / "hw" / "failed").glob("zero-adjust-*.json")
     backup = Path(json.loads(fail.read_text())["backup"])

@@ -287,7 +287,7 @@ def test_trip_penalty_is_worse_than_any_trip_free_episode():
         assert t.trip_penalty < 0 and t.trip_penalty <= t.episode_steps * worst
         # the undiscounted bound also beats the worst DISCOUNTED continuation, for every gamma < 1
         assert t.trip_penalty < worst / (1 - t.gamma)
-    assert REACH.max_dist_m == pytest.approx(np.linalg.norm([0.27, 0.45, 0.305]))
+    assert REACH.max_dist_m == pytest.approx(np.linalg.norm([0.27, 0.45, 0.2895]))  # z: 0.0005..0.28 at the measured table
     with pytest.raises(RewardSpecError, match="not worse"):
         dataclasses.replace(REACH, trip_penalty=-10.0)
     with pytest.raises(RewardSpecError, match="< 0"):

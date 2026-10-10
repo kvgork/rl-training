@@ -282,7 +282,7 @@ def test_bad_geometry_refuses_to_start_with_exit_2(cfg, calibration):
     import dataclasses
 
     bad = dataclasses.replace(
-        cfg, safe_state=dataclasses.replace(cfg.safe_state, home_ticks=np.asarray(cfg.safe_state.rest_ticks))
+        cfg, safe_state=dataclasses.replace(cfg.safe_state, home_ticks=np.full(6, 2047))  # tip x 0.39 m: outside the box
     )
     code, bus, _ = _in_process(bad, calibration, max_ticks=5)
     assert code == process.EXIT_STARTUP
@@ -489,7 +489,7 @@ def _sigint_during_boot_ramp_subprocess(tmp_path, *, second_after_s=None):
         stderr=subprocess.PIPE,
         text=True,
     )
-    rest = np.asarray(json.loads("[2050, 2200, 2301, 2745, 2040, 2065]"))
+    rest = np.asarray(json.loads("[2151, 828, 3071, 2854, 2203, 2010]"))
     shm, st, last = None, new_state(), None
     t_sig = t_sig2 = None
     try:
