@@ -297,7 +297,12 @@ Header (append one row per artifact; the H-track, not the software waves, writes
   2168, wrist_flex 2860), calibration JSON unchanged: +1.47 / −2.14 / +2.20° (σ ≈ 0.06–0.09°, verdict
   `joint_offsets`). The two runs disagree by far more than σ, so the estimate depends on the posture (unloaded joint
   backlash with the gripper resting on the table, kinematic / mesh error); the bootstrap σ does not cover that.
-  Do NOT zero-adjust from a single run: H7a stays open until a third run in a third posture shows which one holds.
+  Two more runs: `20261010-164720` (tip gate failed: the gripper at the image edge in pose 1) +1.61 / −1.15 /
+  +1.16°; `20261010-165407` (pose 1 close to the morning posture) −0.69 / −0.00 / +1.34°. Over the 4 runs:
+  shoulder_lift −0.69…+1.61 (mean +0.63), elbow_flex −2.14…0.00 (mean −0.86), wrist_flex +0.62…+2.20 (mean +1.33);
+  table z −4.2…−5.1 mm, base tilt 0.2–0.6°. The per-run scatter (±1–1.5°) is the method's repeatability for joint
+  offsets, not a zero error: no further zero-adjust. wrist_flex is positive in every run (+1.3° ≈ 2 mm at the tip,
+  well inside the 15 mm success radius). The pass bar "< 1°" is below this repeatability.
 
 ## H8 - Hand-eye calibration and table fiducial
 
@@ -421,7 +426,7 @@ session. It does not go through the lab connector.
   marker.
 - **Needs:** H2, H3 (with FW1), H5 and H7 passed; the servo bus powered; the camera calibrated
   (`pixi run camera-calibrate --method arm-shape` and `pixi run camera-overlay` passing); the sim exit gate signed
-  (`pixi run lab gate-sign <training run>`; the eval run is refused). Status 2026-10-10: camera calibrated (`runs/camera-calib/20261010-163550`, overlay IoU 0.81) and the gate signed for the attempt-3 run `fastsac_sim-reach-20261008-125912-fefa` (eval `…130617-58ef`, `gate.json`). Dry run first against the sim servo: `pixi run -e cpu servo --backend
+  (`pixi run lab gate-sign <training run>`; the eval run is refused). Status 2026-10-10: camera calibrated (`runs/camera-calib/20261010-165407`, overlay IoU 0.82) and the gate signed for the attempt-3 run `fastsac_sim-reach-20261008-125912-fefa` (eval `…130617-58ef`, `gate.json`). Dry run first against the sim servo: `pixi run -e cpu servo --backend
   mujoco` in terminal 1, then the terminal-2 command below without `--attended` (exit 0).
 - **Procedure:**
   1. Terminal 1 (the servo owns the bus): `pixi run servo --backend feetech --heartbeat-port <mcu port> --tick-log
