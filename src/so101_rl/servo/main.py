@@ -154,6 +154,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        if _cuda_torch_installed():
+            print(
+                "so101-servo: the feetech backend imports lerobot -> torch, and this environment has the CUDA torch "
+                "build: after mlockall its GB-sized libraries cannot be mapped ('failed to map segment'). Run the "
+                "servo from the CPU 'robot' environment: pixi run -e robot servo --backend feetech ...",
+                file=sys.stderr,
+            )
+            return 2
         from so101_rl.servo.feetech_bus import FeetechBus
 
         def bus_factory():
@@ -189,6 +197,16 @@ def main(argv: list[str] | None = None) -> int:
         arm_timeout_s=args.arm_timeout_s,
         serial_ports=tuple(ports),
     )
+
+
+def _cuda_torch_installed() -> bool:
+    """True if the importable torch is a CUDA build (``torch/lib/libtorch_cuda.so`` exists); torch is not imported."""
+    import importlib.util
+
+    spec = importlib.util.find_spec("torch")
+    if spec is None or spec.origin is None:
+        return False
+    return (Path(spec.origin).parent / "lib" / "libtorch_cuda.so").exists()
 
 
 class _NoList(list):
