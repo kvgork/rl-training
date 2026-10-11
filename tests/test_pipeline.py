@@ -12,7 +12,7 @@ from so101_rl.safety import pipeline as pipeline_mod
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.pipeline import SafetyPipeline
 from so101_rl.safety.stuck import StuckActionMonitor
-from so101_rl.safety.thermal import ThermalMonitor
+from so101_rl.safety.thermal import CONFIRM_READS, ThermalMonitor
 from so101_rl.safety.types import TripCause, Verdict
 from so101_rl.servo.bus import BlockRead
 from so101_rl.servo.timing import FakeClock
@@ -305,7 +305,8 @@ def test_commanded_target_is_clamped_to_the_exact_box_not_the_tolerance_band(cfg
 # ---- thermal / protection / stuck -----------------------------------------------------------------------------------------
 def test_thermal_and_protection_bits_reported(rig):
     rig.block.temperature_c[3] = 61
-    v = rig.tick(3)
+    for _ in range(CONFIRM_READS):  # a hot joint trips on its CONFIRM_READS-th read in a row
+        v = rig.tick(3)
     assert v.trips & T.THERMAL
     rig.block.temperature_c[3] = 35
     rig.block.status[2] = 4
@@ -392,7 +393,8 @@ def test_earlier_check_wins_over_a_later_one(rig, cfg):
 def test_monitor_only_feeds_thermal_without_touching_targets(rig):
     goal, prev = rig.pipe.goal.copy(), rig.pipe.prev_target.copy()
     rig.block.temperature_c[1] = 62
-    v = rig.pipe.monitor_only(rig.block, rig.v)
+    for _ in range(CONFIRM_READS):
+        v = rig.pipe.monitor_only(rig.block, rig.v)
     assert v.trips == T.THERMAL
     np.testing.assert_array_equal(rig.pipe.goal, goal)
     np.testing.assert_array_equal(rig.pipe.prev_target, prev)

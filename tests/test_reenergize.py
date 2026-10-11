@@ -285,6 +285,55 @@ def test_hot_or_dead_temperature_refuses_before_torque(cfg, calibration, bus, cl
     assert "set_torque:True" not in bus.log and "write_goal" not in bus.log
 
 
+def _spiky(bus, spikes):
+    """``read_block`` returns ``spikes[k]`` (joint, C) on the k-th read of the run, the true temperature otherwise."""
+    real, n = bus.read_block, {"k": 0}
+
+    def read_block(out):
+        ok = real(out)
+        k = n["k"]
+        n["k"] += 1
+        if ok and k in spikes:
+            j, v = spikes[k]
+            out.temperature_c[j] = v
+        return ok
+
+    bus.read_block = read_block
+    return n
+
+
+def test_a_one_read_spike_at_the_start_check_does_not_refuse(cfg, calibration, bus, clock):
+    """The real bus, 2026-10-11: one-tick spikes (26 -> 69 -> 26 C). The start check re-reads at once."""
+    _spiky(bus, {0: (0, 69)})
+    reenergize(bus, cfg, calibration, clock, BlockRead())
+    assert "set_torque:True" in bus.log
+
+
+def test_one_read_spikes_during_the_ramp_do_not_abort_it(cfg, calibration, clock):
+    bus = LoggingBus(calibration, clock, present=IN_BOX)
+    _spiky(bus, {k: (k % N_JOINTS, 69) for k in range(3, 200, 4)})
+    reenergize(bus, cfg, calibration, clock, BlockRead())
+    assert "set_torque:False" not in bus.log
+    np.testing.assert_array_equal(bus.position, cfg.safe_state.home_ticks)
+
+
+def test_a_joint_hot_on_consecutive_ramp_reads_ends_the_ramp_with_torque_off(cfg, calibration, clock):
+    bus = LoggingBus(calibration, clock, present=IN_BOX)
+    n = _spiky(bus, {})
+    real = bus.read_block
+
+    def read_block(out):
+        ok = real(out)
+        if ok and n["k"] > 5:
+            out.temperature_c[2] = cfg.thermal.trip_c
+        return ok
+
+    bus.read_block = read_block
+    with pytest.raises(RuntimeError, match="temperatures"):
+        reenergize(bus, cfg, calibration, clock, BlockRead())
+    assert "set_torque:True" in bus.log and bus.log[-1] == "set_torque:False"
+
+
 def test_protection_status_bit_refuses_before_torque(cfg, calibration, bus, clock):
     bus.status[1] = 32  # overload
     with pytest.raises(RuntimeError, match="protection status"):

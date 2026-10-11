@@ -60,6 +60,7 @@ from . import clamp
 from .calib_check import require_calibration
 from .fk import KinematicChain, So101FK
 from .safe_state import SETTLE_TICKS
+from .thermal import CONFIRM_READS, ConsecutiveAbove
 from .transit import TransitPlanner
 
 _NS = 1_000_000_000
@@ -126,6 +127,7 @@ def reenergize(
         raise ValueError(f"calibration must contain all {N_JOINTS} joints, got {sorted(calibration)}")
     ids = [c.id for _, c in motors]
     t_entry = clock.monotonic_ns()
+    hot = ConsecutiveAbove(cfg.thermal.trip_c)
     deadline = t_entry + int(timeout_s * _NS)
     gap_ns = int(heartbeat_gap_s * _NS)
     # With a heartbeat hook the pre-torque phase must reach its first good tick before the MCU times out.
@@ -168,11 +170,19 @@ def reenergize(
         if tick_hook is not None and clock.monotonic_ns() - t_entry > gap_ns:
             # wait_until evaluates ok() before its deadline: a slow register phase must not slip through
             raise TimeoutError("re-energise: no good tick within the heartbeat gap after entry (pre-torque too slow)")
+        _check_temperatures(cfg, block, hot)
+        for _ in range(CONFIRM_READS - 1):  # a joint at >= trip_c: re-read at once, a spike is gone on the next read
+            if not (block.temperature_c >= cfg.thermal.trip_c).any():
+                break
+            if not (bus.read_block(block) and block.ok):
+                if tick_hook is not None:
+                    tick_hook(False)
+                return False
+            _check_temperatures(cfg, block, hot)  # raises on the CONFIRM_READS-th hot read in a row
         present = block.position
         if not clamp.check_range(present):
             raise RuntimeError(f"re-energise: present position outside 0..4095: {present.tolist()}")
         _check_start_pose(cfg, fk, present)
-        _check_temperatures(cfg, block)
         if not bus.write_goal(present.copy()):
             raise RuntimeError("re-energise: write_goal(present) failed")
         if tick_hook is not None:
@@ -197,7 +207,7 @@ def reenergize(
         if not bus.set_torque(True):
             raise RuntimeError("re-energise: set_torque(True) failed")
         # 6. ramp home through the transit zone, same step and tracking clamp as the safe-state ramp
-        _ramp_home(bus, cfg, clock, block, present, timeout_s, fk, tick_hook, last_good_ns, gap_ns, check_abort)
+        _ramp_home(bus, cfg, clock, block, present, timeout_s, fk, tick_hook, last_good_ns, gap_ns, check_abort, hot)
     except BaseException as exc:
         if hand_over_on_abort and isinstance(exc, ReenergizeAborted) and torque_on_requested:
             exc.torque_on = True  # stop during the ramp: the caller ramps to rest (plan section 10, 2026-10-02)
@@ -254,9 +264,11 @@ def _check_start_pose(cfg: So101Config, fk: So101FK, present: np.ndarray) -> Non
     )
 
 
-def _check_temperatures(cfg: So101Config, block: BlockRead) -> None:
+def _check_temperatures(cfg: So101Config, block: BlockRead, hot: ConsecutiveAbove) -> None:
+    """``hot``: the run's filter, fed once per good read (a joint must read >= trip_c on ``CONFIRM_READS``
+    consecutive reads: the bus returns one-tick spikes, 2026-10-11); a dead sensor (0 / 255) refuses at once."""
     t = block.temperature_c
-    if bool(np.isin(t, _SENSOR_DEAD).any()) or int(t.max()) >= cfg.thermal.trip_c:
+    if bool(np.isin(t, _SENSOR_DEAD).any()) or hot.update(t):
         raise RuntimeError(f"re-energise refused: temperatures {t.tolist()} C (trip {cfg.thermal.trip_c} C)")
     if int(block.status.max()) != 0:
         raise RuntimeError(f"re-energise refused: firmware protection status {block.status.tolist()}")
@@ -274,6 +286,7 @@ def _ramp_home(
     last_good_ns: int,
     gap_ns: int,
     check_abort: Callable[[], None],
+    hot: ConsecutiveAbove,
 ) -> None:
     home = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32)
     planner = TransitPlanner(fk, cfg.safe_state)
@@ -297,7 +310,7 @@ def _ramp_home(
             raise TimeoutError("re-energise: no successful read+write within the heartbeat gap")
         got = bool(bus.read_block(block)) and block.ok
         if got:
-            _check_temperatures(cfg, block)  # torque is on now: a hot joint or a protection bit ends the ramp
+            _check_temperatures(cfg, block, hot)  # torque is on now: a hot joint or a protection bit ends the ramp
         if got and int(np.abs(block.position - home).max()) <= SETTLE_TICKS and bool((target == home).all()):
             return
         if got:

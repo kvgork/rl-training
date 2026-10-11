@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.38 (2026-10-10). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.39 (2026-10-11). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -458,8 +458,8 @@ These are ordered from the outermost layer to the innermost.
       - **BOX** (the commanded target is outside) is a clamp that reverts to the previous target.
       - **BOX_PRESENT** (the present position is outside: tip by more than 5 mm, or the lowest gripper point by more than 2 mm) is a trip.
    4. The thermal trip:
-      - It fires at 60 °C or above and latches once.
-      - Resuming needs 50 °C or below for 30 s.
+      - It fires when one joint reads 60 °C or above on 3 consecutive good reads (100 ms; 0.39: the real bus returns one-tick spikes such as 26 → 69 → 26 °C) and latches once.
+      - Resuming needs 50 °C or below for 30 s; the dwell restarts only when a joint reads above 50 °C on 3 consecutive reads.
       - A temperature reading older than 1 s, or a raw value of 0 or 255, is also a trip.
    5. The firmware protection bits: any non-zero `Status` is a trip.
    6. The stuck-action monitor.
@@ -495,7 +495,7 @@ These are ordered from the outermost layer to the innermost.
    1. `ping_all`
    2. calibration registers
    3. Lock = 0, check that Torque_Enable == 0, write every register, then read every register back
-   4. a block read. The start pose must be near rest, or inside the box with the tip at z ≥ `start_min_tip_z_m` (0.010 m, 3 cm above the table); temperatures below the trip and not 0 or 255, and Status 0.
+   4. a block read. The start pose must be near rest, or inside the box with the tip at z ≥ `start_min_tip_z_m` (0.010 m, 3 cm above the table); temperatures below the trip and not 0 or 255, and Status 0. A joint at or above the trip is re-read at once and refuses on the 3rd hot read in a row (0.39); the ramp's per-read check uses the same 3-in-a-row rule.
    5. goal = present (this is the first heartbeat tick). On the STS3215 this write already switches torque ON, at the present pose
    6. read back Goal_Position
    7. `set_torque(True)`
@@ -620,3 +620,4 @@ Bump the version line at the top and add an entry below.
 | 0.36 | 2026-10-10 | **Attended no-watchdog exception** (`rl/deploy_policy.py`; plan §10 2026-10-10). `deploy-policy --attended --accept-no-watchdog` accepts a real servo started with `--no-mcu` (still refused without the flag or without `--attended`), warns NO WATCHDOG and records `servo.no_watchdog_accepted`. The servo itself already ran `--backend feetech --no-mcu` (no ARM wait: it re-energises at start). §3 row and deploy paragraph; `docs/HARDWARE_CHECKLIST.md` HS4 no-watchdog variant. |
 | 0.37 | 2026-10-10 | **Servo feetech backend needs the CPU `robot` env** (`servo/main.py`). The first real start (`pixi run servo --backend feetech --no-mcu`, default env) failed with `ImportError('libtorch_cuda.so: failed to map segment from shared object')`: mlockall(MCL_CURRENT\|MCL_FUTURE) succeeded, then FeetechBus imported lerobot → torch (CUDA). The servo now refuses that environment before opening any port and names `pixi run -e robot servo`; the HARDWARE_CHECKLIST feetech commands use `-e robot`. §3 RT setup. |
 | 0.38 | 2026-10-10 | **STS3215: a goal write switches torque on** (`servo/core.py`, `safety/reenergize.py`, `servo/fake_bus.py`). The first real start (`--no-mcu`) failed with `re-energise: motor 1 has torque on before the register writes`: the boot tick's goal = present write had switched torque on. Consequences fixed: (1) BOOT / TORQUE_OFF / CHECK / IDLE_TORQUE_OFF and the pre-re-energise boot tick never write a goal; they re-send the acknowledged torque-off every tick, which is also the heartbeat's write (otherwise the arm would stay stiff after every safe-stop, during the thermal dwell); (2) re-energise turns torque off on any failure from its goal = present write on, not only after `set_torque(True)`, and a stop before step 7 is never a hand-over. `FakeBus` models the behaviour by default (`goal_enables_torque`). §5, §6. Tests that render the die / tracker scenes are pinned to the provisional camera (`tests/data/camera_provisional_2026-10-07.yaml`, fixture `provisional_camera`): their fixed die positions were laid out for that view. |
+| 0.39 | 2026-10-11 | **Thermal trip needs 3 consecutive hot reads** (`safety/thermal.py` `CONFIRM_READS`, `ConsecutiveAbove`; `safety/reenergize.py`; plan §10 2026-10-11). The first real-arm runs showed one-tick temperature spikes (19 in 4400 ticks, up to 57 and 69 °C on joints at 26 °C); one tripped THERMAL. A single hot read now neither trips the monitor nor refuses / aborts re-energise (whose ramp abort would drop the arm); 0 / 255 still trip at once. §6 layer 2 item 4, re-energise step 4. `docs/HARDWARE_CHECKLIST.md` HS4 no-watchdog: start `deploy-policy` before the servo (the servo is in RUN seconds after start and safe-stops on STALE_CMD with no client attached). |

@@ -20,7 +20,7 @@ from so101_rl.safety.reenergize import reenergize
 from so101_rl.safety.safe_state import SafeStateSequencer
 from so101_rl.safety.state_machine import SafetyStateMachine, SmInputs, SmOutputs
 from so101_rl.safety.stuck import StuckActionMonitor
-from so101_rl.safety.thermal import ThermalMonitor
+from so101_rl.safety.thermal import CONFIRM_READS, ThermalMonitor
 from so101_rl.safety.types import SmState, TripCause, Verdict
 from so101_rl.servo.bus import BlockRead
 from so101_rl.servo.fake_bus import FakeBus
@@ -126,7 +126,8 @@ def test_thermal_trip_rests_torques_off_cools_and_resumes_by_full_reenergize(cor
     assert core.sm.state is SmState.RUN
 
     core.bus.set_temperature("elbow_flex", cfg.thermal.trip_c + 1)
-    core.tick()  # trip -> SAFE_STOPPING -> sequencer to rest -> TORQUE_OFF
+    for _ in range(CONFIRM_READS):  # trip on the CONFIRM_READS-th hot read -> SAFE_STOPPING -> rest -> TORQUE_OFF
+        core.tick()
     assert SmState.SAFE_STOPPING in core.states and core.sm.state is SmState.TORQUE_OFF
     assert not core.bus.torque_enabled().any()  # torque off at rest: never holding pose energised
     np.testing.assert_allclose(core.block.position[:5], cfg.safe_state.rest_ticks[:5], atol=30)

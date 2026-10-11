@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from so101_rl.config import N_JOINTS, ThermalConfig
-from so101_rl.safety.thermal import ThermalMonitor
+from so101_rl.safety.thermal import CONFIRM_READS, ThermalMonitor
 from so101_rl.safety.types import TripCause
 from so101_rl.servo.timing import FakeClock
 
@@ -34,6 +34,13 @@ def step(mon, clock, t, *, dt_s=1 / 30, status=ZERO_STATUS, ok=True):
     return mon.update(temps(t) if np.isscalar(t) else t, status, ok)
 
 
+def trip(mon, clock, t, **kw):
+    """``CONFIRM_READS`` reads of ``t`` in a row (a hot joint trips on the last one); the last result."""
+    for _ in range(CONFIRM_READS - 1):
+        step(mon, clock, t, **kw)
+    return step(mon, clock, t, **kw)
+
+
 def test_defaults_match_yaml(cfg):
     assert cfg.thermal == CFG
 
@@ -42,6 +49,8 @@ def test_ramp_to_59_no_trip_then_60_trips(mon, clock):
     for t in range(30, 60):
         assert step(mon, clock, t) == TripCause.NONE
     assert step(mon, clock, 59) == TripCause.NONE
+    for _ in range(CONFIRM_READS - 1):
+        assert step(mon, clock, 60) == TripCause.NONE
     assert step(mon, clock, 60) == TripCause.THERMAL
     assert mon.trips_last_hour() == 1
     assert mon.hottest_c == 60.0
@@ -50,11 +59,38 @@ def test_ramp_to_59_no_trip_then_60_trips(mon, clock):
 def test_single_hot_joint_trips(mon, clock):
     t = temps(40)
     t[4] = 61
-    assert step(mon, clock, t) == TripCause.THERMAL
+    assert trip(mon, clock, t) == TripCause.THERMAL
+
+
+def test_one_tick_spikes_never_trip(mon, clock):
+    """The real bus, 2026-10-11: 26 -> 69 -> 26 C on one joint for one tick; also two spikes a tick apart."""
+    for spikes in ([69], [57, 69], [69, 26, 69]):
+        for v in spikes:
+            t = temps(26)
+            t[0] = v
+            assert step(mon, clock, t) == TripCause.NONE
+        step(mon, clock, 26)
+    assert mon.trips_last_hour() == 0 and not mon.latched
+
+
+def test_hot_reads_must_be_consecutive_on_the_same_joint(mon, clock):
+    for j in range(CONFIRM_READS):  # each read a different joint hot: no joint hot twice in a row
+        t = temps(26)
+        t[j] = 61
+        assert step(mon, clock, t) == TripCause.NONE
+    assert trip(mon, clock, 61) == TripCause.THERMAL
+
+
+def test_failed_reads_neither_count_nor_reset_the_hot_run(mon, clock):
+    step(mon, clock, 61)
+    step(mon, clock, 61, ok=False)  # the arrays hold the old values: not a read
+    step(mon, clock, 61)
+    assert not mon.latched
+    assert step(mon, clock, 61) == TripCause.THERMAL
 
 
 def test_no_resume_at_51_and_dwell_is_enforced(mon, clock):
-    step(mon, clock, 61)
+    trip(mon, clock, 61)
     assert not mon.may_resume()
     for _ in range(300):
         step(mon, clock, 51, dt_s=0.5)  # 150 s at 51 C
@@ -73,11 +109,12 @@ def test_no_resume_at_51_and_dwell_is_enforced(mon, clock):
 
 
 def test_dwell_restarts_when_temperature_rises_again(mon, clock):
-    step(mon, clock, 61)
+    trip(mon, clock, 61)
     step(mon, clock, 50)
     for _ in range(25):
         step(mon, clock, 50, dt_s=1.0)
-    step(mon, clock, 52, dt_s=1.0)  # bump above resume_c
+    step(mon, clock, 52, dt_s=1.0)  # a one-read spike above resume_c does not restart the dwell
+    trip(mon, clock, 52, dt_s=1.0)  # but CONFIRM_READS reads in a row do
     step(mon, clock, 50, dt_s=1.0)  # cooling restarts here (t0)
     for _ in range(29):
         step(mon, clock, 50, dt_s=1.0)
@@ -88,6 +125,7 @@ def test_dwell_restarts_when_temperature_rises_again(mon, clock):
 
 def test_oscillation_59_61_is_exactly_one_trip(mon, clock):
     results = []
+    trip(mon, clock, 61, dt_s=0.1)
     for i in range(40):
         results.append(step(mon, clock, 61 if i % 2 == 0 else 59, dt_s=0.1))
     assert mon.trips_last_hour() == 1
@@ -96,7 +134,7 @@ def test_oscillation_59_61_is_exactly_one_trip(mon, clock):
 
 def test_three_trips_in_an_hour_are_counted(mon, clock):
     for _ in range(3):
-        step(mon, clock, 61)
+        trip(mon, clock, 61)
         step(mon, clock, 40, dt_s=1.0)  # cool
         step(mon, clock, 40, dt_s=31.0)  # dwell satisfied -> unlatched
         assert not mon.latched
@@ -190,7 +228,7 @@ def test_any_status_bit_is_protection_trip(mon, clock, joint, bit):
 def test_protection_bit_and_thermal_combine(mon, clock):
     status = ZERO_STATUS.copy()
     status[1] = 4
-    assert step(mon, clock, 65, status=status) == TripCause.THERMAL | TripCause.PROTECTION_BIT
+    assert trip(mon, clock, 65, status=status) == TripCause.THERMAL | TripCause.PROTECTION_BIT
 
 
 def test_max_seen_tracks_per_joint(mon, clock):
