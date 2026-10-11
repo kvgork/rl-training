@@ -328,14 +328,14 @@ def _servo_cmd(*args: str) -> list[str]:
 class ServoProc:
     """``servo --backend <kind>`` child process on a private shm name (FakeMcu in-process, never a serial port)."""
 
-    def __init__(self, tmp_path: Path, backend: str = "fake") -> None:
+    def __init__(self, tmp_path: Path, backend: str = "fake", *extra: str) -> None:
         self.name = f"so101envtest_{uuid.uuid4().hex[:10]}"
         self.tick_log = tmp_path / "ticks.bin"
         self.summary = tmp_path / "summary.json"
         env = {k: v for k, v in os.environ.items() if k != "SO101_HW"}
         self.proc = subprocess.Popen(
             _servo_cmd("--backend", backend, "--shm-name", self.name, "--tick-log", str(self.tick_log),
-                       "--summary", str(self.summary)),
+                       "--summary", str(self.summary), *extra),
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
 
@@ -432,6 +432,34 @@ def test_shm_reset_ramps_without_a_per_tick_jump(cfg, calibration, servo_fake):
     step = np.abs(np.diff(run["target"].astype(np.int64), axis=0))
     assert step.max() <= cfg.action.max_ticks_per_tick.max()  # never a jump
     assert (step <= cfg.action.max_ticks_per_tick).all()
+
+
+@pytest.mark.parametrize("deadband,ok", [(17, True), (30, False)], ids=["real-arm-17", "beyond-tolerance-30"])
+def test_shm_reset_accepts_the_real_arm_steady_error_but_not_more(cfg, calibration, tmp_path, deadband, ok):
+    """The real arm (P = 16) settles up to 17 ticks short of the reset target and stays there (2026-10-11): the
+    reset converges once the arm is still within RESET_TRACK_TOL_TICKS, and fails beyond it."""
+    from so101_rl.env.backend import RESET_TRACK_TOL_TICKS
+
+    assert deadband < RESET_TRACK_TOL_TICKS if ok else deadband >= RESET_TRACK_TOL_TICKS
+    servo = ServoProc(tmp_path, "fake", "--fake-deadband-ticks", str(deadband))
+    try:
+        servo.wait_run(30.0)
+        b = _backend_for(cfg, calibration, servo)
+        q0 = np.asarray(cfg.safe_state.home_ticks, dtype=np.int64) + np.array([150, -100, 120, 80, 60, 0])
+        try:
+            if ok:
+                b.reset(q0)
+                st = new_state()
+                assert b.read_state(st)
+                err = np.abs(st["present_ticks"][0].astype(int) - st["target_ticks"][0].astype(int))
+                assert err.max() <= deadband + 1 and (err[:5] >= deadband - 1).all()  # really short of the goal
+            else:
+                with pytest.raises(ResetFailed, match="did not converge"):
+                    b.reset(q0)
+        finally:
+            b.close()
+    finally:
+        servo.stop()
 
 
 def test_shm_reset_after_a_trip_refuses_and_a_stalled_servo_is_stale(cfg, calibration, servo_fake):

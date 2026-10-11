@@ -91,6 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--fake-start", choices=("home", "rest"), default="home", help="fake backend: initial pose (rest: long boot ramp)"
     )
+    ap.add_argument(
+        "--fake-deadband-ticks", type=float, default=0.0, help="fake backend: the plant settles this far short of the goal"
+    )
     return ap
 
 
@@ -115,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         fake_mcu = FakeMcu(clock, timeout_ms=cfg.rates.heartbeat_timeout_ms)
 
     if args.backend == "fake":
-        from so101_rl.servo.fake_bus import FakeBus
+        from so101_rl.servo.fake_bus import FakeBus, FirstOrderPlant
 
         pose = cfg.safe_state.rest_ticks if args.fake_start == "rest" else cfg.safe_state.home_ticks
         start_pose = np.asarray(pose, dtype=np.int32)
@@ -126,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                 clock,
                 calibration=calibration,
                 initial_ticks=start_pose,
+                plant=FirstOrderPlant(deadband_ticks=args.fake_deadband_ticks),
                 record_writes=False,
                 power=power,
                 boot_ms=FAKE_SERVO_BOOT_MS if power is not None else 0.0,

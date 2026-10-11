@@ -55,15 +55,20 @@ class FirstOrderPlant:
     independent of the servo tick rate.
     """
 
-    def __init__(self, tau_s: float = 0.12, max_speed_ticks_per_s: float = 2500.0) -> None:
-        if tau_s <= 0 or max_speed_ticks_per_s <= 0:
-            raise ValueError("tau_s and max_speed_ticks_per_s must be positive")
+    def __init__(self, tau_s: float = 0.12, max_speed_ticks_per_s: float = 2500.0, deadband_ticks: float = 0.0) -> None:
+        if tau_s <= 0 or max_speed_ticks_per_s <= 0 or deadband_ticks < 0:
+            raise ValueError("tau_s and max_speed_ticks_per_s must be positive, deadband_ticks >= 0")
         self.tau_s = tau_s
         self.max_speed = max_speed_ticks_per_s
+        # the plant settles ``deadband_ticks`` short of the goal: the real arm's steady error at P = 16 (up to 17
+        # ticks, 2026-10-11)
+        self.deadband = deadband_ticks
 
     def step(self, present: np.ndarray, goal: np.ndarray, dt_s: float) -> np.ndarray:
         """New present positions (float ticks) after ``dt_s``; pure function."""
-        delta = (goal - present) * (1.0 - math.exp(-dt_s / self.tau_s))
+        err = goal - present
+        err = np.sign(err) * np.maximum(np.abs(err) - self.deadband, 0.0)
+        delta = err * (1.0 - math.exp(-dt_s / self.tau_s))
         limit = self.max_speed * dt_s
         return present + np.clip(delta, -limit, limit)
 

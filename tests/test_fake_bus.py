@@ -269,3 +269,14 @@ def test_record_writes_false_keeps_the_intercepts_empty(fake_clock):
     assert bus.write_goal(np.full(6, 2047, dtype=np.int32))
     assert bus.written_goals == [] and bus.written_goal_t_ns == [] and bus.torque_events == []
     assert bus.read_reg("Goal_Position", 1) == 2047  # the write itself still happened
+
+
+def test_plant_deadband_settles_short_of_the_goal():
+    from so101_rl.servo.fake_bus import FirstOrderPlant
+
+    plant = FirstOrderPlant(deadband_ticks=17.0)
+    x = np.full(6, 2000.0)
+    goal = np.array([2300.0, 1700.0, 2010.0, 2000.0, 2100.0, 1900.0])
+    for _ in range(300):
+        x = plant.step(x, goal, 1 / 30)
+    np.testing.assert_allclose(goal - x, np.sign(goal - x) * np.minimum(np.abs(goal - 2000.0), 17.0), atol=0.5)

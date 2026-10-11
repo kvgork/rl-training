@@ -59,8 +59,11 @@ __all__ = [
 
 _NS: Final[int] = 1_000_000_000
 RESET_TARGET_TOL_TICKS: Final[int] = 2  # |target - q0| at the end of a reset ramp
-RESET_TRACK_TOL_TICKS: Final[int] = 5  # |target - present| at the end of a reset ramp (plan: "< 5 ticks")
-RESET_SETTLED_STEPS: Final[int] = 2  # consecutive policy ticks inside both tolerances
+# |target - present| at the end of a reset ramp. Was 5; the real arm settles up to 17 ticks short at P = 16 (pan,
+# 2026-10-11, no gravity load: servo stiffness, not sag), plan section 10 2026-10-11. A blocked joint still fails.
+RESET_TRACK_TOL_TICKS: Final[int] = 25
+RESET_STILL_TICKS: Final[int] = 1  # max per-joint |present change| between policy ticks for "the arm has stopped"
+RESET_SETTLED_STEPS: Final[int] = 2  # consecutive policy ticks inside both tolerances and still
 RUNNABLE: Final[frozenset[int]] = frozenset({int(SmState.RUN), int(SmState.HOLD)})
 
 
@@ -270,6 +273,7 @@ class ShmBackend:
         max_steps = 2 * len(path) + 30  # 2x the path length plus settling (3 s)
         k = 0
         settled = 0
+        prev_present: np.ndarray | None = None
         for _ in range(max_steps):
             goal = st["goal_ticks"][0].astype(np.int64)
             if k < len(path) - 1 and np.all(np.abs(path[k] - goal) <= RESET_TARGET_TOL_TICKS):
@@ -285,7 +289,10 @@ class ShmBackend:
                 and int(st["sm_state"][0]) == int(SmState.RUN)
                 and np.all(np.abs(target - q0) <= RESET_TARGET_TOL_TICKS)
                 and np.all(np.abs(target - present) < RESET_TRACK_TOL_TICKS)
+                and prev_present is not None
+                and np.all(np.abs(present - prev_present) <= RESET_STILL_TICKS)
             )
+            prev_present = present
             settled = settled + 1 if ok else 0
             if settled >= RESET_SETTLED_STEPS:
                 return
