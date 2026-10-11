@@ -95,6 +95,7 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 
 | Date | H-id | Artifact path | Key values | Pass (Y/N) | Operator | Notes |
 |---|---|---|---|---|---|---|
+| 2026-10-11 | HS4 (no-watchdog variant) | `runs/deploy/20261011-092435-7438/` (+ servo tick logs `runs/deploy/ticks-092435.bin`, `ticks-095342.bin`) | 70/70 successes (0.5: 10/10, 0.75: 10/10, 1.0: 50/50), Wilson 95 % LB 0.929 at 1.0, 0 trips, final error p50 12.6 mm at 1.0 (sim eval 12.3 mm), `finetune_eligible` true, exit 0 | Y (no-watchdog: not valid for Tier 1) | Koen van Gorkom | M6 attempt-3 policy, seed 7, `servo.mcu` false, `no_watchdog_accepted` true. One resume (episode 43): the reset settled 27 ticks off on elbow_flex (tolerance then 25, now 40, ARCHITECTURE 0.41). Real reset steady error up to ±21 ticks pan, 27 elbow_flex (P = 16 deadband). |
 
 ---
 
