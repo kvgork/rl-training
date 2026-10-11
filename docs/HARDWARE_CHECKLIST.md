@@ -449,12 +449,15 @@ session. It does not go through the lab connector.
   Nothing cuts power if the PC or the servo process hangs (the servos then hold their last goal), so you watch the
   arm for the whole session and never leave it. H5 still applies (rest pose, foam under the reach space).
   1. Clear the reach space, foam down, hand on the power switch. Starting the servo energises the arm AT ONCE
-     (there is no reset button to wait for): it ramps from rest to home within a few seconds.
-  2. Terminal 1: `pixi run -e robot servo --backend feetech --no-mcu --tick-log runs/deploy/ticks-<ts>.bin --summary
-     runs/deploy/servo-<ts>.json`.
-  3. Terminal 2: `pixi run -e cpu deploy-policy --policy runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt
-     --protocol zero-shot --seed 7 --attended --accept-no-watchdog`. It prints `NO WATCHDOG`, then the ladder runs as
-     in step 3 above (no button press). Resume as in step 4 with `--attended --accept-no-watchdog`.
+     (there is no reset button to wait for): it ramps from rest to home within a few seconds, then is in RUN and
+     safe-stops (STALE_CMD) 0.5 s later unless `deploy-policy` is already attached. So start deploy-policy FIRST
+     (it waits up to 120 s for the servo), then the servo (found 2026-10-11: the other order ends in TORQUE_OFF).
+  2. Terminal 1: `pixi run -e cpu deploy-policy --policy runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt
+     --protocol zero-shot --seed 7 --attended --accept-no-watchdog`. It prints `looking for the servo`.
+  3. Terminal 2, within 120 s: `pixi run -e robot servo --backend feetech --no-mcu --tick-log
+     runs/deploy/ticks-<ts>.bin --summary runs/deploy/servo-<ts>.json`. Deploy prints `NO WATCHDOG`, then the ladder
+     runs as in step 3 above (no button press). To resume: deploy-policy with `--resume <run dir> --attended
+     --accept-no-watchdog` first, then the servo again.
   4. Cut power at once on any contact with the table, the camera mount or a cable, on shaking, or on any motion you
      did not expect; the arm then falls limp onto the foam. Afterwards restart from step 1 and `--resume`.
   5. `summary.json` records `servo.mcu: false` and `servo.no_watchdog_accepted: true`; a pass in this variant is

@@ -3,8 +3,11 @@
 Semantics
 ---------
 * ``update`` is called once per servo tick with the latest block read.
-* **Trip:** any joint ``>= trip_c``, any reading of 0 or 255 (sensor dead / bus garbage), or no successful block
-  read for more than ``stale_temp_s`` -> ``TripCause.THERMAL``.
+* **Trip:** any joint ``>= trip_c`` on ``CONFIRM_READS`` consecutive good reads, any reading of 0 or 255 (sensor
+  dead / bus garbage, at once), or no successful block read for more than ``stale_temp_s`` -> ``TripCause.THERMAL``.
+  Why consecutive: the real bus returns one-tick spikes (26 -> 69 -> 26 C on one joint, 19 in 4400 ticks on
+  2026-10-11); real motor heat cannot rise that fast, and the firmware's own over-temperature cut stays the backstop.
+  The same rule decides whether a joint is too warm for the cooling dwell (``> resume_c``).
 * **Latch:** a trip latches. While latched, every ``update`` keeps returning ``THERMAL`` (even if the joint
   oscillates 59 <-> 61), and the trip is counted exactly ONCE. The latch clears only when ``may_resume()`` becomes
   true, i.e. every joint has been ``<= resume_c`` continuously for ``resume_dwell_s`` (hysteresis + dwell, so a
@@ -35,6 +38,22 @@ _NS = 1_000_000_000
 _SENSOR_UNREAD = 0  # short / never read
 _SENSOR_GARBAGE = 255  # all-ones bus garbage
 _RING = 256
+CONFIRM_READS = 3  # 100 ms at 30 Hz (plan section 10, 2026-10-11)
+
+
+class ConsecutiveAbove:
+    """Per joint: true once a joint has read above a threshold on ``n`` consecutive reads fed to ``update``."""
+
+    def __init__(self, threshold: float, *, strict: bool = False, n: int = CONFIRM_READS) -> None:
+        self._threshold = threshold
+        self._strict = strict  # ``>`` instead of ``>=``
+        self._n = n
+        self._count = np.zeros(N_JOINTS, dtype=np.int64)
+
+    def update(self, temp_c: np.ndarray) -> bool:
+        above = temp_c > self._threshold if self._strict else temp_c >= self._threshold
+        self._count = np.where(above, self._count + 1, 0)
+        return bool((self._count >= self._n).any())
 
 
 class ThermalMonitor:
@@ -47,6 +66,8 @@ class ThermalMonitor:
         self._last_good_ns: int | None = None  # no successful read yet: the stale timer has not started
         self._last_update_ns: int | None = None
         self._cool_since_ns: int | None = None
+        self._hot = ConsecutiveAbove(cfg.trip_c)
+        self._warm = ConsecutiveAbove(cfg.resume_c, strict=True)
         self._trip_times = np.zeros(_RING, dtype=np.int64)
         self._n_trips = 0
         self.hottest_c: float = 0.0
@@ -71,8 +92,10 @@ class ThermalMonitor:
             if int(status.max()) != 0:
                 cause |= TripCause.PROTECTION_BIT
             dead = bool((temp_c == _SENSOR_UNREAD).any() or (temp_c == _SENSOR_GARBAGE).any())
-            fault = dead or tmax >= self._cfg.trip_c
-            if not dead and tmax <= self._cfg.resume_c:
+            hot = self._hot.update(temp_c)
+            warm = self._warm.update(temp_c)
+            fault = dead or hot
+            if not dead and not warm:
                 if self._cool_since_ns is None:
                     self._cool_since_ns = now
             else:
