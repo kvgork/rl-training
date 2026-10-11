@@ -91,7 +91,7 @@ __all__ = [
 
 SIM_PARAMS_VERSION: Final[int] = 2  # 2 (2026-10-06): + servo_group, dr, meta.unidentified
 MAX_DELAY_TICKS: Final[int] = 6  # the sysid delay grid is 0..MAX_DELAY_TICKS (FS7)
-MAX_DEADBAND_TICKS: Final[int] = 64  # sanity bound only; D-BACKLASH ranges are 0..6
+MAX_DEADBAND_TICKS: Final[int] = 64  # sanity bound only (measured 9..32 ticks on the arm, plan §10 2026-10-11)
 
 PER_JOINT_FIELDS: Final[tuple[str, ...]] = ("kp", "kv", "damping", "frictionloss", "armature", "forcerange")
 SCALAR_FIELDS: Final[tuple[str, ...]] = ("die_mass_kg", "die_friction", "table_friction")
