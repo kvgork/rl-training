@@ -128,6 +128,7 @@ sim-parity = "pytest tests/test_batched_parity.py"   # no -m filter: the CPU lay
 tray-check = "python -m so101_rl.sim.tray_check"
 sysid-excite = "python -m so101_rl.sim.sysid.run_excitation"
 sysid-fit = "python -m so101_rl.sim.sysid.fit"
+sysid-from-logs = "python -m so101_rl.sim.sysid.from_deploy"
 viz-demo = { cmd = "python -m so101_rl.viz.demo", env = { MUJOCO_GL = "egl" } }   # headless rendering
 viz-attach = "python -m so101_rl.viz.live_viewer attach"
 dashboard = "python -m so101_rl.viz.dashboard"   # --logdir runs/ (default), localhost:6006
