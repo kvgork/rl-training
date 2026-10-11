@@ -407,6 +407,8 @@ without them and without `--attended`. H6 (register proof) is recommended.
   calib/sim_params.yaml`. The default fit is the servo ratio group (one scale per joint on kp, kv, armature) plus
   the integer delay; frictionloss stays at the prior and is listed unidentified (plan §10 2026-10-06). Inspect the
   printed group scales, `delay_ticks`, the spread (`fit_report.json`) and the held-out table.
+  **Deadband prior (plan §10 2026-10-11):** fit from a copy of `calib/sim_params.yaml` with `deadband_ticks: [32, 14,
+  16, 12, 9, 9]` passed as `--prior` (the deadband measured from the HS4 deploy logs; it is held fixed, not fitted).
 - **Artifact:** `calib/sim_params.yaml` release 1 (committed; `meta.heldout_rms_pct` <= 1 % on every joint,
   `servo_group`, `dr` ranges) and `runs/hw/sysid-<ts>.json` (H12's artifact, now from the fitted model:
   `pixi run compare-real --tick-log runs/sysid/<ts>/tick_log.bin --sim-params calib/sim_params.yaml`).
