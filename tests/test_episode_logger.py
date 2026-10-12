@@ -148,3 +148,30 @@ def test_misuse_rejected(tmp_path):
         EpisodeLogger(tmp_path, "r", keep_full_frames="sometimes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="run_id"):
         EpisodeLogger(tmp_path, "../x")
+
+
+def test_observation_width_is_fixed_per_file_by_its_first_step(tmp_path):
+    """15 values (excitation) or 21 (the reach policy obs): each file takes its first step's width, then keeps it."""
+    from so101_rl.logging.checks import check_episode
+
+    lg = EpisodeLogger(tmp_path, "r", keep_full_frames="never")
+    lg.start_episode({})
+    for i in range(N):
+        rec = make_rec(i, small=False)
+        rec.obs["observation"] = np.full(21, i, np.float32)
+        lg.log_step(rec)
+    wide = rec
+    path = lg.end_episode("truncated")
+    with h5py.File(path, "r") as f:
+        assert f["obs/observation"].shape == (N, 21)
+    assert check_episode(path).ok
+    lg.start_episode({})
+    lg.log_step(make_rec(0, small=False))  # a new file: 15 wide
+    with pytest.raises(ValueError, match="obs.observation"):
+        lg.log_step(wide)
+    with pytest.raises(ValueError, match="1-D"):
+        lg2 = EpisodeLogger(tmp_path, "r2")
+        lg2.start_episode({})
+        bad = make_rec(0)
+        bad.obs["observation"] = np.zeros((3, 5), np.float32)
+        lg2.log_step(bad)

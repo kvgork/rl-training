@@ -10,7 +10,7 @@ from so101_rl.config.schema import N_JOINTS, TICKS_PER_REV
 
 ObsDict = dict[str, np.ndarray]  # keys exactly: "observation", "achieved_goal", "desired_goal"
 
-OBS_DIM: Final[int] = 6 + 6 + 3
+ANY_WIDTH: Final[int] = -1  # a per-step shape entry fixed per file by its first step (obs/observation: 15 excitation, 21 reach)
 GOAL_DIM: Final[int] = 3
 FRAME_SMALL_SHAPE: Final[tuple[int, int, int]] = (96, 96, 3)
 FRAME_FULL_SHAPE: Final[tuple[int, int, int]] = (480, 640, 3)
@@ -23,7 +23,7 @@ MAX_TICK: Final[int] = TICKS_PER_REV - 1
 # name -> (dtype, per-step shape). Every one of these has N rows along axis 0.
 REQUIRED_DATASETS: Final[dict[str, tuple[str, tuple[int, ...]]]] = {
     "t_mono_ns": ("<i8", ()),
-    "obs/observation": ("<f4", (OBS_DIM,)),
+    "obs/observation": ("<f4", (ANY_WIDTH,)),
     "obs/achieved_goal": ("<f4", (GOAL_DIM,)),
     "obs/desired_goal": ("<f4", (GOAL_DIM,)),
     "action_cmd": ("<f4", (N_JOINTS,)),

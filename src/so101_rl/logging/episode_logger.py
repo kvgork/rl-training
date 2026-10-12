@@ -19,10 +19,10 @@ import h5py
 import numpy as np
 
 from so101_rl.logging.schema import (
+    ANY_WIDTH,
     FINAL_SUFFIX,
     FRAME_FULL_SHAPE,
     FRAME_SMALL_SHAPE,
-    OBS_DIM,
     OUTCOMES,
     REQUIRED_DATASETS,
     TMP_SUFFIX,
@@ -98,6 +98,10 @@ def _shaped(name: str, value: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
     return arr
 
 
+def _create(f: h5py.File, name: str, dtype: str, shape: tuple[int, ...]) -> None:
+    f.create_dataset(name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype, chunks=(64, *shape))
+
+
 class EpisodeLogger:
     def __init__(
         self,
@@ -147,9 +151,8 @@ class EpisodeLogger:
         self._tmp = self.episodes_dir / (episode_name(self._episode) + TMP_SUFFIX)
         f = h5py.File(self._tmp, "w")
         for name, (dtype, shape) in REQUIRED_DATASETS.items():
-            f.create_dataset(
-                name, shape=(0, *shape), maxshape=(None, *shape), dtype=dtype, chunks=(64, *shape)
-            )
+            if ANY_WIDTH not in shape:  # the others are created at the first step, with its width
+                _create(f, name, dtype, shape)
         f.attrs["run_id"] = self.run_id
         f.attrs["episode"] = self._episode
         f.attrs["config_dump"] = json.dumps(_jsonable(self.config_dump), sort_keys=True)
@@ -161,6 +164,15 @@ class EpisodeLogger:
         self._has_small = False
         self._full = []
         return self._episode
+
+    def _width(self, f: h5py.File, name: str, value: Any) -> tuple[int, ...]:
+        """The per-step shape of an ``ANY_WIDTH`` dataset: the first step's (it creates the dataset), then fixed."""
+        if name not in f:
+            arr = np.asarray(value)
+            if arr.ndim != 1 or arr.shape[0] < 1:
+                raise ValueError(f"{name}: expected a non-empty 1-D array, got shape {arr.shape}")
+            _create(f, name, REQUIRED_DATASETS[name][0], arr.shape)
+        return f[name].shape[1:]
 
     def _append(self, name: str, value: Any) -> None:
         assert self._h5 is not None
@@ -174,9 +186,10 @@ class EpisodeLogger:
             raise RuntimeError("log_step: no episode started")
         if set(rec.obs) != {"observation", "achieved_goal", "desired_goal"}:
             raise ValueError(f"obs: unexpected keys {sorted(rec.obs)}")
+        obs_shape = self._width(f, "obs/observation", rec.obs["observation"])
         row: dict[str, Any] = {
             "t_mono_ns": int(rec.t_mono_ns),
-            "obs/observation": _shaped("obs.observation", rec.obs["observation"], (OBS_DIM,)),
+            "obs/observation": _shaped("obs.observation", rec.obs["observation"], obs_shape),
             "obs/achieved_goal": _shaped("obs.achieved_goal", rec.obs["achieved_goal"], (3,)),
             "obs/desired_goal": _shaped("obs.desired_goal", rec.obs["desired_goal"], (3,)),
             "action_cmd": _shaped("action_cmd", rec.action_cmd, (6,)),
