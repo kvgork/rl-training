@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.45 (2026-10-12). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.46 (2026-10-12). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -506,7 +506,7 @@ These are ordered from the outermost layer to the innermost.
    5. goal = present (this is the first heartbeat tick). On the STS3215 this write already switches torque ON, at the present pose
    6. read back Goal_Position
    7. `set_torque(True)`
-   8. ramp home through the transit zone, re-checking temperatures on every read
+   8. ramp home through the transit zone, re-checking temperatures on every read The ramp is done when its target is home and the arm is still (≤ 1 tick between reads) within 40 ticks of home (0.46; was `SETTLE_TICKS` 25, which the STS3215's up-to-27-tick deadband never reached from some start poses).
 
    Any failure from step 5 on turns torque off (3 attempts), then re-raises (0.38: before, only failures after step 7 did, which left the real arm energised after a step-5/6 failure). The exception is a stop during step 8: the servo core hands over to the safe-state sequence (layer 4) instead, so the arm is ramped to rest rather than dropped. A stop before step 7 never energises.
 6. **Autonomy tiers.**
@@ -634,3 +634,4 @@ Bump the version line at the top and add an entry below.
 | 0.43 | 2026-10-12 | **Real-arm transition logging** (`rl/deploy_policy.py`, `logging/transitions.py`, `env/goal_env.py`, `logging/schema.py`). `deploy-policy` writes each finished episode as an F8 episode file for fine-tuning (§3 Deployment "Transitions"); `load_transitions` gives training arrays. `So101GoalEnv` `info` gains `present_ticks`. **F8 change:** `obs/observation` no longer has a fixed width of 15: each file takes its first step's width (`schema.ANY_WIDTH`; 15 for excitation, 21 for the reach policy observation) and the artifact check accepts any width. §2 module tree. |
 | 0.44 | 2026-10-12 | **S5.2 SAC + HER fine-tuning, sim backend** (`rl/sb3_bridge.py`, `rl/train_sac_her.py`, pixi task `train-reach-sac`; plan §10 2026-10-12). §3 "Fine-tuning", §2 module tree, §11 tasks. The real-arm backend is not built. |
 | 0.45 | 2026-10-12 | **Real-arm fine-tuning backend** (`rl/train_sac_her.py --backend shm`, `--resume`; plan §10 2026-10-12 "Real-arm fine-tuning without the watchdog MCU"). §3 the `train-reach-sac --backend shm` process row and "Fine-tuning". `deploy_policy.resolve_servo` (the servo classification, attach refusals and config / calibration resolution) is now shared by `deploy-policy` and `train-reach-sac`. |
+| 0.46 | 2026-10-12 | **Re-energise ramp-home tolerance** (`safety/reenergize.py`, plan §10 2026-10-12). The ramp home ends when its target is home and the arm is still within `HOME_REACHED_TICKS` = 40 of it (was `SETTLE_TICKS` 25): on 2026-10-12 three servo starts in a row timed out with elbow_flex settled 27 ticks short of home. §6 re-energise step 8. |

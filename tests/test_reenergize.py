@@ -201,6 +201,30 @@ def test_ends_at_home(cfg, calibration, clock, follow):
     assert np.abs(bus.position - home).max() <= 25
 
 
+@pytest.mark.parametrize(("short", "finishes"), [(27, True), (45, False)])
+def test_ramp_finishes_when_the_arm_settles_short_of_home_within_the_deadband(cfg, calibration, clock, short, finishes):
+    """The real STS3215 stops up to 27 ticks short of a goal (2026-10-12: elbow_flex 27, pan 19 off home on every
+    start). The ramp ends once its target is home and the arm is still within 40 ticks; 45 short still times out."""
+    bus = LoggingBus(calibration, clock)
+    orig = bus.write_goal
+    off = np.array([19, -7, short, 7, 3, -4], np.int32)
+
+    def short_of_goal(goal):
+        ok = orig(goal)
+        if bus.torque:
+            bus.position = np.clip(goal.astype(np.int32) + off, 0, 4095).astype(np.int32)
+        return ok
+
+    bus.write_goal = short_of_goal
+    if finishes:
+        reenergize(bus, cfg, calibration, clock, BlockRead(), timeout_s=1.0)
+        assert bus.torque
+    else:
+        with pytest.raises(TimeoutError, match="ramp home"):
+            reenergize(bus, cfg, calibration, clock, BlockRead(), timeout_s=1.0)
+        assert not bus.torque
+
+
 def test_ramp_home_respects_per_tick_step(cfg, calibration, clock):
     bus = LoggingBus(calibration, clock, present=IN_BOX, follow=0.5)
     goals = []
