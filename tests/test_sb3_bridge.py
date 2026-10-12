@@ -155,24 +155,26 @@ def test_entry_point_refusals(tmp_path, capsys):
 
     p = _export(tmp_path / "p.pt")
     assert t.main(["--init-from", str(p), "--total-steps", "0", "--out-root", str(tmp_path)]) == t.EXIT_REFUSED
-    assert t.main(["--init-from", str(p), "--total-steps", "10", "--backend", "shm",
-                   "--out-root", str(tmp_path)]) == t.EXIT_REFUSED  # fmt: skip
+    assert t.main(["--init-from", str(p), "--total-steps", "10", "--backend", "shm", "--wait-servo-s", "0",
+                   "--shm-name", "so101_no_such_servo", "--out-root", str(tmp_path)]) == t.EXIT_REFUSED  # fmt: skip
     assert t.main(["--init-from", str(tmp_path / "nope.pt"), "--total-steps", "10",
                    "--out-root", str(tmp_path)]) == t.EXIT_REFUSED  # fmt: skip
-    assert "not built yet" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--total-steps must be >= 1" in err and "so101_no_such_servo" in err
     assert not any(tmp_path.glob("2*"))  # no run dir for a refusal
 
 
 @pytest.mark.slow
 @pytest.mark.timeout(600)
 def test_finetune_on_the_sim_rig_writes_every_artifact(tmp_path):
-    """300 steps from the M6 export on the CPU reference rig: baseline, 2 evals, every artifact, a deployable export."""
+    """300 steps from the M6 export on the CPU reference rig (actor frozen throughout: the critics warm up): baseline,
+    2 evals, every artifact, a deployable export."""
     from so101_rl.rl import train_sac_her as t
 
     if not M6_POLICY.is_file():
         pytest.skip(f"the M6 policy export is not on this host ({M6_POLICY})")
     code = t.main(["--init-from", str(M6_POLICY), "--total-steps", "300", "--learning-starts", "100",
-                   "--warmup-frozen-actor", "50", "--baseline-eval-every", "150", "--eval-episodes", "2",
+                   "--warmup-frozen-actor", "1000", "--baseline-eval-every", "150", "--eval-episodes", "2",
                    "--out-root", str(tmp_path)])  # fmt: skip
     assert code == t.EXIT_OK
     (run,) = tmp_path.iterdir()
