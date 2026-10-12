@@ -470,3 +470,39 @@ session. It does not go through the lab connector.
 - **Pass:** exit 0, and `summary.json` `verdict.finetune_eligible` true (Wilson 95 % lower bound >= 0.60 with n >= 50
   on the full-speed rung). Fill the results table.
 - **Shown-to-fail:** step 2 without `--attended` against the feetech servo must refuse (exit 2) with no motion.
+
+## HS5 - Real-arm fine-tuning of reach (SAC + HER)
+
+Added 2026-10-12 (plan §10 2026-10-12 "Real fine-tuning software started" and "Real-arm fine-tuning without the
+watchdog MCU"; ARCHITECTURE 0.45). Attended Tier 0: you watch the arm for the whole session, hand on the servo power
+switch. **No watchdog MCU is required**: the servo's own safety layer ends the session on overheating (60 °C on 3
+reads in a row), a firmware overload / overcurrent bit, a blocked joint (tracking error), STUCK or a box violation.
+
+- **Parts:** as HS4 (arm on its clamp, foam under the reach space, the reach space clear, hand on the power switch).
+- **Needs:** HS4 passed (`finetune_eligible`). Dry run first against the sim servo: terminal 1
+  `pixi run train-reach-sac --init-from runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt --backend shm
+  --total-steps 300 --learning-starts 100 --baseline-eval-every 200 --eval-episodes 2`, terminal 2
+  `pixi run -e cpu servo --backend mujoco` (exit 0).
+- **Procedure:**
+  1. Start the trainer FIRST (as in HS4's no-watchdog variant, the servo is in RUN seconds after it starts and
+     safe-stops 0.5 s later without a client): `pixi run train-reach-sac --init-from
+     runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt --backend shm --total-steps 60000 --attended`. It
+     prints `looking for the servo` and waits up to 120 s.
+  2. Terminal 2, within 120 s: `pixi run -e robot servo --backend feetech --no-mcu --tick-log
+     runs/sac-her/ticks-<ts>.bin --summary runs/sac-her/servo-<ts>.json` (or with `--heartbeat-port` once H3 exists).
+     The trainer prints `NO WATCHDOG` (no-MCU servo), runs the baseline eval (10 fixed goals, ~2 min), then trains:
+     100-step episodes with the updates in between (the arm holds still at the start pose for ~1 s while they run).
+  3. A session ends by itself after 20 min (`session_cap`, the thermal duty cycle), or on any trip / stall / failed
+     reset. Everything is saved; the servo safe-stops the arm to rest. Wait 10 min (cool-down) after a
+     `session_cap`; after a trip, look at the cause first (servo summary `fault_bits`, the trainer's `halt`).
+  4. Resume: the trainer first, `pixi run train-reach-sac --resume runs/sac-her/<ts> --attended`, then the servo
+     again (step 2, new tick-log name). Repeat until `--total-steps` (exit 0).
+  5. Cut power at once on any contact with the table, the camera mount or a cable, on shaking, or on any motion you
+     did not expect; then resume from step 4.
+  6. Every eval is in `evals.jsonl`; a rollback (two evals below baseline − 0.15) restores the best policy. Review
+     trigger (plan §5): success below 10 % after 40k steps, or no drop in the mean final distance over 3 evals.
+- **Artifact:** `runs/sac-her/<ts>/{model.zip, replay_buffer.pkl, baseline.json, evals.jsonl, best_policy.pt,
+  policy_export.pt, sessions.jsonl, summary.json}` and the servo tick logs.
+- **Pass:** `--total-steps` reached (exit 0); then the fine-tuned `policy_export.pt` evaluated with `deploy-policy`
+  (HS4 procedure, the same seed) against the HS4 result. Fill the results table.
+- **Shown-to-fail:** step 1 without `--attended` against the feetech servo must refuse (exit 2) with no motion.

@@ -234,6 +234,59 @@ def _yaml_key(path: Path, key: str) -> Any:
 # ------------------------------------------------------------------------------------------------ policy
 
 
+@dataclasses.dataclass(frozen=True)
+class ResolvedServo:
+    servo: ServoInfo
+    config_path: Path
+    calibration_path: Path
+    calibration: Any
+    calibration_sha256: str
+    cfg: Any  # So101Config with the servo's calibration and shm name
+
+
+def resolve_servo(shm_name: str, *, wait_s: float, attended: bool, accept_no_watchdog: bool,
+                  config: Path | None = None, calibration: Path | None = None, log: Any = None) -> ResolvedServo:  # fmt: skip
+    """Find and classify the servo that owns ``shm_name`` (read-only, nothing sent), apply the attach refusals and
+    resolve its config and calibration. Raises :class:`Refused`. Shared by ``deploy-policy`` and ``train-reach-sac``.
+
+    Refused: a command line that does not parse cleanly; the real arm without ``attended``; a real servo with
+    ``--no-mcu`` without ``accept_no_watchdog``; a ``config`` / ``calibration`` that differs from the servo's."""
+    from so101_rl.config import load_calibration, load_config
+
+    log = log or _log
+    log(f"looking for the servo on shm {shm_name!r} (up to {wait_s:.0f} s)")
+    servo = servo_info(shm_name, wait_s=wait_s)
+    if servo.problem is not None:
+        raise Refused(f"the servo on shm {shm_name!r} (pid {servo.pid}) has a command line that does not parse "
+                      f"cleanly ({servo.problem}): treated as the REAL arm and refused even with --attended")  # fmt: skip
+    if servo.is_real and not attended:
+        raise Refused(
+            f"the servo on shm {shm_name!r} (pid {servo.pid}, --backend {servo.backend}) drives the REAL arm: "
+            "Tier 0 needs a human at the e-stop; pass --attended"
+        )
+    if servo.is_real and servo.no_mcu and not accept_no_watchdog:
+        raise Refused(f"the REAL-arm servo (pid {servo.pid}) runs with --no-mcu (no watchdog MCU): restart it "
+                      "with the MCU (--heartbeat-port), or pass --accept-no-watchdog with your hand on the "
+                      "servo power switch (plan §10 2026-10-10)")  # fmt: skip
+    if servo.is_real and servo.no_mcu:
+        log("NO WATCHDOG: nothing cuts power if this PC or the servo process hangs; keep your hand on the "
+            "servo power switch for the whole run")  # fmt: skip
+    from so101_rl.config.loader import DEFAULT_CONFIG_PATH
+
+    config_path = Path(servo.config or DEFAULT_CONFIG_PATH)
+    if config is not None and config.expanduser().resolve() != config_path.resolve():
+        raise Refused(f"--config {config} differs from the servo's {config_path}")
+    servo_cal = servo.calibration or (
+        servo.cwd / Path(str(_yaml_key(config_path, "calibration_path"))).expanduser()
+    ).resolve()
+    if calibration is not None and calibration.expanduser().resolve() != servo_cal:
+        raise Refused(f"--calibration {calibration} differs from the servo's {servo_cal}")
+    cal = load_calibration(servo_cal)
+    sha = hashlib.sha256(servo_cal.read_bytes()).hexdigest()
+    cfg = dataclasses.replace(load_config(config_path, calibration=cal), shm_name=shm_name)
+    return ResolvedServo(servo, config_path, servo_cal, cal, sha, cfg)
+
+
 def check_policy(policy: Any, task: Any) -> None:
     """Refuse a policy for another task or input layout (``load_policy`` already checked the layout version)."""
     from so101_rl.env.obs import GOAL_DIM, OBS_LAYOUT_VERSION
@@ -678,7 +731,6 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
 
     torch.set_num_threads(1)
     try:
-        from so101_rl.config import load_calibration, load_config
         from so101_rl.config.loader import DEFAULT_CONFIG_PATH
         from so101_rl.env.goals import BoxGoalSampler
         from so101_rl.env.tasks import REACH
@@ -694,36 +746,14 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
             raise Refused(f"cannot use policy {args.policy}: {exc}") from None
         check_policy(policy, REACH)
         shm_name = args.shm_name or str(_yaml_key(args.config or DEFAULT_CONFIG_PATH, "shm_name"))
-        _log(f"looking for the servo on shm {shm_name!r} (up to {args.wait_servo_s:.0f} s)")
-        servo = servo_info(shm_name, wait_s=args.wait_servo_s)
-        if servo.problem is not None:
-            raise Refused(f"the servo on shm {shm_name!r} (pid {servo.pid}) has a command line that does not parse "
-                          f"cleanly ({servo.problem}): treated as the REAL arm and refused even with --attended")  # fmt: skip
-        if servo.is_real and not args.attended:
-            raise Refused(
-                f"the servo on shm {shm_name!r} (pid {servo.pid}, --backend {servo.backend}) drives the REAL arm: "
-                "Tier 0 needs a human at the e-stop; pass --attended"
-            )
-        if servo.is_real and servo.no_mcu and not args.accept_no_watchdog:
-            raise Refused(f"the REAL-arm servo (pid {servo.pid}) runs with --no-mcu (no watchdog MCU): restart it "
-                          "with the MCU (--heartbeat-port), or pass --accept-no-watchdog with your hand on the "
-                          "servo power switch (plan §10 2026-10-10)")  # fmt: skip
-        if servo.is_real and servo.no_mcu:
-            _log("NO WATCHDOG: nothing cuts power if this PC or the servo process hangs; keep your hand on the "
-                 "servo power switch for the whole run")  # fmt: skip
+        rs = resolve_servo(shm_name, wait_s=args.wait_servo_s, attended=args.attended,
+                           accept_no_watchdog=args.accept_no_watchdog, config=args.config,
+                           calibration=args.calibration)  # fmt: skip
+        servo, config_path, servo_cal, calibration, cal_sha = (rs.servo, rs.config_path, rs.calibration_path,
+                                                               rs.calibration, rs.calibration_sha256)  # fmt: skip
         if orig is not None and bool(orig["servo"].get("real")) != servo.is_real:
             raise Refused(f"--resume: the run was on a {'REAL' if orig['servo'].get('real') else 'sim'} servo, this "
                           f"one is {'REAL' if servo.is_real else 'sim'}")  # fmt: skip
-        config_path = servo.config or DEFAULT_CONFIG_PATH
-        if args.config is not None and args.config.expanduser().resolve() != Path(config_path).resolve():
-            raise Refused(f"--config {args.config} differs from the servo's {config_path}")
-        servo_cal = servo.calibration or (
-            servo.cwd / Path(str(_yaml_key(config_path, "calibration_path"))).expanduser()
-        ).resolve()
-        if args.calibration is not None and args.calibration.expanduser().resolve() != servo_cal:
-            raise Refused(f"--calibration {args.calibration} differs from the servo's {servo_cal}")
-        calibration = load_calibration(servo_cal)
-        cal_sha = hashlib.sha256(servo_cal.read_bytes()).hexdigest()
         if orig is not None and orig.get("calibration_sha256") not in (None, cal_sha):
             raise Refused(f"--resume: the calibration {servo_cal} changed since the run started (sha256 differs); "
                           "start a new run")  # fmt: skip
@@ -733,7 +763,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         elif cal_changed is None:
             _log("note: the policy records no calibration sha256 (trained before it was recorded); "
                  "make sure it was re-evaluated under the current calibration")  # fmt: skip
-        cfg = dataclasses.replace(load_config(config_path, calibration=calibration), shm_name=shm_name)
+        cfg = rs.cfg
         fk = So101FK(KinematicChain.from_yaml(cfg.kinematics_path), calibration)
         schedule = [s for s, n in plan for _ in range(n)]
     except Refused as exc:
