@@ -15,6 +15,7 @@ import h5py
 import numpy as np
 
 from so101_rl.logging.schema import (
+    ANY_WIDTH,
     FINAL_SUFFIX,
     FLOAT_DATASETS,
     MAX_TICK,
@@ -90,7 +91,8 @@ def check_episode(path: Path, cfg: So101Config | None = None) -> ArtifactReport:
                 continue
             if ds.dtype != np.dtype(dtype):
                 errors.append(f"{name}: dtype {ds.dtype}, expected {np.dtype(dtype)}")
-            if ds.shape[1:] != shape:
+            per_step = ds.shape[1:]
+            if len(per_step) != len(shape) or any(w not in (ANY_WIDTH, d) for w, d in zip(shape, per_step)):
                 errors.append(f"{name}: per-step shape {ds.shape[1:]}, expected {shape}")
             lengths[name] = ds.shape[0]
             if name in REQUIRED_DATASETS:

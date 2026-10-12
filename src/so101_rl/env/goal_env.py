@@ -27,7 +27,8 @@ One class for both tasks, both backends, and one definition of everything that s
   ``info["read_ok"]``) but such a step never terminates an episode as a success. The reach task reports
   ``info["tracker_visible"] = read_ok`` (the achieved goal was measured this step).
 
-``info`` keys every step: ``applied_delta_ticks`` f32[6], ``target_ticks`` i32[6], ``clamped_mask`` bool[6],
+``info`` keys every step: ``applied_delta_ticks`` f32[6], ``target_ticks`` i32[6], ``present_ticks`` i32[6],
+``clamped_mask`` bool[6],
 ``trips`` (int, the state record's ``fault_bits``), ``is_success``, ``tripped``, ``state_seq``, ``cmd_seq``,
 ``tracker_visible``, ``read_ok``, ``sm_state``, ``tick``, ``action_clamped`` (any joint clamped this step) and
 ``applied_action`` (``applied_delta_ticks / max_delta_ticks``, the logged L4 action) -- the last two feed the
@@ -189,6 +190,7 @@ class So101GoalEnv(gymnasium.Env):
         info: dict[str, Any] = {
             "applied_delta_ticks": applied.copy(),
             "target_ticks": rec["target_ticks"].astype(np.int32),
+            "present_ticks": rec["present_ticks"].astype(np.int32),
             "clamped_mask": clamped,
             "trips": fault,
             "state_seq": int(rec["seq"]),

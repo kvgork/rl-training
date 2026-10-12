@@ -13,11 +13,14 @@ import time
 import uuid
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import torch
 
 from so101_rl.env.backend import ShmBackend
+from so101_rl.logging.checks import check_episode
+from so101_rl.logging.transitions import load_transitions
 from so101_rl.rl import deploy_policy as dp
 from so101_rl.rl.eval_sim import wilson_interval
 from so101_rl.rl.fast_sac import Actor
@@ -655,6 +658,21 @@ def test_zero_shot_ladder_order_and_speed_scaling(tmp_path, command_log, const_p
     mags = [np.abs(command_log.run_deltas[5 * k]).sum() for k in range(3)]
     assert mags[0] / mags[2] == pytest.approx(0.5, abs=0.03) and mags[1] / mags[2] == pytest.approx(0.75, abs=0.03)
     assert command_log[-1] == "HOLD"
+    # every episode is also an F8 transitions file: what was sent, what was applied, next obs = the following row's
+    run = _run
+    files = [run / e["transitions"] for e in eps]
+    assert [f.name for f in files] == ["ep_000000.h5", "ep_000001.h5", "ep_000002.h5"]
+    for f in files:
+        assert check_episode(f, load_config(None, calibration=load_calibration(CALIB))).ok
+    tr = load_transitions(files)
+    assert len(tr["reward"]) == 15 and tr["observation"].shape == (15, 21) and tr["next_observation"].shape == (15, 21)
+    for k, speed in enumerate((0.5, 0.75, 1.0)):
+        rows = slice(5 * k, 5 * k + 5)
+        np.testing.assert_allclose(tr["action_cmd"][rows], np.float32(0.4) * np.float32(speed))
+        np.testing.assert_array_equal(tr["next_observation"][5 * k : 5 * k + 4], tr["observation"][5 * k + 1 : 5 * k + 5])
+        assert tr["truncated"][5 * k + 4] and not tr["truncated"][rows][:4].any() and not tr["terminated"][rows].any()
+    np.testing.assert_allclose(tr["action"], np.clip(tr["action"], -1, 1))
+    assert (np.abs(tr["action"]) > 0).any() and (tr["reward"] <= 0).all()
 
 
 @pytest.mark.slow
@@ -700,6 +718,10 @@ def test_trip_or_stall_stops_the_ladder(tmp_path, command_log, const_policy, mon
     segs = _episode_segments(command_log)
     assert len(segs) == 2 and segs[1][:2] == ["RUN", "RUN"] and "RUN" not in segs[1][2:]
     assert sum(seg.count("RUN") for seg in segs) == 7 and command_log[-1] == "HOLD"
+    run = _run_dir(tmp_path / "deploy")[0]
+    with h5py.File(run / eps[1]["transitions"], "r") as f:  # the halting episode is kept, cut at its last step
+        assert f.attrs["outcome"] == ("trip" if kind == "trip" else "failure") and f["reward"].shape == (2,)
+        assert bool(f["truncated"][-1]) and int(f["verifier"][-1]) == 2
 
 
 @pytest.mark.slow

@@ -53,6 +53,10 @@ scales the delta magnitude; the env then clips and maps it).
   until RUN. Only a ``--resume`` whose goal list no longer matches is refused after the attach (HOLD only). Real arm:
   start the servo (it waits for the reset button), start this script, then press the button (any time after the
   attach). ``servo --backend mujoco`` presses it itself: start this script first or together with it.
+* **Transitions** (ARCHITECTURE 0.43): every finished episode is also written as an F8 episode file
+  ``episodes/ep_NNNNNN.h5`` (``logging.episode_logger``; its path is ``transitions`` in ``episodes.jsonl``), the
+  real-arm data for fine-tuning. The steps are buffered during the episode and written after it under the HOLD
+  keep-alive (no file I/O in the 10 Hz loop); an episode cut short by Ctrl-C or a halt inside it is not written.
 * **Outputs** ``<out-root>/<ts>/``: ``episodes.jsonl`` (one line per episode, appended as it ends), ``summary.json``
   (written before RUN and at the end: per rung and overall success rate + Wilson 95 %, the verdict, the goal
   list, the servo's tick-log path, inference timing).
@@ -372,8 +376,18 @@ def _table(summary: dict[str, Any]) -> str:
 # ------------------------------------------------------------------------------------------------ episodes
 
 
+@dataclasses.dataclass
+class EpisodeTrace:
+    """One episode's transitions, buffered in memory during the 10 Hz loop (no file I/O there) and written as an F8
+    episode file after it (:func:`write_transitions`). ``final_obs`` is the observation after the last step."""
+
+    steps: list[Any] = dataclasses.field(default_factory=list)
+    final_obs: dict[str, np.ndarray] | None = None
+
+
 def _run_episode(env: Any, policy: Any, speed: float, *, goals: GoalList, index: int,
-                 infer_ms: list[float]) -> dict[str, Any]:  # fmt: skip
+                 infer_ms: list[float], trace: EpisodeTrace | None = None) -> dict[str, Any]:  # fmt: skip
+    from so101_rl.logging.episode_logger import StepRecord
     from so101_rl.safety.types import SmState
 
     goals.select(index)
@@ -391,8 +405,19 @@ def _run_episode(env: Any, policy: Any, speed: float, *, goals: GoalList, index:
         t0 = time.perf_counter()
         a = policy(x)
         infer_ms.append((time.perf_counter() - t0) * 1e3)
-        obs, _r, terminated, truncated, info = env.step(a * np.float32(speed))
+        cmd = np.asarray(a, np.float32) * np.float32(speed)
+        prev = {k: np.array(v, np.float32) for k, v in obs.items()} if trace is not None else None
+        obs, r, terminated, truncated, info = env.step(cmd)
         steps += 1
+        if trace is not None:
+            last = terminated or truncated
+            trace.steps.append(StepRecord(
+                t_mono_ns=time.monotonic_ns(), obs=prev, action_cmd=cmd,
+                applied_delta_ticks=info["applied_delta_ticks"], target_ticks=info["target_ticks"],
+                present_ticks=info["present_ticks"], reward=float(r), terminated=bool(terminated),
+                truncated=bool(truncated), trips=int(info["trips"]),
+                verifier=(1 if info["is_success"] else 2) if last else 0,
+            ))  # fmt: skip
         clamped_steps += int(info["action_clamped"])
         sm = int(info["sm_state"])
         if "trip" in info:  # the servo left RUN or reported fault bits (fault_bits may be 0)
@@ -403,6 +428,8 @@ def _run_episode(env: Any, policy: Any, speed: float, *, goals: GoalList, index:
             success = bool(info["is_success"])  # terminated also covers a terminal trip (plan §10 2026-10-08)
             break
     tripped = tripped or (not success and sm != int(SmState.RUN))
+    if trace is not None:
+        trace.final_obs = {k: np.array(v, np.float32) for k, v in obs.items()}
     err = float(np.linalg.norm(obs["achieved_goal"].astype(float) - obs["desired_goal"].astype(float)))
     return {
         "goal": [round(float(g), 5) for g in goal],
@@ -417,6 +444,33 @@ def _run_episode(env: Any, policy: Any, speed: float, *, goals: GoalList, index:
         "clamped_steps": clamped_steps,
         "speed": speed,
     }
+
+
+def episode_outcome(ep: dict[str, Any]) -> str:
+    """The F8 ``outcome`` of a finished deploy episode."""
+    if ep["success"]:
+        return "success"
+    if ep["tripped"]:
+        return "trip"
+    return "failure" if ep["servo_stalled"] else "truncated"
+
+
+def write_transitions(logger: Any, trace: EpisodeTrace, ep: dict[str, Any], max_delta_ticks: Any) -> Path:
+    """Write one finished episode as an F8 file (``<run>/episodes/ep_NNNNNN.h5``). Row t = (obs before step t, the
+    command sent, the servo's record after it, reward, terminated, truncated; ``t_mono_ns`` = the host's
+    CLOCK_MONOTONIC when the step returned, the servo tick log's clock); the observation after the last step is
+    ``meta.final_obs``, so every row has its next observation (:func:`so101_rl.logging.transitions.load_transitions`).
+    """
+    if trace.final_obs is None or not trace.steps:
+        raise ValueError("write_transitions: the episode has no steps")
+    logger.start_episode({
+        "source": "deploy-policy", "deploy_episode": ep["episode"], "speed": ep["speed"], "goal": ep["goal"],
+        "max_delta_ticks": np.asarray(max_delta_ticks).tolist(),
+        "final_obs": {k: v.tolist() for k, v in trace.final_obs.items()},
+    })  # fmt: skip
+    for rec in trace.steps:
+        logger.log_step(rec)
+    return logger.end_episode(episode_outcome(ep))
 
 
 def wait_for_run(backend: Any, timeout_s: float, log: Any = None, period_s: float = 0.1) -> None:
@@ -620,6 +674,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
 
     from so101_rl.env.backend import ResetFailed, ServoNotRunning, ServoStateStale, ShmBackend
     from so101_rl.env.goal_env import So101GoalEnv
+    from so101_rl.logging.episode_logger import EpisodeLogger
 
     torch.set_num_threads(1)
     try:
@@ -787,6 +842,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
     rung_of = [k for k, (_s, n) in enumerate(plan) for _ in range(n)]
     rung_start = [sum(n for _s, n in plan[:k]) for k in range(len(plan))]
     code = EXIT_OK
+    transitions = EpisodeLogger(out.parent, out.name, keep_full_frames="never")
     try:
         goals = env.goal_sampler
         with (out / "episodes.jsonl").open("a") as f:
@@ -815,13 +871,17 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
                         halt_reason = "rung_below_threshold"
                         break
                 speed = schedule[i]
+                trace = EpisodeTrace()
                 try:
-                    ep = _run_episode(env, policy, speed, goals=goals, index=i, infer_ms=infer_ms)
+                    ep = _run_episode(env, policy, speed, goals=goals, index=i, infer_ms=infer_ms, trace=trace)
                 except (ServoNotRunning, ResetFailed, ServoStateStale) as exc:
                     halt = f"{type(exc).__name__}: {exc}"
                     halt_reason = "reset_failed" if isinstance(exc, ResetFailed) else "servo_not_running"
                     break
                 ep["episode"] = i
+                with hold_keepalive(backend):  # the env sent HOLD at the episode end; keep it fresh while writing
+                    path = write_transitions(transitions, trace, ep, cfg.action.max_delta_ticks)
+                ep["transitions"] = str(path.relative_to(out))
                 episodes.append(ep)
                 f.write(json.dumps(ep) + "\n")
                 f.flush()
@@ -853,6 +913,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         keepalive.close()
         if backend is not None:
             _hold(backend)  # last command is always HOLD (never a stale RUN)
+        transitions.close()  # an episode interrupted mid-write stays an ep_*.h5.tmp, never an .h5
         with contextlib.suppress(Exception):
             if env is not None:
                 env.close()
