@@ -180,8 +180,8 @@ def test_finetune_on_the_sim_rig_writes_every_artifact(tmp_path):
     (run,) = tmp_path.iterdir()
     assert all((run / a).is_file() for a in t.ARTIFACTS)
     summary = json.loads((run / "summary.json").read_text())
-    assert summary["total_steps"] >= 300 and summary["n_updates"] > 0 and summary["missing_artifacts"] == []
+    assert summary["steps_done"] >= 300 and summary["n_updates"] > 0 and summary["missing_artifacts"] == []
     evals = [json.loads(line) for line in (run / "evals.jsonl").read_text().splitlines()]
     assert len(evals) == 2 and all(e["n"] == 2 for e in evals)
     assert json.loads((run / "baseline.json").read_text())["n"] == 2
-    assert load_policy(run / "policy_export.pt").meta["finetune_steps"] == summary["total_steps"]
+    assert load_policy(run / "policy_export.pt").meta["finetune_steps"] == summary["steps_done"]

@@ -59,7 +59,6 @@ from so101_rl.servo.timing import Clock
 from . import clamp
 from .calib_check import require_calibration
 from .fk import KinematicChain, So101FK
-from .safe_state import SETTLE_TICKS
 from .thermal import CONFIRM_READS, ConsecutiveAbove
 from .transit import TransitPlanner
 
@@ -69,6 +68,12 @@ _RAMP_SLACK_S = 1.0
 _SENSOR_DEAD = (0, 255)
 _N_ARM = 5
 _TORQUE_OFF_ATTEMPTS = 3
+# The ramp home is done when its target IS home and the arm is within HOME_REACHED_TICKS of it and still (moved at most
+# HOME_STILL_TICKS since the previous read). Not SETTLE_TICKS (25): the STS3215 settles up to 27 ticks short of a goal
+# (elbow_flex, depending on the side it came from; plan §10 2026-10-11 "Reset tracking tolerance" and "Measured servo
+# deadband"), so the ramp never finished from some start poses (2026-10-12). The same 40 ticks as the deploy reset.
+HOME_REACHED_TICKS = 40
+HOME_STILL_TICKS = 1
 
 TickHook = Callable[[bool], None]
 
@@ -301,6 +306,7 @@ def _ramp_home(
     budget_s = timeout_s + _RAMP_SLACK_S + (worst / max(step, 1)) / cfg.rates.servo_hz
     deadline = clock.monotonic_ns() + int(budget_s * _NS)
     next_tick = clock.monotonic_ns()
+    prev = None
     while True:
         check_abort()
         now = clock.monotonic_ns()
@@ -311,8 +317,11 @@ def _ramp_home(
         got = bool(bus.read_block(block)) and block.ok
         if got:
             _check_temperatures(cfg, block, hot)  # torque is on now: a hot joint or a protection bit ends the ramp
-        if got and int(np.abs(block.position - home).max()) <= SETTLE_TICKS and bool((target == home).all()):
-            return
+        if got:
+            still = prev is not None and int(np.abs(block.position - prev).max()) <= HOME_STILL_TICKS
+            prev = block.position.astype(np.int32)
+            if bool((target == home).all()) and still and int(np.abs(block.position - home).max()) <= HOME_REACHED_TICKS:
+                return
         if got:
             planner.next_target(target, home, nxt)
             clamp.clamp_joint_limits(nxt, cfg.joints, lim, mask)
