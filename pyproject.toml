@@ -145,10 +145,11 @@ train-sim-sac = "python -m so101_rl.rl.train_sim_sac"   # --task reach --nworld 
 eval-sim = { cmd = "python -m so101_rl.rl.eval_sim", env = { MUJOCO_GL = "egl" } }   # renders eval rollouts headless
 export-policy = "python -m so101_rl.rl.policy_export"
 deploy-policy = "python -m so101_rl.rl.deploy_policy"   # M7: attaches to a RUNNING servo; --attended on the real arm
+train-reach-sac = "python -m so101_rl.rl.train_sac_her"   # S5.2: SB3 SAC + HER fine-tune from a policy export (--backend sim)
 lab-mcp = "python -m so101_rl.lab.mcp_server"   # stdio MCP server (.mcp.json); jobs run as transient user units
 lab = "python -m so101_rl.lab.cli"   # status | stop <run> | gate-sign <run>
 # Planned tasks: each is added in the same commit that creates its module, so `pixi task list` never advertises a
 # broken task (tests/test_pixi_tasks.py). Phase 0 U8-U10 / SR1-SR3: random-policy-sim / random-policy-real
-# (so101_rl.env.random_policy --backend {sim,real}), train-reach-sac (rl.train_sac_her), train-reach-tdmpc2
+# (so101_rl.env.random_policy --backend {sim,real}), train-reach-tdmpc2
 # (rl.train_tdmpc2), train-wm-state (wm.train_state_wm), check-milestone (scripts/check_milestone_phase0.py).
 # Sim track S5 (deferred after the MVP): pretrain-tdmpc2 (rl.tdmpc2_offline), gap-report (rl.gap_report).
