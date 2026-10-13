@@ -478,6 +478,10 @@ watchdog MCU"; ARCHITECTURE 0.45). Attended Tier 0: you watch the arm for the wh
 switch. **No watchdog MCU is required**: the servo's own safety layer ends the session on overheating (60 °C on 3
 reads in a row), a firmware overload / overcurrent bit, a blocked joint (tracking error), STUCK or a box violation.
 
+**Since 2026-10-13 (plan §10 "HS5 run by Claude, unattended"):** Claude runs the sessions itself, unattended. It
+resumes only after `session_cap`, stale-command or THERMAL stops (600 s cool-down first); any other stop leaves the
+arm torque-off for the user.
+
 - **Parts:** as HS4 (arm on its clamp, foam under the reach space, the reach space clear, hand on the power switch).
 - **Needs:** HS4 passed (`finetune_eligible`). Dry run first against the sim servo: terminal 1
   `pixi run train-reach-sac --init-from runs/lab/fastsac_sim-reach-20261008-130617-58ef/policy.pt --backend shm
