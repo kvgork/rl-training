@@ -84,7 +84,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
@@ -557,19 +557,26 @@ def wait_for_run(backend: Any, timeout_s: float, log: Any = None, period_s: floa
 
 
 @contextlib.contextmanager
-def hold_keepalive(backend: Any, period_s: float = 0.1) -> Iterator[None]:
+def hold_keepalive(backend: Any, period_s: float = 0.1, *, on_late: Callable[[float], None] | None = None,
+                   late_s: float = 0.15) -> Iterator[None]:
     """A HOLD command every ``period_s`` from a helper thread while the caller does slow set-up after the attach
     (nothing else may send meanwhile: ``So101GoalEnv.__init__`` only calls ``backend.fk()``). HOLD never moves the
-    arm; it only keeps the servo from safe-stopping."""
+    arm; it only keeps the servo from safe-stopping. ``on_late(gap_s)`` is called (from the helper thread) for every
+    gap between two HOLDs longer than ``late_s`` (the servo's stale-command limit): the thread itself was starved."""
     stop = threading.Event()
 
     def _run() -> None:
         warned = False
         t_next = time.monotonic()
+        t_prev: float | None = None
         while not stop.is_set():
             if not _hold(backend) and not warned:
                 print("deploy-policy: HOLD keep-alive could not write the shm command", file=sys.stderr, flush=True)
                 warned = True
+            now = time.monotonic()
+            if on_late is not None and t_prev is not None and now - t_prev > late_s:
+                on_late(now - t_prev)
+            t_prev = now
             t_next += period_s
             stop.wait(max(0.0, t_next - time.monotonic()))
 

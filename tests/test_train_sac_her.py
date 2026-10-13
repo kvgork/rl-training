@@ -57,6 +57,27 @@ def test_real_arm_needs_attended_and_no_watchdog_is_accepted(tmp_path, capsys, n
     assert "NO WATCHDOG" in err and "refused" not in err
 
 
+def test_keepalive_reports_its_own_starved_gaps():
+    """A HOLD gap above the stale-command limit (the helper thread starved, here: one slow send) reaches ``on_late``;
+    the regular 0.1 s period does not."""
+    from so101_rl.rl.deploy_policy import hold_keepalive
+
+    class SlowOnce:
+        episode, n = 0, 0
+
+        def send_hold(self, *_a):
+            self.n += 1
+            if self.n == 3:
+                time.sleep(0.4)
+
+    late: list[float] = []
+    b = SlowOnce()
+    with hold_keepalive(b, on_late=late.append):
+        while b.n < 6:
+            time.sleep(0.02)
+    assert len(late) == 1 and 0.35 < late[0] < 1.0
+
+
 def test_resume_refuses_a_non_run_dir_and_a_different_backend(tmp_path, capsys):
     assert t.main(["--resume", str(tmp_path)]) == t.EXIT_REFUSED
     (tmp_path / "run.json").write_text(json.dumps({"backend": "sim"}))
@@ -105,6 +126,11 @@ def test_shm_session_keeps_the_servo_alive_through_updates_then_caps_and_resumes
     assert len(sessions) == 2 and sessions[1]["start_step"] == 10 and summary["steps_done"] >= 40
     assert summary["halt_reason"] is None and summary["n_updates"] > 0
     assert json.loads((run / "baseline.json").read_text())["n"] == 1  # the baseline is not re-run on resume
+    timing = [json.loads(x) for x in (run / "timing.jsonl").read_text().splitlines()]
+    slow_cycles = [c for c in timing if c.get("updates_s", 0.0) >= 1.0]
+    assert slow_cycles and all("last_step_to_hold_s" in c for c in slow_cycles)
+    assert not any("keepalive_late_s" in c for c in timing)  # the keep-alive kept its 0.1 s period throughout
+    assert any("updates_to_first_step_s" in c for c in timing)
     # slow updates ran between episodes and the next episodes still ran: the keep-alive held the servo in RUN/HOLD
     # (a stale-command safe stop would have failed the next reset: halt_reason servo_not_running)
     assert slow["n"] >= 2

@@ -173,9 +173,14 @@ def test_finetune_on_the_sim_rig_writes_every_artifact(tmp_path):
 
     if not M6_POLICY.is_file():
         pytest.skip(f"the M6 policy export is not on this host ({M6_POLICY})")
-    code = t.main(["--init-from", str(M6_POLICY), "--total-steps", "300", "--learning-starts", "100",
-                   "--warmup-frozen-actor", "1000", "--baseline-eval-every", "150", "--eval-episodes", "2",
-                   "--out-root", str(tmp_path)])  # fmt: skip
+    threads = torch.get_num_threads()
+    try:
+        code = t.main(["--init-from", str(M6_POLICY), "--total-steps", "300", "--learning-starts", "100",
+                       "--warmup-frozen-actor", "1000", "--baseline-eval-every", "150", "--eval-episodes", "2",
+                       "--torch-threads", "2", "--out-root", str(tmp_path)])  # fmt: skip
+        assert torch.get_num_threads() == 2
+    finally:
+        torch.set_num_threads(threads)
     assert code == t.EXIT_OK
     (run,) = tmp_path.iterdir()
     assert all((run / a).is_file() for a in t.ARTIFACTS)
@@ -185,3 +190,5 @@ def test_finetune_on_the_sim_rig_writes_every_artifact(tmp_path):
     assert len(evals) == 2 and all(e["n"] == 2 for e in evals)
     assert json.loads((run / "baseline.json").read_text())["n"] == 2
     assert load_policy(run / "policy_export.pt").meta["finetune_steps"] == summary["steps_done"]
+    timing = [json.loads(x) for x in (run / "timing.jsonl").read_text().splitlines()]
+    assert timing and any("eval_s" in c for c in timing) and all("keepalive_late_s" not in c for c in timing)
