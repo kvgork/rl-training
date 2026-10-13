@@ -1,20 +1,29 @@
 """SB3 SAC + HER fine-tuning of the sim reach actor (sim plan S5.2 / HS5; pixi task ``train-reach-sac``).
 
 ``train-reach-sac --init-from <policy_export.pt> --backend {sim,shm} --total-steps N [--attended]``
-``train-reach-sac --resume <run dir> [--total-steps N] [--attended]``
+``train-reach-sac --resume <run dir> [--total-steps N] [--attended] [--reset-actor]``
 
 * **Model:** :class:`~so101_rl.rl.sb3_bridge.FinetuneSAC` on ``So101GoalEnv(REACH)``, the export's actor copied in
   (critics fresh), ``HerReplayBuffer`` (4 sampled goals, ``future``, the info dicts kept: the relabelled reward reads
-  the trip bits), ``ent_coef="auto_0.01"``, lr 1e-4, batch 256, ``gamma`` = the task's, ``tau`` 0.005,
-  ``learning_starts`` 2000. Updates run **between episodes** (``train_freq=(1, "episode")``, one gradient step per
-  collected step), never inside one: the 10 Hz loop never waits for an update. Every action is the actor's (no
-  uniform-random warm-up); the actor and the entropy coefficient stay frozen for ``--warmup-frozen-actor`` gradient
-  steps while the critics learn.
+  the trip bits), critic lr 1e-4, batch 256, ``gamma`` = the task's, ``tau`` 0.005, ``learning_starts`` 2000.
+  Updates run **between episodes** (``train_freq=(1, "episode")``, one gradient step per collected step), never inside
+  one: the 10 Hz loop never waits for an update. Every action is the actor's (no uniform-random warm-up).
+* **Recipe** (plan §10 2026-10-13 "Anchored fine-tuning", after the 2026-10-13 collapse: the free SAC actor fell from
+  ~10 mm to 20-35 cm final errors right after its warm-up): the actor is frozen for ``--warmup-frozen-actor`` (5000)
+  gradient steps while the fresh critics learn, then learns at ``--actor-lr`` (1e-5) with the TD3+BC anchor to the sim
+  actor (``--anchor-weight`` 0.4, 0 = plain SAC); the entropy coefficient is held at ``--ent-coef`` (0.01; ``auto`` =
+  SB3's learned one). These recipe flags are stored in ``run.json``; on ``--resume`` a given flag replaces the stored
+  value (logged in ``run.json["recipe_changes"]``), a missing stored one takes the default. ``--reset-actor`` (resume
+  only) puts the export's actor back (critics, replay buffer and step count kept) and freezes it for
+  ``--warmup-frozen-actor`` more gradient steps.
 * **Baseline and rollback:** before learning, the export is evaluated deterministically on ``--eval-episodes`` fixed
   goals (drawn from ``--eval-seed`` as in ``deploy-policy``) = ``baseline.json``. At the first episode end after every
   ``--baseline-eval-every`` steps the current actor is evaluated on the same goals (``evals.jsonl``); the best actor so
-  far is kept (``best_policy.pt``), and when two consecutive evals fall below baseline − ``--rollback-margin`` the
-  policy (actor and critics) is rolled back to it.
+  far is kept (``best_policy.pt``). The **actor** (the critics are kept) is rolled back to it when two consecutive
+  evals fall below baseline − ``--rollback-margin``, at once when an eval episode trips (a tripped eval counts as
+  success 0; the session then ends), and at once when the last ``--train-window`` (10) training episodes of the
+  learning actor succeed less than baseline − margin. Each rollback is a line in ``rollbacks.jsonl``; the
+  ``--max-rollbacks``-th (3) in a session ends it (``rollback_limit``).
 * **Backends:** ``sim`` = the in-process CPU reference rig (``SimBackend``). ``shm`` = an already-running servo
   (``servo --backend feetech`` on the arm; the tests use ``mujoco`` / ``fake``), attached exactly like
   ``deploy-policy`` (``resolve_servo``: classified read-only from ``/proc``, the real arm needs ``--attended``;
@@ -31,13 +40,15 @@
   total unless given.
 * **Outputs** ``<out-root>/<ts>/``: ``model.zip``, ``replay_buffer.pkl``, ``monitor.csv`` (sim), ``baseline.json``,
   ``evals.jsonl``, ``best_policy.pt``, ``policy_export.pt`` (the current actor, deployable), ``sessions.jsonl`` (one
-  line per session), ``timing.jsonl`` (one line per collect/update cycle, below) and ``summary.json``. Exit 2 on a refusal (``--total-steps`` < 1, a bad export, no servo, the real
-  arm without ``--attended``).
+  line per session), ``timing.jsonl`` (one line per collect/update cycle, below), ``rollbacks.jsonl`` and ``summary.json``. Exit 2 on a
+  refusal (``--total-steps`` < 1, a bad export, no servo, the real arm without ``--attended``, ``--reset-actor``
+  without ``--resume``).
 * **Timing** (``timing.jsonl``, plan §10 2026-10-13 "Trainer stall diagnostics"): per cycle the episode's longest gap
-  between two policy steps, the eval time, the gap from the episode's last step to the first keep-alive HOLD, the
+  between two policy steps (``reset_step_s``: the episode's last step, which includes the auto-reset ramp), the eval
+  time, the gap from the episode's last step to the first keep-alive HOLD, the
   update time, every keep-alive HOLD gap above the servo's stale-command limit (the helper thread was starved) and
   ``updates_to_first_step_s`` (the previous cycle's updates to this episode's first step). A gap above
-  ``STALL_WARN_S`` is also printed.
+  ``STALL_WARN_S`` inside an episode is also printed.
   ``--torch-threads`` (default 4) caps PyTorch's CPU threads so the updates leave cores for the keep-alive thread and
   the servo process.
 """
@@ -67,8 +78,11 @@ ARTIFACTS: Final[tuple[str, ...]] = ("model.zip", "replay_buffer.pkl", "baseline
                                      "policy_export.pt", "sessions.jsonl", "summary.json")  # fmt: skip
 STALL_WARN_S: Final[float] = 0.3  # a send gap this long is printed (servo: HOLD after 0.15 s, SAFE_STOPPING ~0.5 s)
 RUN_KEYS: Final[tuple[str, ...]] = ("init_from", "seed", "eval_seed", "eval_episodes", "total_steps",
-                                    "warmup_frozen_actor", "learning_starts", "baseline_eval_every",
-                                    "rollback_margin", "backend")  # fmt: skip
+                                    "learning_starts", "baseline_eval_every", "backend")  # fmt: skip
+# plan §10 2026-10-13 "Anchored fine-tuning"; stored in run.json, a flag given on --resume replaces the stored value
+RECIPE_DEFAULTS: Final[dict[str, Any]] = {"warmup_frozen_actor": 5000, "actor_lr": 1e-5, "anchor_weight": 0.4,
+                                          "ent_coef": 0.01, "rollback_margin": 0.15, "train_window": 10,
+                                          "max_rollbacks": 3}  # fmt: skip
 
 
 class Halt(Exception):
@@ -157,12 +171,19 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--resume", type=Path, help="continue this run dir (its export, seed and eval goals)")
     ap.add_argument("--backend", choices=("sim", "shm"), default=None, help="new run: default sim")
     ap.add_argument("--total-steps", type=int, default=None, help="new run: required")
-    ap.add_argument("--warmup-frozen-actor", type=int, default=2000, help="gradient steps with the actor frozen")
+    rec = ap.add_argument_group("recipe (default: run.json on --resume, else RECIPE_DEFAULTS)")
+    rec.add_argument("--warmup-frozen-actor", type=int, default=None, help="gradient steps with the actor frozen")
+    rec.add_argument("--actor-lr", type=float, default=None)
+    rec.add_argument("--anchor-weight", type=float, default=None, help="TD3+BC anchor to the sim actor; 0 = plain SAC")
+    rec.add_argument("--ent-coef", type=_ent_coef, default=None, help="fixed entropy coefficient, or 'auto'")
+    rec.add_argument("--rollback-margin", type=float, default=None)
+    rec.add_argument("--train-window", type=int, default=None, help="training episodes in the rollback window")
+    rec.add_argument("--max-rollbacks", type=int, default=None, help="per session; reaching it ends the session")
+    ap.add_argument("--reset-actor", action="store_true", help="--resume only: the export's actor back, frozen again")
     ap.add_argument("--learning-starts", type=int, default=2000)
     ap.add_argument("--baseline-eval-every", type=int, default=1000)
     ap.add_argument("--eval-episodes", type=int, default=10)
     ap.add_argument("--eval-seed", type=int, default=7)
-    ap.add_argument("--rollback-margin", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--torch-threads", type=int, default=4, help="PyTorch CPU threads (leave cores for the servo)")
@@ -175,6 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
     shm.add_argument("--config", type=Path, default=None)
     shm.add_argument("--calibration", type=Path, default=None)
     return ap
+
+
+def _ent_coef(v: str) -> float | str:
+    return "auto" if v == "auto" else float(v)
 
 
 def _log(msg: str) -> None:
@@ -197,9 +222,12 @@ def _resolve_run(args: argparse.Namespace) -> tuple[dict[str, Any], Path, bool]:
     if args.resume is None:
         if args.total_steps is None or args.total_steps < 1:
             raise ValueError("--total-steps must be >= 1")
+        if args.reset_actor:
+            raise ValueError("--reset-actor needs --resume")
         run = {k: getattr(args, k) for k in RUN_KEYS}
         run["init_from"] = str(args.init_from.resolve())
         run["backend"] = args.backend or "sim"
+        run.update({k: d if getattr(args, k) is None else getattr(args, k) for k, d in RECIPE_DEFAULTS.items()})
         out = args.out_root / f"{datetime.now().astimezone():%Y%m%d-%H%M%S}-{os.urandom(2).hex()}"
         return run, out, False
     out = args.resume
@@ -212,6 +240,17 @@ def _resolve_run(args: argparse.Namespace) -> tuple[dict[str, Any], Path, bool]:
         if args.total_steps < 1:
             raise ValueError("--total-steps must be >= 1")
         run["total_steps"] = args.total_steps
+    changes = {}
+    for k, d in RECIPE_DEFAULTS.items():
+        given = getattr(args, k)
+        new = given if given is not None else run.get(k, d)
+        if k == "warmup_frozen_actor" and args.reset_actor and given is None:
+            new = d  # a reset actor is frozen for the default warm-up, not the run's original one
+        if run.get(k) != new:
+            changes[k] = {"from": run.get(k), "to": new}
+        run[k] = new
+    if changes or args.reset_actor:
+        run["_pending_change"] = {"changes": changes, "reset_actor": bool(args.reset_actor)}
     return run, out, True
 
 
@@ -298,10 +337,13 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                          if run["backend"] == "sim" else genv)  # fmt: skip
         pairs = dp.draw_goal_pairs(BoxGoalSampler(REACH.goal_bounds, fk=genv._fk, limits=cfg.joints, seed=0),
                                    int(run["eval_seed"]), int(run["eval_episodes"]))  # fmt: skip
+        pending = run.pop("_pending_change", None)
         if not resuming:
             _write_json(out / "run.json", run)
-        kw = {"warmup_frozen_actor": int(run["warmup_frozen_actor"]), "device": args.device}
-        if resuming:
+        fixed_ent = None if run["ent_coef"] == "auto" else float(run["ent_coef"])
+        kw = {"actor_learning_rate": float(run["actor_lr"]), "fixed_ent_coef": fixed_ent,
+              "anchor_weight": float(run["anchor_weight"]), "device": args.device}  # fmt: skip
+        if resuming:  # warmup_frozen_actor comes from model.zip (absolute, possibly moved by a --reset-actor)
             model = FinetuneSAC.load(out / "model.zip", env=env, **kw)
             model.load_replay_buffer(out / "replay_buffer.pkl")
             baseline = json.loads((out / "baseline.json").read_text())
@@ -317,9 +359,17 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                 replay_buffer_kwargs={"n_sampled_goal": 4, "goal_selection_strategy": "future", "copy_info_dict": True},
                 ent_coef="auto_0.01", learning_rate=1e-4, learning_starts=int(run["learning_starts"]), batch_size=256,
                 gamma=REACH.gamma, tau=0.005, train_freq=(1, "episode"), gradient_steps=-1, seed=int(run["seed"]),
-                verbose=0, **kw,
+                verbose=0, warmup_frozen_actor=int(run["warmup_frozen_actor"]), **kw,
             )  # fmt: skip
             load_actor_into_sb3(model, init)
+        model.set_anchor(init)
+        if pending is not None:
+            if pending["reset_actor"]:
+                model.reset_actor(init, int(run["warmup_frozen_actor"]))
+                _log(f"actor reset to the export; frozen until gradient step {model.warmup_frozen_actor}")
+            run.setdefault("recipe_changes", []).append({"at_step": int(model.num_timesteps), **pending,
+                                                         "at": datetime.now().astimezone().isoformat(timespec="seconds")})
+            _write_json(out / "run.json", run)
         if run["backend"] == "shm":
             keepalive.close()
             dp.wait_for_run(backend, args.wait_servo_s, _log)
@@ -344,8 +394,12 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
 
             def __init__(self) -> None:
                 super().__init__()
-                every = int(run["baseline_eval_every"])
-                self.next_at = (model.num_timesteps // every + 1) * every
+                every, n = int(run["baseline_eval_every"]), int(model.num_timesteps)
+                due = (n // every) * every  # an eval missed at a session boundary runs at the first episode end
+                last = max((int(e["step"]) for e in evals), default=0)
+                self.next_at = n if 0 < due and last < due else (n // every + 1) * every
+                self.window: list[bool] = []  # training-episode successes of the learning actor
+                self.n_rollbacks = 0
                 self.cyc: dict[str, Any] = {}
                 self.late: list[float] = []  # appended by the keep-alive thread
                 self.t_step: float | None = None  # last policy step (on_step)
@@ -354,21 +408,42 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
 
             def _on_step(self) -> bool:
                 now = time.monotonic()
+                info, done = self.locals["infos"][0], bool(self.locals["dones"][0])
                 if self.t_step is not None:
                     gap = now - self.t_step
                     if self.t_upd_end is not None:  # the first step after the updates (includes its own 0.1 s wait)
                         self.cyc["updates_to_first_step_s"] = round(now - self.t_upd_end, 4)
                         self.t_upd_end = None
+                    elif done:  # the episode's last step: the VecEnv's auto-reset (a commanded ramp) ran inside it
+                        self.cyc["reset_step_s"] = round(gap, 4)
                     else:
                         self.cyc["max_step_gap_s"] = round(max(self.cyc.get("max_step_gap_s", 0.0), gap), 4)
-                    if gap > STALL_WARN_S + 0.1:
-                        _log(f"policy step gap {gap:.2f} s at step {self.num_timesteps} (servo HOLD after 0.15 s)")
+                        if gap > STALL_WARN_S + 0.1:
+                            _log(f"policy step gap {gap:.2f} s at step {self.num_timesteps} (servo HOLD after 0.15 s)")
                 self.t_step = now
-                if self.locals["infos"][0].get("halted"):  # a halted env's step: not stored, the loop ends here
+                if info.get("halted"):  # a halted env's step: not stored, the loop ends here
                     model.num_timesteps -= 1  # SB3 counted it before this callback; it never reached the servo
                     self._flush()
                     return False
+                if done and not model.actor_frozen:
+                    self.window.append(bool(info.get("is_success")))
+                    w = int(run["train_window"])
+                    if len(self.window) >= w:
+                        rate = float(np.mean(self.window[-w:]))
+                        if rate < baseline["success_rate"] - float(run["rollback_margin"]):
+                            self._rollback("train_window", f"last {w} training episodes {rate:.2f}")
                 return True
+
+            def _rollback(self, reason: str, detail: str) -> None:
+                """Actor <- the best one (critics kept); ``rollbacks.jsonl``; the session ends at ``max_rollbacks``."""
+                model.rollback_actor(best["state"])
+                self.window.clear()
+                self.n_rollbacks += 1
+                _append_jsonl(out / "rollbacks.jsonl", {"step": int(self.num_timesteps), "reason": reason,
+                                                        "detail": detail, "to_step": best["step"]})  # fmt: skip
+                _log(f"ROLLBACK ({reason}: {detail}) to the actor of step {best['step']}")
+                if self.n_rollbacks >= int(run["max_rollbacks"]):
+                    env.halt("rollback_limit", f"{self.n_rollbacks} rollbacks this session")
 
             def _on_rollout_end(self) -> None:
                 if env.halted:
@@ -420,22 +495,24 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                 elif r["success_rate"] > best["success_rate"]:
                     best.update(success_rate=r["success_rate"], state=copy.deepcopy(model.policy.state_dict()),
                                 step=self.num_timesteps)  # fmt: skip
-                r["rolled_back"] = (not r["halted"]) and rollback_due(
-                    [e["success_rate"] for e in evals if not e.get("halted")] + [r["success_rate"]],
+                r["rolled_back"] = r["halted"] or rollback_due(  # a tripped eval counts as success 0
+                    [0.0 if e.get("halted") else e["success_rate"] for e in evals] + [r["success_rate"]],
                     baseline["success_rate"], margin=float(run["rollback_margin"]))  # fmt: skip
                 if r["rolled_back"]:
-                    model.policy.load_state_dict(best["state"])
                     r["rolled_back_to_step"] = best["step"]
+                    self._rollback("eval_trip" if r["halted"] else "evals", f"eval at step {r['step']}")
                 evals.append(r)
                 _append_jsonl(out / "evals.jsonl", r)
                 _log(f"eval @ {r['step']}: {r['success_rate']:.2f}" + (" ROLLBACK" if r["rolled_back"] else ""))
                 model._last_obs = self.training_env.reset()  # the evals moved the arm: start a fresh episode
 
+        cb = Session()
         remaining = int(run["total_steps"]) - int(model.num_timesteps)
         if remaining > 0 and not env.halted:
-            model.learn(total_timesteps=remaining, callback=Session(), reset_num_timesteps=not resuming)
+            model.learn(total_timesteps=remaining, callback=cb, reset_num_timesteps=not resuming)
         reached = model.num_timesteps >= int(run["total_steps"]) and not env.halted
         session.update(halt_reason=None if reached else (env.halt_reason or "incomplete"), halt=env.halt_detail)
+        session["rollbacks"] = cb.n_rollbacks
     except dp.Refused as exc:
         _log(f"refused: {exc}")
         session = {}

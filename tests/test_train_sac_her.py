@@ -130,7 +130,7 @@ def test_shm_session_keeps_the_servo_alive_through_updates_then_caps_and_resumes
     slow_cycles = [c for c in timing if c.get("updates_s", 0.0) >= 1.0]
     assert slow_cycles and all("last_step_to_hold_s" in c for c in slow_cycles)
     assert not any("keepalive_late_s" in c for c in timing)  # the keep-alive kept its 0.1 s period throughout
-    assert any("updates_to_first_step_s" in c for c in timing)
+    assert any("updates_to_first_step_s" in c for c in timing) and any("reset_step_s" in c for c in timing)
     # slow updates ran between episodes and the next episodes still ran: the keep-alive held the servo in RUN/HOLD
     # (a stale-command safe stop would have failed the next reset: halt_reason servo_not_running)
     assert slow["n"] >= 2

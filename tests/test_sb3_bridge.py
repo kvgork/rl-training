@@ -72,13 +72,13 @@ def _export(path: Path) -> Path:
     return path
 
 
-def _model(env, *, warmup=0, learning_starts=0):
+def _model(env, *, warmup=0, learning_starts=0, **kw):
     return FinetuneSAC(
         "MultiInputPolicy", env, policy_kwargs={"net_arch": HIDDEN, "features_extractor_class": GoalPolicyInput},
         replay_buffer_class=HerReplayBuffer,
         replay_buffer_kwargs={"n_sampled_goal": 4, "goal_selection_strategy": "future", "copy_info_dict": True},
         learning_starts=learning_starts, batch_size=16, train_freq=(1, "episode"), gradient_steps=-1,
-        warmup_frozen_actor=warmup, buffer_size=1000, device="cpu", seed=0,
+        warmup_frozen_actor=warmup, buffer_size=1000, device="cpu", seed=0, **kw,
     )  # fmt: skip
 
 
@@ -126,6 +126,82 @@ def test_frozen_warmup_keeps_actor_and_entropy_and_never_samples_uniformly(tmp_p
     assert any(not torch.equal(actor0[k], v) for k, v in model.actor.state_dict().items())
 
 
+def _filled(tmp_path, steps=60, **kw):
+    """A model with ``steps`` collected steps and no update yet, the export's actor loaded, the anchor set."""
+    pol = load_policy(_export(tmp_path / "p.pt"))
+    model = _model(_GoalEnv(), learning_starts=10_000, **kw)
+    load_actor_into_sb3(model, pol)
+    model.set_anchor(pol)
+    model.learn(total_timesteps=steps)
+    assert model._n_updates == 0
+    return model, pol
+
+
+def _seeded_train(model, train, steps=5):
+    np.random.seed(3)
+    torch.manual_seed(3)
+    train(model, steps, batch_size=16)
+    return {k: v.clone() for k, v in model.policy.state_dict().items()}
+
+
+def test_unanchored_train_is_sb3_sac_train(tmp_path):
+    """With anchor 0 and no actor lr / fixed entropy, FinetuneSAC.train is SB3's SAC.train (guards the copied loop
+    against an SB3 upgrade)."""
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.logger import configure
+
+    model, _ = _filled(tmp_path)
+    model.save(tmp_path / "m.zip")
+    model.save_replay_buffer(tmp_path / "b.pkl")
+    ours = _seeded_train(model, FinetuneSAC.train)
+    twin = FinetuneSAC.load(tmp_path / "m.zip", env=_GoalEnv(), device="cpu")
+    twin.load_replay_buffer(tmp_path / "b.pkl")
+    twin.set_logger(configure(None, []))
+    sb3 = _seeded_train(twin, SAC.train)
+    assert all(torch.allclose(ours[k], sb3[k], atol=1e-6) for k in ours)
+
+
+def test_anchor_keeps_the_actor_near_the_sim_actor(tmp_path):
+    x = _obs_batch(200, seed=5)
+
+    def drift(weight):
+        model, pol = _filled(tmp_path, anchor_weight=weight, actor_learning_rate=1e-3)
+        _seeded_train(model, FinetuneSAC.train, steps=150)
+        a, _ = model.predict(x, deterministic=True)
+        return float(np.mean((a - pol(np.concatenate([x["observation"], x["desired_goal"]], axis=1))) ** 2))
+
+    assert drift(50.0) < 0.25 * drift(0.0)
+
+
+def test_actor_lr_fixed_entropy_rollback_and_reset(tmp_path):
+    model, pol = _filled(tmp_path, actor_learning_rate=1e-5, fixed_ent_coef=0.02, anchor_weight=0.4)
+    model.log_ent_coef.data.fill_(0.0)
+    start = {k: v.clone() for k, v in model.policy.state_dict().items()}
+    _seeded_train(model, FinetuneSAC.train, steps=20)
+    assert model.actor.optimizer.param_groups[0]["lr"] == 1e-5
+    assert np.isclose(float(torch.exp(model.log_ent_coef.detach())), 0.02)
+    trained = {k: v.clone() for k, v in model.policy.state_dict().items()}
+    model.rollback_actor(start)  # actor back, critics kept
+    now = model.policy.state_dict()
+    assert all(torch.equal(now[k], start[k]) for k in now if k.startswith("actor."))
+    assert all(torch.equal(now[k], trained[k]) for k in now if k.startswith("critic."))
+    with torch.no_grad():
+        for p in model.actor.mu.parameters():
+            p.add_(0.1)
+    model.reset_actor(pol, 7)
+    assert model.warmup_frozen_actor == model._n_updates + 7 and model.actor_frozen
+    x = _obs_batch(20)
+    a, _ = model.predict(x, deterministic=True)
+    np.testing.assert_allclose(a, pol(np.concatenate([x["observation"], x["desired_goal"]], axis=1)), atol=1e-6)
+
+
+def test_anchor_needs_set_anchor(tmp_path):
+    model = _model(_GoalEnv(), learning_starts=10_000, anchor_weight=0.4)
+    model.learn(total_timesteps=30)
+    with pytest.raises(RuntimeError, match="set_anchor"):
+        model.train(1, batch_size=16)
+
+
 def test_export_round_trip_is_deployable(tmp_path):
     pol = load_policy(_export(tmp_path / "p.pt"))
     model = _model(_GoalEnv())
@@ -159,8 +235,10 @@ def test_entry_point_refusals(tmp_path, capsys):
                    "--shm-name", "so101_no_such_servo", "--out-root", str(tmp_path)]) == t.EXIT_REFUSED  # fmt: skip
     assert t.main(["--init-from", str(tmp_path / "nope.pt"), "--total-steps", "10",
                    "--out-root", str(tmp_path)]) == t.EXIT_REFUSED  # fmt: skip
+    assert t.main(["--init-from", str(p), "--total-steps", "10", "--reset-actor",
+                   "--out-root", str(tmp_path)]) == t.EXIT_REFUSED  # fmt: skip
     err = capsys.readouterr().err
-    assert "--total-steps must be >= 1" in err and "so101_no_such_servo" in err
+    assert "--total-steps must be >= 1" in err and "so101_no_such_servo" in err and "--reset-actor needs" in err
     assert not any(tmp_path.glob("2*"))  # no run dir for a refusal
 
 
@@ -192,3 +270,40 @@ def test_finetune_on_the_sim_rig_writes_every_artifact(tmp_path):
     assert load_policy(run / "policy_export.pt").meta["finetune_steps"] == summary["steps_done"]
     timing = [json.loads(x) for x in (run / "timing.jsonl").read_text().splitlines()]
     assert timing and any("eval_s" in c for c in timing) and all("keepalive_late_s" not in c for c in timing)
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(900)
+def test_train_window_rollbacks_end_the_session_and_reset_actor_resumes(tmp_path, monkeypatch):
+    """Training episodes reported as failures while the actor learns: each window of 2 rolls the actor back, the 3rd
+    rollback ends the session (rollback_limit). ``--resume --reset-actor`` then puts the export's actor back, frozen:
+    the run finishes with the export's actor and the change logged in run.json."""
+    from so101_rl.rl import train_sac_her as t
+
+    if not M6_POLICY.is_file():
+        pytest.skip(f"the M6 policy export is not on this host ({M6_POLICY})")
+    step = t.HaltOnTrip.step
+
+    def failing(self, action):  # training episodes only (the evals run on the unwrapped env)
+        obs, r, term, trunc, info = step(self, action)
+        info["is_success"] = False
+        return obs, r, term, trunc, info
+
+    monkeypatch.setattr(t.HaltOnTrip, "step", failing)
+    code = t.main(["--init-from", str(M6_POLICY), "--total-steps", "3000", "--learning-starts", "50",
+                   "--warmup-frozen-actor", "0", "--baseline-eval-every", "100000", "--eval-episodes", "2",
+                   "--train-window", "2", "--out-root", str(tmp_path)])  # fmt: skip
+    assert code == t.EXIT_HALTED
+    (run,) = tmp_path.iterdir()
+    summary = json.loads((run / "summary.json").read_text())
+    assert summary["halt_reason"] == "rollback_limit" and summary["anchor_weight"] == 0.4
+    rollbacks = [json.loads(x) for x in (run / "rollbacks.jsonl").read_text().splitlines()]
+    assert [r["reason"] for r in rollbacks] == ["train_window"] * 3 and all(r["to_step"] == 0 for r in rollbacks)
+    monkeypatch.setattr(t.HaltOnTrip, "step", step)
+    done = summary["steps_done"]
+    assert t.main(["--resume", str(run), "--reset-actor", "--total-steps", str(done + 150)]) == t.EXIT_OK
+    run_json = json.loads((run / "run.json").read_text())
+    (change,) = run_json["recipe_changes"]
+    assert change["reset_actor"] and change["at_step"] == done and run_json["warmup_frozen_actor"] == 5000
+    x = np.random.default_rng(2).standard_normal((50, 24)).astype(np.float32)
+    np.testing.assert_allclose(load_policy(run / "policy_export.pt")(x), load_policy(M6_POLICY)(x), atol=1e-5)
