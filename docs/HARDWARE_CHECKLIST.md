@@ -499,12 +499,15 @@ reads in a row), a firmware overload / overcurrent bit, a blocked joint (trackin
      `policy step gap` lines (plan §10 2026-10-13).
   4. Resume: the trainer first, `pixi run train-reach-sac --resume runs/sac-her/<ts> --attended`, then the servo
      again (step 2, new tick-log name). Repeat until `--total-steps` (exit 0).
+     Run `20261012-191349-203e` (collapsed at step ~4060 under the old recipe): resume it ONCE with `--reset-actor`
+     (plan §10 2026-10-13 "Anchored fine-tuning"), later resumes without it.
   5. Cut power at once on any contact with the table, the camera mount or a cable, on shaking, or on any motion you
      did not expect; then resume from step 4.
-  6. Every eval is in `evals.jsonl`; a rollback (two evals below baseline − 0.15) restores the best policy. Review
+  6. Every eval is in `evals.jsonl`; a rollback (two evals below baseline − 0.15, a tripped eval, or the last 10
+     training episodes below baseline − 0.15) restores the best actor (`rollbacks.jsonl`); the 3rd in a session ends it. Review
      trigger (plan §5): success below 10 % after 40k steps, or no drop in the mean final distance over 3 evals.
 - **Artifact:** `runs/sac-her/<ts>/{model.zip, replay_buffer.pkl, baseline.json, evals.jsonl, best_policy.pt,
-  policy_export.pt, sessions.jsonl, timing.jsonl, summary.json}` and the servo tick logs.
+  policy_export.pt, sessions.jsonl, timing.jsonl, rollbacks.jsonl, summary.json}` and the servo tick logs.
 - **Pass:** `--total-steps` reached (exit 0); then the fine-tuned `policy_export.pt` evaluated with `deploy-policy`
   (HS4 procedure, the same seed) against the HS4 result. Fill the results table.
 - **Shown-to-fail:** step 1 without `--attended` against the feetech servo must refuse (exit 2) with no motion.
