@@ -494,7 +494,9 @@ reads in a row), a firmware overload / overcurrent bit, a blocked joint (trackin
      100-step episodes with the updates in between (the arm holds still at the start pose for ~1 s while they run).
   3. A session ends by itself after 20 min (`session_cap`, the thermal duty cycle), or on any trip / stall / failed
      reset. Everything is saved; the servo safe-stops the arm to rest. Wait 10 min (cool-down) after a
-     `session_cap`; after a trip, look at the cause first (servo summary `fault_bits`, the trainer's `halt`).
+     `session_cap`; after a trip, look at the cause first (servo summary `fault_bits`, the trainer's `halt`). A STALE_CMD
+     (`0x100`) halt means the trainer stopped sending: send `timing.jsonl` and the trainer's `keep-alive starved` /
+     `policy step gap` lines (plan §10 2026-10-13).
   4. Resume: the trainer first, `pixi run train-reach-sac --resume runs/sac-her/<ts> --attended`, then the servo
      again (step 2, new tick-log name). Repeat until `--total-steps` (exit 0).
   5. Cut power at once on any contact with the table, the camera mount or a cable, on shaking, or on any motion you
@@ -502,7 +504,7 @@ reads in a row), a firmware overload / overcurrent bit, a blocked joint (trackin
   6. Every eval is in `evals.jsonl`; a rollback (two evals below baseline − 0.15) restores the best policy. Review
      trigger (plan §5): success below 10 % after 40k steps, or no drop in the mean final distance over 3 evals.
 - **Artifact:** `runs/sac-her/<ts>/{model.zip, replay_buffer.pkl, baseline.json, evals.jsonl, best_policy.pt,
-  policy_export.pt, sessions.jsonl, summary.json}` and the servo tick logs.
+  policy_export.pt, sessions.jsonl, timing.jsonl, summary.json}` and the servo tick logs.
 - **Pass:** `--total-steps` reached (exit 0); then the fine-tuned `policy_export.pt` evaluated with `deploy-policy`
   (HS4 procedure, the same seed) against the HS4 result. Fill the results table.
 - **Shown-to-fail:** step 1 without `--attended` against the feetech servo must refuse (exit 2) with no motion.

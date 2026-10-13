@@ -31,8 +31,15 @@
   total unless given.
 * **Outputs** ``<out-root>/<ts>/``: ``model.zip``, ``replay_buffer.pkl``, ``monitor.csv`` (sim), ``baseline.json``,
   ``evals.jsonl``, ``best_policy.pt``, ``policy_export.pt`` (the current actor, deployable), ``sessions.jsonl`` (one
-  line per session) and ``summary.json``. Exit 2 on a refusal (``--total-steps`` < 1, a bad export, no servo, the real
+  line per session), ``timing.jsonl`` (one line per collect/update cycle, below) and ``summary.json``. Exit 2 on a refusal (``--total-steps`` < 1, a bad export, no servo, the real
   arm without ``--attended``).
+* **Timing** (``timing.jsonl``, plan §10 2026-10-13 "Trainer stall diagnostics"): per cycle the episode's longest gap
+  between two policy steps, the eval time, the gap from the episode's last step to the first keep-alive HOLD, the
+  update time, every keep-alive HOLD gap above the servo's stale-command limit (the helper thread was starved) and
+  ``updates_to_first_step_s`` (the previous cycle's updates to this episode's first step). A gap above
+  ``STALL_WARN_S`` is also printed.
+  ``--torch-threads`` (default 4) caps PyTorch's CPU threads so the updates leave cores for the keep-alive thread and
+  the servo process.
 """
 
 from __future__ import annotations
@@ -58,6 +65,7 @@ EXIT_REFUSED: Final[int] = 2
 EXIT_INTERRUPTED: Final[int] = 130
 ARTIFACTS: Final[tuple[str, ...]] = ("model.zip", "replay_buffer.pkl", "baseline.json", "evals.jsonl", "best_policy.pt",
                                      "policy_export.pt", "sessions.jsonl", "summary.json")  # fmt: skip
+STALL_WARN_S: Final[float] = 0.3  # a send gap this long is printed (servo: HOLD after 0.15 s, SAFE_STOPPING ~0.5 s)
 RUN_KEYS: Final[tuple[str, ...]] = ("init_from", "seed", "eval_seed", "eval_episodes", "total_steps",
                                     "warmup_frozen_actor", "learning_starts", "baseline_eval_every",
                                     "rollback_margin", "backend")  # fmt: skip
@@ -157,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rollback-margin", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--torch-threads", type=int, default=4, help="PyTorch CPU threads (leave cores for the servo)")
     ap.add_argument("--out-root", type=Path, default=Path("runs/sac-her"))
     shm = ap.add_argument_group("shm backend (an already-running servo)")
     shm.add_argument("--attended", action="store_true", help="required on the real arm: a human at the power switch")
@@ -242,6 +251,7 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
     )
 
     torch.manual_seed(int(run["seed"]))
+    torch.set_num_threads(max(1, int(args.torch_threads)))
     backend: Any = None
     model: Any = None
     baseline: dict[str, Any] | None = None
@@ -336,10 +346,27 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                 super().__init__()
                 every = int(run["baseline_eval_every"])
                 self.next_at = (model.num_timesteps // every + 1) * every
+                self.cyc: dict[str, Any] = {}
+                self.late: list[float] = []  # appended by the keep-alive thread
+                self.t_step: float | None = None  # last policy step (on_step)
+                self.t_hold: float | None = None  # keep-alive start
+                self.t_upd_end: float | None = None  # end of the updates (on_rollout_start)
 
             def _on_step(self) -> bool:
+                now = time.monotonic()
+                if self.t_step is not None:
+                    gap = now - self.t_step
+                    if self.t_upd_end is not None:  # the first step after the updates (includes its own 0.1 s wait)
+                        self.cyc["updates_to_first_step_s"] = round(now - self.t_upd_end, 4)
+                        self.t_upd_end = None
+                    else:
+                        self.cyc["max_step_gap_s"] = round(max(self.cyc.get("max_step_gap_s", 0.0), gap), 4)
+                    if gap > STALL_WARN_S + 0.1:
+                        _log(f"policy step gap {gap:.2f} s at step {self.num_timesteps} (servo HOLD after 0.15 s)")
+                self.t_step = now
                 if self.locals["infos"][0].get("halted"):  # a halted env's step: not stored, the loop ends here
                     model.num_timesteps -= 1  # SB3 counted it before this callback; it never reached the servo
+                    self._flush()
                     return False
                 return True
 
@@ -351,12 +378,35 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                     return
                 if self.num_timesteps >= self.next_at:
                     self.next_at += int(run["baseline_eval_every"])
+                    t = time.monotonic()
                     self._eval()
+                    self.cyc["eval_s"] = round(time.monotonic() - t, 3)
+                    self.t_step = None  # the eval episodes sent the commands meanwhile
                 if run["backend"] == "shm" and not env.halted:
-                    keepalive.enter_context(dp.hold_keepalive(backend))  # the updates run now
+                    self.t_hold = time.monotonic()
+                    if self.t_step is not None:
+                        self.cyc["last_step_to_hold_s"] = round(self.t_hold - self.t_step, 4)
+                    keepalive.enter_context(dp.hold_keepalive(backend, on_late=self.late.append))  # the updates run now
 
             def _on_rollout_start(self) -> None:
                 keepalive.close()
+                now = time.monotonic()
+                if self.t_hold is not None:
+                    self.cyc["updates_s"] = round(now - self.t_hold, 3)
+                    self.t_hold = None
+                    self.t_upd_end = now
+                    if self.late:
+                        _log(f"keep-alive starved: HOLD gaps {[round(g, 2) for g in self.late]} s during the updates")
+                self._flush()
+
+            def _flush(self) -> None:
+                """Write the finished cycle (the previous episode, its eval and updates) to ``timing.jsonl``."""
+                if self.late:
+                    self.cyc["keepalive_late_s"] = [round(g, 3) for g in self.late]
+                    self.late.clear()
+                if self.cyc:
+                    _append_jsonl(out / "timing.jsonl", {"step": int(self.num_timesteps), **self.cyc})
+                self.cyc = {}
 
             def _eval(self) -> None:
                 try:
