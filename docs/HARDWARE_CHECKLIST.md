@@ -518,5 +518,6 @@ arm torque-off for the user.
 - **5 mm (plan §10 2026-10-14):** the 15 mm run is stopped (the zero-shot actor is at the ceiling). The next run starts
   from a sim policy trained at 5 mm (`train-sim-sac ... --success-radius-mm 5`) and adds `--success-radius-mm 5` to
   step 1 (new run only; resumes keep it). Episodes that miss 5 mm run the full 100 steps (10 s). Compare final
-  errors (`final_error_m_p50` in `evals.jsonl`), not only the success rate. `deploy-policy` still scores at 15 mm.
+  errors (`final_error_m_p50` in `evals.jsonl`), not only the success rate. `deploy-policy` scores at the export's radius
+  (the 5 mm sim export: 5 mm; M6: 15 mm), so its zero-shot ladder (8/10 per rung) is a 5 mm check for a 5 mm policy.
 - **Shown-to-fail:** step 1 without `--attended` against the feetech servo must refuse (exit 2) with no motion.

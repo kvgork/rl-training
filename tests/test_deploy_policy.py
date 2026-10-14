@@ -407,6 +407,33 @@ def _episode_segments(log: list[str]) -> list[list[str]]:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(300)
+def test_the_exports_success_radius_is_the_episode_predicate(tmp_path, command_log, monkeypatch):  # noqa: F811
+    """An export with ``success_radius_mm`` (plan §10 2026-10-14) is scored and terminated at that radius: at 0.1 mm
+    no episode succeeds and each runs to the step limit; the summary records the radius."""
+    from so101_rl.env.goal_env import So101GoalEnv
+
+    init = So101GoalEnv.__init__
+
+    def short_init(self, *a, **k):
+        init(self, *a, **k)
+        self.task = __import__("dataclasses").replace(self.task, episode_steps=5)
+
+    monkeypatch.setattr(So101GoalEnv, "__init__", short_init)
+    servo = ServoChild(tmp_path, "mujoco")
+    try:
+        code = dp.main(["--policy", str(_export(tmp_path / "p.pt", success_radius_mm=0.1)), "--shm-name", servo.name,
+                        "--out-root", str(tmp_path / "deploy"), "--episodes", "2", "--wait-servo-s", "120"])  # fmt: skip
+    finally:
+        assert servo.stop() == 0
+    assert code == dp.EXIT_OK
+    (run,) = (tmp_path / "deploy").iterdir()
+    eps = [json.loads(line) for line in (run / "episodes.jsonl").read_text().splitlines()]
+    assert [(e["success"], e["steps"]) for e in eps] == [(False, 5), (False, 5)]
+    assert json.loads((run / "summary.json").read_text())["success_radius_m"] == pytest.approx(1e-4)
+
+
+@pytest.mark.slow
 @pytest.mark.timeout(400)
 def test_mujoco_end_to_end_with_the_m6_policy(tmp_path, command_log, capsys):
     if not M6_POLICY.is_file():

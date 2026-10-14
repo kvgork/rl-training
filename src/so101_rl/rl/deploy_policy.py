@@ -9,7 +9,8 @@ starts ``servo --backend feetech`` (Tier 0, attended); in tests and for the sim 
 This script never starts a servo and never opens a serial device; it only writes shm commands.
 
 Everything that sim and real must agree on is the env's: the FS3 observation, ``tasks.action_to_delta_np``, the
-reach goal rule (``BoxGoalSampler`` with the near-start redraw) and the success / termination predicate. The policy
+reach goal rule (``BoxGoalSampler`` with the near-start redraw) and the success / termination predicate (at the
+export's ``success_radius_mm`` when it records one, else REACH's 15 mm; plan §10 2026-10-14). The policy
 input is ``observation ++ desired_goal`` (as ``eval_sim``); the action is ``policy(x) * speed_scale`` (the ladder
 scales the delta magnitude; the env then clips and maps it).
 
@@ -121,7 +122,8 @@ EXIT_OK, EXIT_HALTED, EXIT_REFUSED, EXIT_INTERRUPTED = 0, 1, 2, 130
 SERVO_MARKERS: Final[tuple[str, ...]] = ("so101_rl.servo.main", "so101-servo")
 # summary.json keys that describe the run as a whole (kept across resumes); the rest describe the latest invocation
 RUN_META_KEYS: Final[tuple[str, ...]] = (
-    "policy", "policy_meta", "task", "protocol", "plan", "seed", "attended", "servo", "config", "calibration",
+    "policy", "policy_meta", "task", "success_radius_m", "protocol", "plan", "seed", "attended", "servo", "config",
+    "calibration",
     "calibration_sha256", "calibration_changed_since_training", "tick_log", "started", "goals", "resumes",
 )  # fmt: skip
 
@@ -752,6 +754,8 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         except (ValueError, KeyError, RuntimeError, OSError) as exc:
             raise Refused(f"cannot use policy {args.policy}: {exc}") from None
         check_policy(policy, REACH)
+        radius_mm = policy.meta.get("success_radius_mm")  # the radius the policy was trained at (plan §10 2026-10-14)
+        task = REACH if radius_mm is None else dataclasses.replace(REACH, success_radius_m=float(radius_mm) / 1000.0)
         shm_name = args.shm_name or str(_yaml_key(args.config or DEFAULT_CONFIG_PATH, "shm_name"))
         rs = resolve_servo(shm_name, wait_s=args.wait_servo_s, attended=args.attended,
                            accept_no_watchdog=args.accept_no_watchdog, config=args.config,
@@ -790,6 +794,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
             "policy": str(args.policy.resolve()),
             "policy_meta": {k: v for k, v in policy.meta.items() if isinstance(v, (str, int, float, list, type(None)))},
             "task": REACH.name,
+            "success_radius_m": task.success_radius_m,
             "protocol": args.protocol,
             "plan": [{"speed": s, "episodes": n} for s, n in plan],
             "seed": args.seed,
@@ -847,7 +852,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         return EXIT_REFUSED
     keepalive.enter_context(hold_keepalive(backend))
     try:
-        pairs = draw_goal_pairs(BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0), args.seed,
+        pairs = draw_goal_pairs(BoxGoalSampler(task.goal_bounds, fk=fk, limits=cfg.joints, seed=0), args.seed,
                                 len(schedule))  # fmt: skip
         if orig is not None:
             if not np.allclose(np.asarray(orig["goals"]["pairs"], float), pairs, atol=1e-9):
@@ -858,7 +863,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
             meta["goals"] = {"seed": args.seed, "rule": "per episode (first draw, redraw) from default_rng(seed); the "
                              "redraw is used if the first is within 2 success radii of the measured start tip",
                              "pairs": pairs.tolist()}  # fmt: skip
-        env = So101GoalEnv(backend, cfg, REACH, goal_sampler=GoalList(pairs))
+        env = So101GoalEnv(backend, cfg, task, goal_sampler=GoalList(pairs))
         out.mkdir(parents=True, exist_ok=orig is not None)
         _write_json(out / "summary.json", _doc(None))  # before RUN: a resumable record even if killed
         if servo.tick_log is None:
