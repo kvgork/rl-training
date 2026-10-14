@@ -4,9 +4,9 @@
 ``train-reach-sac --resume <run dir> [--total-steps N] [--attended] [--reset-actor]``
 
 * **Task:** ``REACH`` with the success radius ``--success-radius-mm`` (new run only, stored in ``run.json``; default
-  the task's 15 mm). HS5 ended with the zero-shot actor at the 15 mm ceiling (plan §10 2026-10-14 "Fine-tune success
-  radius 5 mm"), so a real-arm fine-tune runs at 5 mm: the radius sets the success predicate, the reward's success
-  term and episode termination (and HER's relabelled reward), never the eval goals.
+  the task's 15 mm). HS5 stopped with the zero-shot actor at the 15 mm ceiling, so the next real-arm run uses 5 mm
+  (plan §10 2026-10-14 "Reach success radius 5 mm, sim first"): the radius sets the success predicate, the reward's
+  success term and episode termination (and HER's relabelled reward), never the eval goals.
 * **Model:** :class:`~so101_rl.rl.sb3_bridge.FinetuneSAC` on ``So101GoalEnv(task)``, the export's actor copied in
   (critics fresh), ``HerReplayBuffer`` (4 sampled goals, ``future``, the info dicts kept: the relabelled reward reads
   the trip bits), critic lr 1e-4, batch 256, ``gamma`` = the task's, ``tau`` 0.005, ``learning_starts`` 2000.
