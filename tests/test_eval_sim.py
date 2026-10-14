@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from so101_rl.rl import eval_sim, train_sim_sac
 from so101_rl.rl.eval_sim import gate_verdict, wilson_interval
@@ -35,7 +36,7 @@ def test_gate_fails_at_94pct_and_passes_at_97():
 
 @pytest.fixture
 def toy(monkeypatch):
-    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None):
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
         return ToyBatchedReachEnv(nworld, seed=seed)
 
     monkeypatch.setattr(eval_sim, "build_env", build)
@@ -73,7 +74,7 @@ def test_calibration_change_since_training_is_flagged(toy_ckpt, tmp_path, monkey
     torch.save(d, toy_ckpt)
     for env_sha, changed in (("a" * 64, False), ("b" * 64, True), (None, None)):
 
-        def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, sha=env_sha):
+        def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None, sha=env_sha):
             env = ToyBatchedReachEnv(nworld, seed=seed)
             env.metadata = {"calibration_sha256": sha}
             return env
@@ -85,6 +86,31 @@ def test_calibration_change_since_training_is_flagged(toy_ckpt, tmp_path, monkey
         else:
             res = eval_sim.evaluate(toy_ckpt, "reach", episodes=8, dr_stage=0, out_dir=tmp_path / "ev")
         assert json.loads(res.eval_json.read_text())["calibration_changed_since_training"] is changed
+
+
+def test_success_radius_reaches_the_env_through_the_checkpoint(toy, tmp_path, monkeypatch):
+    """A run's ``success_radius_mm`` (plan §10 2026-10-14) is passed to every env the trainer and ``evaluate`` build,
+    and lands in the export's meta."""
+    from so101_rl.rl.policy_export import export_policy
+
+    seen: list[float | None] = []
+
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
+        seen.append(success_radius_mm)
+        return ToyBatchedReachEnv(nworld, seed=seed)
+
+    monkeypatch.setattr(eval_sim, "build_env", build)
+    cfg = train_sim_sac.load_sim_sac_config({
+        "task": "reach", "nworld": 32, "budget_min": 5.0, "seed": 0, "dr_max_stage": 0, "eval_every_steps": 32 * 30,
+        "eval_episodes": 32, "log_every_steps": 32 * 10, "max_env_steps": 32 * 30, "batch_size": 128,
+        "grad_steps_per_env_step": 1, "warmup_steps": 5, "replay_capacity": 10_000, "tensorboard": False,
+        "success_radius_mm": 5.0,
+    })  # fmt: skip
+    ckpt = train_sim_sac.run_training(cfg, tmp_path / "run").last_ckpt
+    eval_sim.evaluate(ckpt, "reach", episodes=10, dr_stage=0, out_dir=tmp_path / "ev")
+    assert seen and set(seen) == {5.0}
+    export_policy(ckpt, tmp_path / "p.pt")
+    assert torch.load(tmp_path / "p.pt", weights_only=False)["success_radius_mm"] == 5.0
 
 
 def test_run_episodes_counts_each_world_once():

@@ -26,6 +26,7 @@ if "mujoco" not in sys.modules:  # headless renders (viz/video.py); must precede
 
 import argparse
 import hashlib
+import dataclasses
 import json
 import math
 import subprocess
@@ -126,10 +127,12 @@ def build_env(
     calibration: str | None = None,
     sim_params: str = "calib/sim_params.yaml",
     device: str | None = None,
+    success_radius_mm: float | None = None,
 ) -> Any:
     """The batched reach env with the reach DR stages around ``sim_params`` (the v0 MJCF prior is accepted for
     reach, plan S4.5; its release is recorded). Needs CUDA. The training loop builds its envs through this
-    function too (tests replace it with the toy env)."""
+    function too (tests replace it with the toy env). ``success_radius_mm`` replaces REACH's 15 mm success radius
+    (plan §10 2026-10-14; None = the task's)."""
     if task not in TASKS:
         raise ValueError(f"task {task!r} is not trainable in the MVP (only {TASKS})")
     dev = device or "cuda:0"
@@ -152,10 +155,12 @@ def build_env(
     spf = read_sim_params_file(Path(sim_params), allow_unverified=True)
     model = load_model()[0]
     rnd = DomainRandomizer(spf.params, spf.dr, nworld, stage=stage, seed=seed + 1, device=dev)
-    env = BatchedGoalEnv(cfg, cal, REACH, nworld, sim_params=spf.params, randomizer=rnd, model=model, seed=seed, device=dev)
+    task_spec = REACH if success_radius_mm is None else dataclasses.replace(REACH, success_radius_m=success_radius_mm / 1000.0)
+    env = BatchedGoalEnv(cfg, cal, task_spec, nworld, sim_params=spf.params, randomizer=rnd, model=model, seed=seed, device=dev)
     env.metadata.update({
         "calibration": str(cal_path), "calibration_sha256": _sha256(cal_path), "sim_params": str(sim_params), "sim_params_release": spf.meta.version,
         "sim_params_verified": not spf.meta.verification_problems(MAX_RMS_PCT), "camera_pose_method": CAMERA_POSE_METHOD_REACH,
+        "success_radius_m": task_spec.success_radius_m,
     })  # fmt: skip
     return env
 
@@ -340,7 +345,8 @@ def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Pa
     t0 = time.monotonic()
     env = build_env(task, min(int(episodes), int(run_cfg.get("nworld", 1024)), 1024), stage=int(dr_stage),
                     seed=int(run_cfg.get("seed", 0)) + 7777, calibration=run_cfg.get("calibration"),
-                    sim_params=run_cfg.get("sim_params", "calib/sim_params.yaml"))  # fmt: skip
+                    sim_params=run_cfg.get("sim_params", "calib/sim_params.yaml"),
+                    success_radius_mm=run_cfg.get("success_radius_mm"))  # fmt: skip
     try:
         actor = actor_from_checkpoint(d, env.device)
         stats = run_episodes(env, actor, episodes)
@@ -385,7 +391,8 @@ def _render(d: dict, actor: Any, task: str, k: int, stage: int, run_cfg: dict, o
     from so101_rl.viz.video import d435_camera_pose, record_rollout
 
     env = build_env(task, k, stage=stage, seed=int(run_cfg.get("seed", 0)) + 8888, calibration=run_cfg.get("calibration"),
-                    sim_params=run_cfg.get("sim_params", "calib/sim_params.yaml"))  # fmt: skip
+                    sim_params=run_cfg.get("sim_params", "calib/sim_params.yaml"),
+                    success_radius_mm=run_cfg.get("success_radius_mm"))  # fmt: skip
     try:
         actor = actor.to(env.device)
         res = record_rollout(_RenderEnv(env), actor, env_step=int(d.get("env_step", 0)), out_dir=out_dir / "renders",

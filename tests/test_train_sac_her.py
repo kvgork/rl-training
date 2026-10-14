@@ -86,6 +86,48 @@ def test_resume_refuses_a_non_run_dir_and_a_different_backend(tmp_path, capsys):
     assert "--backend sim" in capsys.readouterr().err
 
 
+def test_success_radius_is_fixed_per_run(tmp_path, capsys):
+    """``--success-radius-mm`` (plan §10 2026-10-14): a new run stores it (default REACH's 15 mm), a resume refuses it
+    and a run.json from before the flag reads as 15 mm."""
+    from so101_rl.env.tasks import REACH
+
+    assert t.RADIUS_MM_BEFORE == pytest.approx(REACH.success_radius_m * 1000.0)
+    new = ["--init-from", str(tmp_path / "p.pt"), "--total-steps", "5", "--out-root", str(tmp_path / "out")]
+    run, _out, _ = t._resolve_run(t.build_parser().parse_args(new))
+    assert run["success_radius_mm"] == 15.0
+    run, _out, _ = t._resolve_run(t.build_parser().parse_args([*new, "--success-radius-mm", "5"]))
+    assert run["success_radius_mm"] == 5.0
+    assert t.main([*new, "--success-radius-mm", "0"]) == t.EXIT_REFUSED
+    old = {k: v for k, v in run.items() if k != "success_radius_mm"}
+    (tmp_path / "run.json").write_text(json.dumps(old))
+    (tmp_path / "model.zip").write_text("")
+    run, _out, _ = t._resolve_run(t.build_parser().parse_args(["--resume", str(tmp_path)]))
+    assert run["success_radius_mm"] == 15.0
+    assert t.main(["--resume", str(tmp_path), "--success-radius-mm", "5"]) == t.EXIT_REFUSED
+    assert "fixed for a run" in capsys.readouterr().err
+
+
+def test_sim_run_uses_the_success_radius(tmp_path, monkeypatch):
+    """The env, the HER reward and the baseline eval all see the run's radius: at 0.1 mm nothing succeeds."""
+    from so101_rl.env.goal_env import So101GoalEnv
+
+    _short(monkeypatch)
+    seen: list[float] = []
+    init = So101GoalEnv.__init__
+
+    def spy(self, *a, **k):
+        init(self, *a, **k)
+        seen.append(self.task.success_radius_m)
+
+    monkeypatch.setattr(So101GoalEnv, "__init__", spy)
+    code = t.main(["--init-from", str(_export(tmp_path / "p.pt")), "--total-steps", "20", "--success-radius-mm", "0.1",
+                   "--out-root", str(tmp_path / "out"), *FAST[:-2]])  # fmt: skip
+    assert code == t.EXIT_OK and seen == [pytest.approx(1e-4)]
+    run, summary, _ = _run(tmp_path)
+    assert json.loads((run / "run.json").read_text())["success_radius_mm"] == 0.1
+    assert json.loads((run / "baseline.json").read_text())["success_rate"] == 0.0
+
+
 @pytest.mark.slow
 @pytest.mark.timeout(600)
 def test_shm_session_keeps_the_servo_alive_through_updates_then_caps_and_resumes(tmp_path, command_log, monkeypatch):  # noqa: F811

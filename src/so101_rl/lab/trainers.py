@@ -245,6 +245,7 @@ class FastSacSimTrainer:
         "eval_episodes": Param(int, 1000, 1, 10_000),
         "log_every_steps": Param(int, 50_000, 1_000, 100_000_000),
         "max_env_steps": Param(int, None, 1, 10_000_000_000),  # None: the time budget ends the run
+        "success_radius_mm": Param(float, None, 1.0, 15.0),  # None: the task's 15 mm (plan §10 2026-10-14)
     }
 
     def available(self) -> bool:
