@@ -40,7 +40,7 @@ def toy(monkeypatch):
     from so101_rl.rl import eval_sim, train_sim_sac
     from so101_rl.rl.toy_batched_env import ToyBatchedReachEnv
 
-    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None):
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
         return ToyBatchedReachEnv(nworld, seed=seed)
 
     monkeypatch.setattr(eval_sim, "build_env", build)

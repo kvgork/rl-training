@@ -123,6 +123,7 @@ class SimSacConfig:
     eval_max_fraction: float = 0.1  # defer an eval until evals are <= this fraction of the training time
     keep_ckpts: int = 3  # numbered checkpoints kept (plus ckpt_last.pt and ckpt_best.pt)
     thermal_guard: bool = True  # the trainer's own NVML pause; False under the lab (the job owns the guard)
+    success_radius_mm: float | None = None  # None = the task's (reach 15 mm); plan §10 2026-10-14
 
 
 _REQUIRED: Final[tuple[str, ...]] = ("task", "nworld", "budget_min", "seed")
@@ -134,7 +135,7 @@ _TYPES: Final[dict[str, tuple[type, bool]]] = {  # name -> (type, nullable)
     "grad_steps_per_env_step": (int, False), "warmup_steps": (int, False), "lr": (float, False),
     "gamma": (float, True), "calibration": (str, True), "sim_params": (str, False), "vram_fraction": (float, False),
     "thermal_max_pause_min": (float, False), "tensorboard": (bool, False), "eval_max_fraction": (float, False),
-    "keep_ckpts": (int, False), "thermal_guard": (bool, False),
+    "keep_ckpts": (int, False), "thermal_guard": (bool, False), "success_radius_mm": (float, True),
 }  # fmt: skip
 
 
@@ -219,6 +220,8 @@ def _check_ranges(c: SimSacConfig, where: str) -> None:
               "grad_steps_per_env_step", "keep_ckpts"):  # fmt: skip
         if getattr(c, k) < 1:
             raise bad(f"{k} must be >= 1")
+    if c.success_radius_mm is not None and not (math.isfinite(c.success_radius_mm) and c.success_radius_mm > 0):
+        raise bad("success_radius_mm must be > 0 (or null = the task's)")
     if c.warmup_steps < 0 or (c.max_env_steps is not None and c.max_env_steps < 0):
         raise bad("warmup_steps / max_env_steps must be >= 0")
     if c.replay_capacity < c.nworld:
@@ -401,7 +404,7 @@ def _train(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dict[str, An
     stage = int(ck["dr_stage"]) if ck is not None else cfg.dr_start_stage
     stage = min(stage, cfg.dr_max_stage)
     env = eval_sim.build_env(cfg.task, cfg.nworld, stage=stage, seed=cfg.seed, calibration=cfg.calibration,
-                             sim_params=cfg.sim_params)  # fmt: skip
+                             sim_params=cfg.sim_params, success_radius_mm=cfg.success_radius_mm)  # fmt: skip
     try:
         return _train_with_env(cfg, out_dir, hooks, ck, csvw, env)
     finally:
@@ -546,7 +549,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         nonlocal eval_env
         if eval_env is None:
             eval_env = eval_sim.build_env(cfg.task, min(cfg.eval_episodes, cfg.nworld, 1024), stage=int(env.dr_stage),
-                                          seed=cfg.seed + 1000, calibration=cfg.calibration, sim_params=cfg.sim_params)  # fmt: skip
+                                          seed=cfg.seed + 1000, calibration=cfg.calibration, sim_params=cfg.sim_params,
+                                          success_radius_mm=cfg.success_radius_mm)  # fmt: skip
         if getattr(eval_env, "randomizer", None) is not None:
             eval_env.randomizer.set_stage(int(env.dr_stage))
         sac.actor.eval()
@@ -717,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dr-start-stage", type=int, default=None)
     ap.add_argument("--eval-every-steps", type=int, default=None)
     ap.add_argument("--eval-episodes", type=int, default=None)
+    ap.add_argument("--success-radius-mm", type=float, default=None, help="reach success radius (default the task's 15 mm)")
     ap.add_argument("--calibration", default=None)
     ap.add_argument("--sim-params", default=None)
     ap.add_argument("--out", type=Path, default=None, help="default runs/sac-sim/<task>-<timestamp>/")
@@ -728,7 +733,7 @@ def main(argv: list[str] | None = None) -> int:
 
         raw.update(yaml.safe_load(a.config.read_text()) or {})
     for k in ("task", "nworld", "budget_min", "seed", "dr_max_stage", "dr_start_stage", "eval_every_steps",
-              "eval_episodes", "calibration", "sim_params"):  # fmt: skip
+              "eval_episodes", "calibration", "sim_params", "success_radius_mm"):  # fmt: skip
         v = getattr(a, k)
         if v is not None:
             raw[k] = v

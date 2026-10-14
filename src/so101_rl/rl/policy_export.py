@@ -45,6 +45,7 @@ def export_policy(ckpt: Path, out: Path) -> Path:
         "export_version": EXPORT_VERSION,
         "obs_layout_version": OBS_LAYOUT_VERSION,
         "task_name": str(d["task"]),
+        "success_radius_mm": (d.get("config") or {}).get("success_radius_mm"),  # None = the task's (reach 15 mm)
         "obs_dim": obs_dim,
         "act_dim": act_dim,
         "actor_hidden": [int(h) for h in sac["cfg"]["actor_hidden"]],

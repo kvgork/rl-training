@@ -3,7 +3,11 @@
 ``train-reach-sac --init-from <policy_export.pt> --backend {sim,shm} --total-steps N [--attended]``
 ``train-reach-sac --resume <run dir> [--total-steps N] [--attended] [--reset-actor]``
 
-* **Model:** :class:`~so101_rl.rl.sb3_bridge.FinetuneSAC` on ``So101GoalEnv(REACH)``, the export's actor copied in
+* **Task:** ``REACH`` with the success radius ``--success-radius-mm`` (new run only, stored in ``run.json``; default
+  the task's 15 mm). HS5 ended with the zero-shot actor at the 15 mm ceiling (plan §10 2026-10-14 "Fine-tune success
+  radius 5 mm"), so a real-arm fine-tune runs at 5 mm: the radius sets the success predicate, the reward's success
+  term and episode termination (and HER's relabelled reward), never the eval goals.
+* **Model:** :class:`~so101_rl.rl.sb3_bridge.FinetuneSAC` on ``So101GoalEnv(task)``, the export's actor copied in
   (critics fresh), ``HerReplayBuffer`` (4 sampled goals, ``future``, the info dicts kept: the relabelled reward reads
   the trip bits), critic lr 1e-4, batch 256, ``gamma`` = the task's, ``tau`` 0.005, ``learning_starts`` 2000.
   Updates run **between episodes** (``train_freq=(1, "episode")``, one gradient step per collected step), never inside
@@ -42,7 +46,7 @@
   ``evals.jsonl``, ``best_policy.pt``, ``policy_export.pt`` (the current actor, deployable), ``sessions.jsonl`` (one
   line per session), ``timing.jsonl`` (one line per collect/update cycle, below), ``rollbacks.jsonl`` and ``summary.json``. Exit 2 on a
   refusal (``--total-steps`` < 1, a bad export, no servo, the real arm without ``--attended``, ``--reset-actor``
-  without ``--resume``).
+  or ``--success-radius-mm`` with ``--resume``, a radius <= 0).
 * **Timing** (``timing.jsonl``, plan §10 2026-10-13 "Trainer stall diagnostics"): per cycle the episode's longest gap
   between two policy steps (``reset_step_s``: the episode's last step, which includes the auto-reset ramp), the eval
   time, the gap from the episode's last step to the first keep-alive HOLD, the
@@ -58,6 +62,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import dataclasses
 import json
 import os
 import signal
@@ -78,7 +83,9 @@ ARTIFACTS: Final[tuple[str, ...]] = ("model.zip", "replay_buffer.pkl", "baseline
                                      "policy_export.pt", "sessions.jsonl", "summary.json")  # fmt: skip
 STALL_WARN_S: Final[float] = 0.3  # a send gap this long is printed (servo: HOLD after 0.15 s, SAFE_STOPPING ~0.5 s)
 RUN_KEYS: Final[tuple[str, ...]] = ("init_from", "seed", "eval_seed", "eval_episodes", "total_steps",
-                                    "learning_starts", "baseline_eval_every", "backend")  # fmt: skip
+                                    "learning_starts", "baseline_eval_every", "backend",
+                                    "success_radius_mm")  # fmt: skip
+RADIUS_MM_BEFORE: Final[float] = 15.0  # run.json without success_radius_mm (runs before 2026-10-14): REACH's
 # plan §10 2026-10-13 "Anchored fine-tuning"; stored in run.json, a flag given on --resume replaces the stored value
 RECIPE_DEFAULTS: Final[dict[str, Any]] = {"warmup_frozen_actor": 5000, "actor_lr": 1e-5, "anchor_weight": 0.4,
                                           "ent_coef": 0.01, "rollback_margin": 0.15, "train_window": 10,
@@ -179,6 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--rollback-margin", type=float, default=None)
     rec.add_argument("--train-window", type=int, default=None, help="training episodes in the rollback window")
     rec.add_argument("--max-rollbacks", type=int, default=None, help="per session; reaching it ends the session")
+    ap.add_argument("--success-radius-mm", type=float, default=None,
+                    help="new run only: reach success radius (default the task's 15 mm)")
     ap.add_argument("--reset-actor", action="store_true", help="--resume only: the export's actor back, frozen again")
     ap.add_argument("--learning-starts", type=int, default=2000)
     ap.add_argument("--baseline-eval-every", type=int, default=1000)
@@ -227,6 +236,10 @@ def _resolve_run(args: argparse.Namespace) -> tuple[dict[str, Any], Path, bool]:
         run = {k: getattr(args, k) for k in RUN_KEYS}
         run["init_from"] = str(args.init_from.resolve())
         run["backend"] = args.backend or "sim"
+        if args.success_radius_mm is None:
+            run["success_radius_mm"] = RADIUS_MM_BEFORE
+        elif not args.success_radius_mm > 0:
+            raise ValueError("--success-radius-mm must be > 0")
         run.update({k: d if getattr(args, k) is None else getattr(args, k) for k, d in RECIPE_DEFAULTS.items()})
         out = args.out_root / f"{datetime.now().astimezone():%Y%m%d-%H%M%S}-{os.urandom(2).hex()}"
         return run, out, False
@@ -234,6 +247,9 @@ def _resolve_run(args: argparse.Namespace) -> tuple[dict[str, Any], Path, bool]:
     if not (out / "run.json").is_file() or not (out / "model.zip").is_file():
         raise ValueError(f"--resume {out}: not a train-reach-sac run dir (run.json / model.zip missing)")
     run = json.loads((out / "run.json").read_text())
+    if args.success_radius_mm is not None:
+        raise ValueError("--success-radius-mm is fixed for a run (new run only)")
+    run.setdefault("success_radius_mm", RADIUS_MM_BEFORE)
     if args.backend is not None and args.backend != run["backend"]:
         raise ValueError(f"--resume: the run used --backend {run['backend']}, not {args.backend}")
     if args.total_steps is not None:
@@ -332,10 +348,11 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
             session_s = float(args.session_s) if args.session_s is not None else float("inf")
         session["session_s"] = session_s
         out.mkdir(parents=True, exist_ok=resuming)
-        genv = So101GoalEnv(backend, cfg, REACH)
+        task = dataclasses.replace(REACH, success_radius_m=float(run["success_radius_mm"]) / 1000.0)
+        genv = So101GoalEnv(backend, cfg, task)
         env = HaltOnTrip(Monitor(genv, str(out / "monitor.csv"), override_existing=not resuming)
                          if run["backend"] == "sim" else genv)  # fmt: skip
-        pairs = dp.draw_goal_pairs(BoxGoalSampler(REACH.goal_bounds, fk=genv._fk, limits=cfg.joints, seed=0),
+        pairs = dp.draw_goal_pairs(BoxGoalSampler(task.goal_bounds, fk=genv._fk, limits=cfg.joints, seed=0),
                                    int(run["eval_seed"]), int(run["eval_episodes"]))  # fmt: skip
         pending = run.pop("_pending_change", None)
         if not resuming:
@@ -358,7 +375,7 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                 # copy_info_dict: the relabelled reward reads the stored info (trip bits -> trip_penalty)
                 replay_buffer_kwargs={"n_sampled_goal": 4, "goal_selection_strategy": "future", "copy_info_dict": True},
                 ent_coef="auto_0.01", learning_rate=1e-4, learning_starts=int(run["learning_starts"]), batch_size=256,
-                gamma=REACH.gamma, tau=0.005, train_freq=(1, "episode"), gradient_steps=-1, seed=int(run["seed"]),
+                gamma=task.gamma, tau=0.005, train_freq=(1, "episode"), gradient_steps=-1, seed=int(run["seed"]),
                 verbose=0, warmup_frozen_actor=int(run["warmup_frozen_actor"]), **kw,
             )  # fmt: skip
             load_actor_into_sb3(model, init)
@@ -384,7 +401,8 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
             (out / "evals.jsonl").touch()
             best = {"success_rate": baseline["success_rate"], "state": copy.deepcopy(model.policy.state_dict()),
                     "step": 0}  # fmt: skip
-            _log(f"baseline: {baseline['success_rate']:.2f} success over {baseline['n']} episodes")
+            _log(f"baseline: {baseline['success_rate']:.2f} success over {baseline['n']} episodes "
+                 f"(radius {run['success_radius_mm']:g} mm)")
             if baseline["halted"]:
                 env.halt("eval_trip", "a baseline eval episode tripped or stalled")
         session["start_step"] = int(model.num_timesteps)

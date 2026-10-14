@@ -29,7 +29,7 @@ CAL = str(ROOT / "tests/data/so101_follower.calib.json")
 
 @pytest.fixture
 def toy(monkeypatch):
-    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None):
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
         return ToyBatchedReachEnv(nworld, seed=seed)
 
     monkeypatch.setattr(eval_sim, "build_env", build)
@@ -87,6 +87,11 @@ def test_config_strict(tmp_path):
             load_sim_sac_config({"task": "reach", "nworld": 8, "budget_min": 1, "seed": 0, **bad})
     with pytest.raises(TypeError):
         load_sim_sac_config({"task": "reach", "nworld": 8, "budget_min": 1, "seed": None})
+    c = load_sim_sac_config({"task": "reach", "nworld": 8, "budget_min": 1, "seed": 0, "success_radius_mm": 5})
+    assert c.success_radius_mm == 5.0 and isinstance(c.success_radius_mm, float)  # plan §10 2026-10-14
+    for bad in (0, -1, math.inf):
+        with pytest.raises(ValueError, match="success_radius_mm"):
+            load_sim_sac_config({"task": "reach", "nworld": 8, "budget_min": 1, "seed": 0, "success_radius_mm": bad})
     y = tmp_path / "c.yaml"
     y.write_text("task: reach\nnworld: 16\nbudget_min: 2.5\nseed: 1\nmax_env_steps: null\n")
     assert load_sim_sac_config(y) == SimSacConfig("reach", 16, 2.5, 1)
