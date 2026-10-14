@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.50 (2026-10-14). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.51 (2026-10-14). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -140,6 +140,7 @@ rl-trainer/
 ├── plans/                        # implementation plans per phase
 ├── scripts/                      # fetch_assets.py, extract_kinematics.py, vendor_tdmpc2.py (reproducible generators),
 │                                 # bench_warp.py (MuJoCo Warp throughput/VRAM/overflow/parity + the S0 gate)
+│                                 # finetune_critic_diag.py, finetune_awr_offline.py, finetune_awr_eval.py (offline, CPU-only fine-tune experiments)
 ├── assets/so101/                 # official TheRobotStudio MJCF (+ licence), jaw primitives, keyframes
 │   └── upstream/                 # fetched unmodified at a pinned commit (UPSTREAM.json holds sha + sha256 per file)
 ├── calib/                        # camera.yaml (THE D435 model: intrinsics + pose, SUC), distractors.yaml (C.5), hand_eye.yaml,
@@ -639,3 +640,4 @@ Bump the version line at the top and add an entry below.
 | 0.48 | 2026-10-13 | **Anchored fine-tuning** (`rl/sb3_bridge.py`, `rl/train_sac_her.py`; plan §10 2026-10-13). `FinetuneSAC` gains `actor_learning_rate`, `fixed_ent_coef`, `anchor_weight` (+ `set_anchor`, `reset_actor`, `rollback_actor`) and its own copy of SB3 2.9 `SAC.train` (a test pins it to SB3's for w = 0). `train-reach-sac`: recipe flags stored in `run.json` (`recipe_changes` on resume), `--reset-actor`, actor-only rollbacks (`rollbacks.jsonl`, `rollback_limit` halt), training-episode rollback window, a missed eval runs after a resume, the reset step is no longer reported as a step gap. §3 "Fine-tuning". |
 | 0.49 | 2026-10-14 | **Reach success radius override** (`rl/train_sim_sac.py`, `rl/eval_sim.py`, `rl/policy_export.py`, `lab/trainers.py`, `rl/train_sac_her.py`; plan §10 2026-10-14). `SimSacConfig.success_radius_mm` (None = REACH's 15 mm; lab `fastsac_sim` param 1–15; `train-sim-sac --success-radius-mm`) goes to every `eval_sim.build_env(..., success_radius_mm=)` call (training, evals, `evaluate` / renders read it from the checkpoint's config), `env.metadata["success_radius_m"]` and the export meta `success_radius_mm`. `train-reach-sac --success-radius-mm` (new run only, `run.json`; a run.json without it reads as 15 mm). HS5 run `20261012-191349-203e` stopped at the 15 mm ceiling. |
 | 0.50 | 2026-10-14 | **deploy-policy at the export's radius** (`rl/deploy_policy.py`; plan §10 2026-10-14). The env's task is REACH with the export meta's `success_radius_mm` (none: 15 mm), so success, termination and the near-start goal redraw use it; `summary.json` records `success_radius_m`. |
+| 0.51 | 2026-10-14 | **Offline fine-tune experiments** (`scripts/finetune_critic_diag.py`, `scripts/finetune_awr_offline.py`, `scripts/finetune_awr_eval.py`; plan §10 2026-10-14 "5 mm fine-tune stopped" / "Offline AWR prototype"): CPU-only scripts over a `train-reach-sac` run's `model.zip` + `replay_buffer.pkl` that score in the CPU MuJoCo `SimBackend`; no package module changes, no arm. |
