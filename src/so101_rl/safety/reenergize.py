@@ -59,7 +59,7 @@ from so101_rl.servo.timing import Clock
 from . import clamp
 from .calib_check import require_calibration
 from .fk import KinematicChain, So101FK
-from .thermal import CONFIRM_READS, ConsecutiveAbove
+from .thermal import CONFIRM_READS, HotCheck
 from .transit import TransitPlanner
 
 _NS = 1_000_000_000
@@ -132,7 +132,7 @@ def reenergize(
         raise ValueError(f"calibration must contain all {N_JOINTS} joints, got {sorted(calibration)}")
     ids = [c.id for _, c in motors]
     t_entry = clock.monotonic_ns()
-    hot = ConsecutiveAbove(cfg.thermal.trip_c)
+    hot = HotCheck(cfg.thermal.trip_c)
     deadline = t_entry + int(timeout_s * _NS)
     gap_ns = int(heartbeat_gap_s * _NS)
     # With a heartbeat hook the pre-torque phase must reach its first good tick before the MCU times out.
@@ -269,9 +269,10 @@ def _check_start_pose(cfg: So101Config, fk: So101FK, present: np.ndarray) -> Non
     )
 
 
-def _check_temperatures(cfg: So101Config, block: BlockRead, hot: ConsecutiveAbove) -> None:
-    """``hot``: the run's filter, fed once per good read (a joint must read >= trip_c on ``CONFIRM_READS``
-    consecutive reads: the bus returns one-tick spikes, 2026-10-11); a dead sensor (0 / 255) refuses at once."""
+def _check_temperatures(cfg: So101Config, block: BlockRead, hot: HotCheck) -> None:
+    """``hot``: the run's filter, fed once per good read (the median filter, then a joint must read >= trip_c
+    on ``CONFIRM_READS`` consecutive reads: the bus returns spiked reads, 2026-10-11 / 2026-10-15); a dead sensor
+    (0 / 255, raw) refuses at once."""
     t = block.temperature_c
     if bool(np.isin(t, _SENSOR_DEAD).any()) or hot.update(t):
         raise RuntimeError(f"re-energise refused: temperatures {t.tolist()} C (trip {cfg.thermal.trip_c} C)")
@@ -291,7 +292,7 @@ def _ramp_home(
     last_good_ns: int,
     gap_ns: int,
     check_abort: Callable[[], None],
-    hot: ConsecutiveAbove,
+    hot: HotCheck,
 ) -> None:
     home = np.asarray(cfg.safe_state.home_ticks, dtype=np.int32)
     planner = TransitPlanner(fk, cfg.safe_state)

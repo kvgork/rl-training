@@ -8,6 +8,13 @@ Semantics
   Why consecutive: the real bus returns one-tick spikes (26 -> 69 -> 26 C on one joint, 19 in 4400 ticks on
   2026-10-11); real motor heat cannot rise that fast, and the firmware's own over-temperature cut stays the backstop.
   The same rule decides whether a joint is too warm for the cooling dwell (``> resume_c``).
+* **Median filter** (:class:`MedianTemperature`, plan section 10, 2026-10-15): every trip, warm and hottest
+  decision reads the per-joint median of the last ``MEDIAN_READS`` (11, 367 ms) good reads, not the raw byte. The
+  real bus returns spiked reads on one joint (~1 % of reads, 40-150 C, in runs of 1-4 reads; 33 -> 94 -> 98 -> 65 ->
+  33 C on 2026-10-12 tripped through ``CONFIRM_READS``), which a median of 11 removes: replayed over 740k real reads
+  it stays within 2 C of the 1 s median and trips 0 times (the old rule tripped twice). A real temperature change
+  reaches the median after 6 reads (200 ms), far faster than motor heat moves. Until 11 reads exist the median is
+  over the reads so far. The dead-sensor values 0 / 255 bypass the filter (raw) and trip at once.
 * **Latch:** a trip latches. While latched, every ``update`` keeps returning ``THERMAL`` (even if the joint
   oscillates 59 <-> 61), and the trip is counted exactly ONCE. The latch clears only when ``may_resume()`` becomes
   true, i.e. every joint has been ``<= resume_c`` continuously for ``resume_dwell_s`` (hysteresis + dwell, so a
@@ -39,6 +46,39 @@ _SENSOR_UNREAD = 0  # short / never read
 _SENSOR_GARBAGE = 255  # all-ones bus garbage
 _RING = 256
 CONFIRM_READS = 3  # 100 ms at 30 Hz (plan section 10, 2026-10-11)
+MEDIAN_READS = 11  # per-joint median window of the temperature filter (plan section 10, 2026-10-15)
+OUTLIER_C = 3.0  # a raw read this far from the median is counted (diagnostics only)
+
+
+class MedianTemperature:
+    """Per joint: the median of the last ``n`` reads fed to ``update`` (module docstring, median filter). ``update(raw)``
+    returns the filtered temperatures (a view owned by the filter)."""
+
+    def __init__(self, n: int = MEDIAN_READS) -> None:
+        self._buf = np.zeros((int(n), N_JOINTS), dtype=np.float64)
+        self._i = 0
+        self._count = 0
+        self._out = np.zeros(N_JOINTS, dtype=np.float64)
+        self.outliers = np.zeros(N_JOINTS, dtype=np.int64)  # raw reads > OUTLIER_C from the median (diagnostics)
+
+    def update(self, raw: np.ndarray) -> np.ndarray:
+        self._buf[self._i] = raw
+        self._i = (self._i + 1) % len(self._buf)
+        self._count = min(self._count + 1, len(self._buf))
+        np.copyto(self._out, np.median(self._buf[: self._count], axis=0))
+        self.outliers += np.abs(np.asarray(raw, dtype=np.float64) - self._out) > OUTLIER_C
+        return self._out
+
+
+class HotCheck:
+    """``MedianTemperature`` then ``ConsecutiveAbove``: the trip test of one run of reads (re-energise)."""
+
+    def __init__(self, threshold: float) -> None:
+        self._median = MedianTemperature()
+        self._run = ConsecutiveAbove(threshold)
+
+    def update(self, temp_c: np.ndarray) -> bool:
+        return self._run.update(self._median.update(temp_c))
 
 
 class ConsecutiveAbove:
@@ -66,12 +106,18 @@ class ThermalMonitor:
         self._last_good_ns: int | None = None  # no successful read yet: the stale timer has not started
         self._last_update_ns: int | None = None
         self._cool_since_ns: int | None = None
+        self._median = MedianTemperature()
         self._hot = ConsecutiveAbove(cfg.trip_c)
         self._warm = ConsecutiveAbove(cfg.resume_c, strict=True)
         self._trip_times = np.zeros(_RING, dtype=np.int64)
         self._n_trips = 0
         self.hottest_c: float = 0.0
         self.max_seen_c = np.zeros(N_JOINTS, dtype=np.int32)
+
+    @property
+    def outlier_reads(self) -> np.ndarray:
+        """Per joint: raw temperature reads more than ``OUTLIER_C`` from the median (diagnostics, servo summary)."""
+        return self._median.outliers
 
     @property
     def latched(self) -> bool:
@@ -86,14 +132,14 @@ class ThermalMonitor:
 
         if block_ok:
             self._last_good_ns = now
-            tmax = int(temp_c.max())
-            self.hottest_c = float(tmax)
-            np.maximum(self.max_seen_c, temp_c, out=self.max_seen_c)
+            dead = bool((temp_c == _SENSOR_UNREAD).any() or (temp_c == _SENSOR_GARBAGE).any())
+            t = self._median.update(temp_c)
+            self.hottest_c = float(t.max())
+            np.maximum(self.max_seen_c, t.astype(np.int32), out=self.max_seen_c)
             if int(status.max()) != 0:
                 cause |= TripCause.PROTECTION_BIT
-            dead = bool((temp_c == _SENSOR_UNREAD).any() or (temp_c == _SENSOR_GARBAGE).any())
-            hot = self._hot.update(temp_c)
-            warm = self._warm.update(temp_c)
+            hot = self._hot.update(t)
+            warm = self._warm.update(t)
             fault = dead or hot
             if not dead and not warm:
                 if self._cool_since_ns is None:

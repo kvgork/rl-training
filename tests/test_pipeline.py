@@ -12,7 +12,7 @@ from so101_rl.safety import pipeline as pipeline_mod
 from so101_rl.safety.fk import KinematicChain, So101FK
 from so101_rl.safety.pipeline import SafetyPipeline
 from so101_rl.safety.stuck import StuckActionMonitor
-from so101_rl.safety.thermal import CONFIRM_READS, ThermalMonitor
+from so101_rl.safety.thermal import CONFIRM_READS, MEDIAN_READS, ThermalMonitor
 from so101_rl.safety.types import TripCause, Verdict
 from so101_rl.servo.bus import BlockRead
 from so101_rl.servo.timing import FakeClock
@@ -393,13 +393,13 @@ def test_earlier_check_wins_over_a_later_one(rig, cfg):
 def test_monitor_only_feeds_thermal_without_touching_targets(rig):
     goal, prev = rig.pipe.goal.copy(), rig.pipe.prev_target.copy()
     rig.block.temperature_c[1] = 62
-    for _ in range(CONFIRM_READS):
+    for _ in range(MEDIAN_READS // 2 + CONFIRM_READS):  # the median turns hot, then CONFIRM_READS hot values
         v = rig.pipe.monitor_only(rig.block, rig.v)
     assert v.trips == T.THERMAL
     np.testing.assert_array_equal(rig.pipe.goal, goal)
     np.testing.assert_array_equal(rig.pipe.prev_target, prev)
     rig.block.temperature_c[1] = 45
-    for _ in range(31):  # cooldown dwell advances although apply() is never called
+    for _ in range(MEDIAN_READS // 2 + 31):  # cooldown dwell advances although apply() is never called
         rig.clock.advance(10**9)
         rig.pipe.monitor_only(rig.block, rig.v)
     assert rig.thermal.may_resume()

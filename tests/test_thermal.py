@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from so101_rl.config import N_JOINTS, ThermalConfig
-from so101_rl.safety.thermal import CONFIRM_READS, ThermalMonitor
+from so101_rl.safety.thermal import CONFIRM_READS, MEDIAN_READS, OUTLIER_C, HotCheck, MedianTemperature, ThermalMonitor
 from so101_rl.safety.types import TripCause
 from so101_rl.servo.timing import FakeClock
 
@@ -34,11 +34,21 @@ def step(mon, clock, t, *, dt_s=1 / 30, status=ZERO_STATUS, ok=True):
     return mon.update(temps(t) if np.isscalar(t) else t, status, ok)
 
 
+LAG = MEDIAN_READS // 2  # a new level reaches the median on read LAG + 1
+
+
 def trip(mon, clock, t, **kw):
-    """``CONFIRM_READS`` reads of ``t`` in a row (a hot joint trips on the last one); the last result."""
-    for _ in range(CONFIRM_READS - 1):
+    """``LAG + CONFIRM_READS`` reads of ``t`` in a row: enough for any earlier level to leave the median, then
+    ``CONFIRM_READS`` hot medians (a hot joint trips on the last one); the last result."""
+    for _ in range(LAG + CONFIRM_READS - 1):
         step(mon, clock, t, **kw)
     return step(mon, clock, t, **kw)
+
+
+def settle(mon, clock, t, **kw):
+    """``LAG + 1`` reads of ``t``: the median is ``t`` from the last one on."""
+    for _ in range(LAG + 1):
+        step(mon, clock, t, **kw)
 
 
 def test_defaults_match_yaml(cfg):
@@ -49,7 +59,7 @@ def test_ramp_to_59_no_trip_then_60_trips(mon, clock):
     for t in range(30, 60):
         assert step(mon, clock, t) == TripCause.NONE
     assert step(mon, clock, 59) == TripCause.NONE
-    for _ in range(CONFIRM_READS - 1):
+    for _ in range(LAG + CONFIRM_READS - 1):  # the median reaches 60 on read LAG + 1, then CONFIRM_READS of it
         assert step(mon, clock, 60) == TripCause.NONE
     assert step(mon, clock, 60) == TripCause.THERMAL
     assert mon.trips_last_hour() == 1
@@ -96,8 +106,8 @@ def test_no_resume_at_51_and_dwell_is_enforced(mon, clock):
         step(mon, clock, 51, dt_s=0.5)  # 150 s at 51 C
     assert not mon.may_resume()
     assert mon.latched
-    # now cool to exactly resume_c and hold
-    step(mon, clock, 50, dt_s=0.0)
+    # now cool to exactly resume_c and hold (the median is 50 from the last settle read on)
+    settle(mon, clock, 50, dt_s=0.0)
     for _ in range(29):
         step(mon, clock, 50, dt_s=1.0)
     assert not mon.may_resume()  # 29 s
@@ -110,12 +120,12 @@ def test_no_resume_at_51_and_dwell_is_enforced(mon, clock):
 
 def test_dwell_restarts_when_temperature_rises_again(mon, clock):
     trip(mon, clock, 61)
-    step(mon, clock, 50)
+    settle(mon, clock, 50)
     for _ in range(25):
         step(mon, clock, 50, dt_s=1.0)
     step(mon, clock, 52, dt_s=1.0)  # a one-read spike above resume_c does not restart the dwell
-    trip(mon, clock, 52, dt_s=1.0)  # but CONFIRM_READS reads in a row do
-    step(mon, clock, 50, dt_s=1.0)  # cooling restarts here (t0)
+    trip(mon, clock, 52, dt_s=1.0)  # but a held 52 does
+    settle(mon, clock, 50, dt_s=1.0)  # cooling restarts on the last of these (t0)
     for _ in range(29):
         step(mon, clock, 50, dt_s=1.0)
     assert not mon.may_resume()  # 29 s since t0
@@ -135,7 +145,7 @@ def test_oscillation_59_61_is_exactly_one_trip(mon, clock):
 def test_three_trips_in_an_hour_are_counted(mon, clock):
     for _ in range(3):
         trip(mon, clock, 61)
-        step(mon, clock, 40, dt_s=1.0)  # cool
+        settle(mon, clock, 40, dt_s=1.0)  # cool
         step(mon, clock, 40, dt_s=31.0)  # dwell satisfied -> unlatched
         assert not mon.latched
         clock.advance(600 * S)
@@ -233,7 +243,56 @@ def test_protection_bit_and_thermal_combine(mon, clock):
 
 def test_max_seen_tracks_per_joint(mon, clock):
     t = np.array([30, 41, 35, 52, 33, 38], dtype=np.int32)
-    step(mon, clock, t)
-    step(mon, clock, temps(31))
+    settle(mon, clock, t)
+    for _ in range(MEDIAN_READS):
+        step(mon, clock, temps(31))
     np.testing.assert_array_equal(mon.max_seen_c, np.maximum(t, 31))
     assert mon.hottest_c == 31.0
+
+
+# ---------------------------------------------------------------- median filter (plan section 10, 2026-10-15)
+
+
+def test_real_spike_runs_never_trip(mon, clock):
+    """Recorded runs: 33 -> 94 -> 98 -> 65 -> 33 C (tripped THERMAL on 2026-10-12 through CONFIRM_READS alone), a 150 C
+    read (2026-10-14), and a 4-read run (the longest in 740k real reads)."""
+    settle(mon, clock, 33)
+    for run in ([94, 98, 65], [150], [57, 64, 63, 84]):
+        for v in run:
+            t = temps(33)
+            t[0] = v
+            assert step(mon, clock, t) == TripCause.NONE
+        for _ in range(MEDIAN_READS):
+            assert step(mon, clock, 33) == TripCause.NONE
+    assert mon.trips_last_hour() == 0 and not mon.latched
+    assert mon.outlier_reads[0] == 3 + 1 + 4 and mon.outlier_reads[1:].sum() == 0
+
+
+def test_a_held_hot_level_still_trips_within_the_median_lag(mon, clock):
+    settle(mon, clock, 40)
+    t = temps(40)
+    t[2] = 62
+    for _ in range(LAG + CONFIRM_READS - 1):
+        assert step(mon, clock, t) == TripCause.NONE
+    assert step(mon, clock, t) == TripCause.THERMAL
+
+
+def test_dead_sensor_bypasses_the_median(mon, clock):
+    settle(mon, clock, 30)
+    t = temps(30)
+    t[5] = 255
+    assert step(mon, clock, t) == TripCause.THERMAL  # one raw 255 among ten good medians: at once
+
+
+def test_median_filter_before_the_window_fills():
+    f = MedianTemperature()
+    np.testing.assert_array_equal(f.update(temps(30)), temps(30))
+    np.testing.assert_array_equal(f.update(temps(40)), temps(35))
+    assert len(f._buf) == MEDIAN_READS and OUTLIER_C == 3.0
+
+
+def test_hot_check_ignores_a_spike_run_after_good_reads():
+    h = HotCheck(CFG.trip_c)
+    for _ in range(MEDIAN_READS):
+        assert not h.update(temps(30))
+    assert not any(h.update(temps(v)) for v in (94, 98, 65))
