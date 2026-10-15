@@ -155,7 +155,9 @@ def test_torch_sampler_refuses_a_device_mismatch(sampler):
 # ---------------------------------------------------------------- trimmed table + near-start rule (plan §10 2026-10-08)
 def test_the_table_is_trimmed_by_one_voxel_layer(sampler, cfg, fk):
     """The shipped table is the untrimmed one minus its rim: a strict subset, and every kept voxel's 26 neighbours
-    are FK-reachable (in the untrimmed table, wherever the neighbour lies inside the goal bounds)."""
+    are FK-reachable (in the untrimmed table, wherever the neighbour's whole voxel lies inside the goal bounds: a
+    voxel cut by a face or the radius sphere may hold FK samples only on its outside part, which the untrimmed
+    table drops while the padded erosion keeps them)."""
     raw = BoxGoalSampler(REACH.goal_bounds, fk=fk, limits=cfg.joints, seed=0, erode_layers=0)
     kept, full = sampler.keys, raw.keys
     assert np.isin(kept, full).all() and 0.8 * full.size < kept.size < full.size
@@ -165,7 +167,9 @@ def test_the_table_is_trimmed_by_one_voxel_layer(sampler, cfg, fk):
     centre = (np.floor(g / v) + 0.5) * v
     offs = np.array([(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)], np.float64) * v
     nb = (centre[:, None, :] + offs[None]).reshape(-1, 3)
-    inside = REACH.goal_bounds.contains_np(nb)
+    corners = np.array([(a, b, c) for a in (-0.5, 0.5) for b in (-0.5, 0.5) for c in (-0.5, 0.5)]) * v
+    inside = REACH.goal_bounds.contains_np(nb[:, None, :] + corners[None]).all(axis=1)
+    assert inside.mean() > 0.5
     assert raw.reachable(nb[inside]).all()
 
 

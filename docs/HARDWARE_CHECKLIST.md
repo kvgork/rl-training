@@ -523,6 +523,8 @@ arm torque-off for the user.
   step 1 (new run only; resumes keep it). Episodes that miss 5 mm run the full 100 steps (10 s). Compare final
   errors (`final_error_m_p50` in `evals.jsonl`), not only the success rate. `deploy-policy` scores at the export's radius
   (the 5 mm sim export: 5 mm; M6: 15 mm), so its zero-shot ladder (8/10 per rung) is a 5 mm check for a 5 mm policy.
+- **wrist_flex limit (plan §10 2026-10-15):** `joints.max_ticks` wrist_flex is 2960 (real overloads at 2989 / 3013
+  with the elbow flexed). Goal pairs for a seed changed with it: compare runs before and after unpaired.
 - **Before any critic-based fine-tune session (plan §10 2026-10-14):** replay the actor update against the run's
   critic offline and score the moved actor in sim (`scripts/finetune_critic_diag.py`); if it degrades in sim, do not
   unfreeze the actor on the arm. Resume a rolled-back run from `best_policy.pt`, not `model.zip`'s actor.

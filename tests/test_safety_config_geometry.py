@@ -127,6 +127,7 @@ def test_transit_stall_is_rejected_on_its_own(tmp_path, calibration):
         raw["safe_state"]["table_z_m"] = 0.0025
         raw["box"]["floor_above_table_m"] = 0.0075  # box floor z[0] = table + this = 0.010
         raw["safe_state"]["start_min_tip_z_m"] = 0.0125  # >= table + 1 cm (loader rule)
+        raw["joints"]["max_ticks"][3] = 4095  # this rest's wrist_flex (2993) is above the shipped 2960 cap
 
     probs = _problems(tmp_path, calibration, mut)
     assert len(probs) == 1
