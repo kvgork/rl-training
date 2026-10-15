@@ -18,7 +18,7 @@ firmware_max_temp_c: 70.0
 # Config limits; the loader intersects them with the calibration range_min/max (narrowest wins).
 joints:
   min_ticks: [0, 0, 0, 0, 0, 0]
-  max_ticks: [4095, 4095, 4095, 4095, 4095, 4095]
+  max_ticks: [4095, 4095, 4095, 2960, 4095, 4095]   # wrist_flex 2960: real overloads (0x40) at 2989 / 3013 with the elbow flexed (plan §10 2026-10-15)
 
 action:
   max_delta_ticks: [45, 45, 45, 45, 45, 60]            # per 10 Hz command
