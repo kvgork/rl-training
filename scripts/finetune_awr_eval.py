@@ -1,4 +1,6 @@
-"""Usage: pixi run python scripts/finetune_awr_eval.py  (after finetune_awr_offline.py; CPU only)
+"""Usage: pixi run python scripts/finetune_awr_eval.py [AWR_DIR] [BASE_POLICY] [ACTOR_FILE ...]  (CPU only)
+
+Defaults: round 1 (runs/sac-her5/awr-offline, the 5 mm sim export, its three 500-step actors).
 
 Re-score saved AWR actors in sim on a fresh, larger goal set (seed 13)."""
 import dataclasses, json, sys
@@ -13,15 +15,16 @@ from so101_rl.env.tasks import REACH
 from so101_rl.rl import deploy_policy as dp
 from so101_rl.rl.policy_export import load_policy
 from so101_rl.rl.train_sac_her import evaluate
-D = Path("runs/sac-her5/awr-offline")
-init = load_policy(Path("runs/sac-sim/reach-5mm-20261014-065212/policy.pt"))
+D = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("runs/sac-her5/awr-offline")
+init = load_policy(Path(sys.argv[2]) if len(sys.argv) > 2 else Path("runs/sac-sim/reach-5mm-20261014-065212/policy.pt"))
 task = dataclasses.replace(REACH, success_radius_m=0.005)
 cal = load_calibration(load_config().calibration_path); cfg = load_config(calibration=cal)
 genv = So101GoalEnv(SimBackend(cfg, cal, seed=1), cfg, task)
 pairs = dp.draw_goal_pairs(BoxGoalSampler(task.goal_bounds, fk=genv._fk, limits=cfg.joints, seed=0), 13, 300)
 sim_sd = {k: v.clone() for k, v in init.actor.state_dict().items()}
 out = {}
-for name in ["sim_actor", "actor_betaNone_steps500.pt", "actor_beta0.5_steps500.pt", "actor_beta2.0_steps500.pt"]:
+NAMES = sys.argv[3:] or ["actor_betaNone_steps500.pt", "actor_beta0.5_steps500.pt", "actor_beta2.0_steps500.pt"]
+for name in ["sim_actor", *NAMES]:
     if name == "sim_actor":
         init.actor.load_state_dict(sim_sd)
     else:
