@@ -1,4 +1,7 @@
-"""Usage: pixi run python scripts/finetune_awr_offline.py OUT_DIR [N_EVAL]  (from the repo root; CPU only)
+"""Usage: pixi run python scripts/finetune_awr_offline.py OUT_DIR [N_EVAL] [RUN_DIR] [FROZEN_END]  (repo root; CPU only)
+
+Defaults: RUN_DIR runs/sac-her5/20261014-174624-bbcf, FROZEN_END 7000 (round 1). The behaviour policy is the run's
+``init_from`` export (the actor must have been frozen for the transitions used).
 
 Option 2 prototype: advantage-weighted regression (AWR) of the 5 mm sim actor on the real HS5-5mm transitions.
 
@@ -20,9 +23,9 @@ import torch.nn as nn
 
 torch.set_num_threads(4)
 torch.manual_seed(0)
-RUN = Path("runs/sac-her5/20261014-174624-bbcf")
+RUN = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("runs/sac-her5/20261014-174624-bbcf")
 OUT = Path(sys.argv[1]); OUT.mkdir(parents=True, exist_ok=True)
-FROZEN_END = 7000
+FROZEN_END = int(sys.argv[4]) if len(sys.argv) > 4 else 7000
 N_RELABEL = 8
 N_EVAL = int(sys.argv[2]) if len(sys.argv) > 2 else 100
 
@@ -46,7 +49,7 @@ genv = So101GoalEnv(SimBackend(cfg, cal, seed=0), cfg, task)
 model = FinetuneSAC.load(RUN / "model.zip", env=genv, device="cpu", actor_learning_rate=1e-5, fixed_ent_coef=0.01,
                          anchor_weight=0.4)
 model.load_replay_buffer(RUN / "replay_buffer.pkl")
-load_actor_into_sb3(model, init)  # model.zip's actor drifted; start from the clean sim actor
+load_actor_into_sb3(model, init)  # model.zip's actor may have drifted; start from the run's export
 model.set_anchor(init)
 rb = model.replay_buffer
 gamma = model.gamma
