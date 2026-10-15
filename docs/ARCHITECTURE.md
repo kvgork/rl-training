@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.52 (2026-10-15). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.53 (2026-10-15). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -466,7 +466,7 @@ These are ordered from the outermost layer to the innermost.
       - **BOX** (the commanded target is outside) is a clamp that reverts to the previous target.
       - **BOX_PRESENT** (the present position is outside: tip by more than 5 mm, or the lowest gripper point by more than 2 mm) is a trip.
    4. The thermal trip:
-      - It fires when one joint reads 60 °C or above on 3 consecutive good reads (100 ms; 0.39: the real bus returns one-tick spikes such as 26 → 69 → 26 °C) and latches once.
+      - It fires when one joint's **median of the last 11 good reads** (`MedianTemperature`, 0.53) is 60 °C or above on 3 consecutive good reads (100 ms; 0.39: the real bus returns one-tick spikes such as 26 → 69 → 26 °C; 0.53: and runs of up to 4 spiked reads, 33 → 94 → 98 → 65 °C) and latches once. The warm (dwell) test and `hottest_c` / `max_seen_c` read the same median; the dead-sensor values 0 / 255 are tested raw. Re-energise uses the same chain (`HotCheck`).
       - Resuming needs 50 °C or below for 30 s; the dwell restarts only when a joint reads above 50 °C on 3 consecutive reads.
       - A temperature reading older than 1 s, or a raw value of 0 or 255, is also a trip.
    5. The firmware protection bits: any non-zero `Status` is a trip.
@@ -642,3 +642,4 @@ Bump the version line at the top and add an entry below.
 | 0.50 | 2026-10-14 | **deploy-policy at the export's radius** (`rl/deploy_policy.py`; plan §10 2026-10-14). The env's task is REACH with the export meta's `success_radius_mm` (none: 15 mm), so success, termination and the near-start goal redraw use it; `summary.json` records `success_radius_m`. |
 | 0.51 | 2026-10-14 | **Offline fine-tune experiments** (`scripts/finetune_critic_diag.py`, `scripts/finetune_awr_offline.py`, `scripts/finetune_awr_eval.py`; plan §10 2026-10-14 "5 mm fine-tune stopped" / "Offline AWR prototype"): CPU-only scripts over a `train-reach-sac` run's `model.zip` + `replay_buffer.pkl` that score in the CPU MuJoCo `SimBackend`; no package module changes, no arm. |
 | 0.52 | 2026-10-15 | **wrist_flex limit 2960** (`config/so101.yaml` `joints.max_ticks`; plan §10 2026-10-15 "Narrower wrist_flex limit"): the effective wrist_flex range becomes [869, 2960] (calibration max 3068). No interface change; every consumer of `cfg.joints` (clamp, goal sampler, reset paths, sim, batched env) gets it; goal pairs for a given seed change. |
+| 0.53 | 2026-10-15 | **Temperature median filter** (`safety/thermal.py` `MedianTemperature`, `MEDIAN_READS` 11, `HotCheck`; `safety/reenergize.py`; servo summary `temp_outlier_reads`; plan §10 2026-10-15 "Temperature median filter"): every thermal decision (trip, warm/dwell, hottest, max seen; re-energise's start and ramp checks) reads the per-joint median of the last 11 good reads; 0 / 255 still trip raw and at once. Replayed over 740k real reads: within 2 °C of the 1 s median, 0 trips (the 0.39 rule alone tripped twice). Safety-check order unchanged. |

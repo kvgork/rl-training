@@ -359,6 +359,7 @@ def _core_summary(core: ServoCore, runner: ServoRunner, gc_before: int) -> dict[
         "reenergize_count": core.reenergize_count,
         "thermal_trips_monitor": thermal.trips_last_hour(),
         "max_temp_c": {n: int(t) for n, t in zip(JOINT_NAMES, thermal.max_seen_c, strict=True)},
+        "temp_outlier_reads": {n: int(k) for n, k in zip(JOINT_NAMES, thermal.outlier_reads, strict=True)},
         "gc_collections": _gc_collections() - gc_before,
         "signal": runner.signal_received,
         "stop_signals": runner.stop_signals,
