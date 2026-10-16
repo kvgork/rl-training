@@ -364,7 +364,7 @@ def test_die_start_region_needs_room_for_every_yaw():
 
 def test_die_start_table_stages_are_on_the_open_table_and_reachable(cfg):
     """Every footprint rectangle: inside the safety box (xy), >= 2 mm clear of the tray's outer rim, >= 10 mm clear
-    of the zone square, its corners 0.12..0.26 m from the base (where the jaws reach a resting die,
+    of the zone square, >= 10 mm clear of the fiducial site (a die on it would hide the marker), its corners 0.12..0.26 m from the base (where the jaws reach a resting die,
     tests/test_die_reach_feasibility.py) at a bearing of at most 35 deg."""
     from so101_rl.sim.model import load_model
 
@@ -380,6 +380,7 @@ def test_die_start_table_stages_are_on_the_open_table_and_reachable(cfg):
             assert box.x[0] <= r[0] < r[1] <= box.x[1] and box.y[0] <= r[2] < r[3] <= box.y[1], (reg.name, r)
             assert _rect_gap(r, tray) >= 0.002 - 1e-9, (reg.name, r)
             assert _rect_gap(r, zone) >= 0.010, (reg.name, r)
+            assert _rect_gap(r, _site_xy(data, model, "fiducial")) >= 0.010, (reg.name, r)
             corners = np.array([(x, y) for x in r[:2] for y in r[2:]])
             radius = np.hypot(corners[:, 0], corners[:, 1])
             assert radius.min() >= 0.12 and radius.max() <= 0.26, (reg.name, r)
@@ -392,15 +393,93 @@ def _dist_to_zone(xy):
     return np.hypot(d[:, 0], d[:, 1])
 
 
-@pytest.mark.parametrize(("stage", "lo", "hi"), [(0, 0.019, 0.063), (1, 0.06, 0.127), (2, 0.06, 0.152)])
+@pytest.mark.parametrize(("stage", "lo", "hi"), [(0, 0.019, 0.061), (1, 0.075, 0.121), (2, 0.018, 0.116)])
 def test_die_start_stage_distances_to_the_zone(stage, lo, hi):
-    """Die centre to the zone square: S0 2-6.2 cm (a straight +y push), S1 6.5-12.5 cm, S2 (at the rim) 6.3-15 cm. Sampled
-    with the env's rule (the numpy twin ``rl.gates._die_starts``), so the yaw-dependent clipping is included."""
+    """Die centre to the zone square: S0 2-6 cm (a straight -y push), S1 7.6-12 cm (the same lane farther out), S2 (at
+    the rim) 1.9-11.5 cm. Sampled with the env's rule (the numpy twin ``rl.gates._die_starts``), so the yaw-dependent
+    clipping is included."""
     from so101_rl.rl.gates import _die_starts
 
     xyz, _ = _die_starts(DIE_TO_ZONE, 20_000, np.random.default_rng(0), 0.0115, stage)
     d = _dist_to_zone(xyz[:, :2])
     assert lo <= d.min() and d.max() <= hi, (d.min(), d.max())
-    if stage == 0:  # in front of the zone: within its x span, so the push is straight in +y
+    if stage in (0, 1):  # in front of the zone: within its x span, so the push is straight in -y
         z = DIE_TO_ZONE.zone
         assert (np.abs(xyz[:, 0] - z.center_xy_m[0]) <= z.half_edge_m).all()
+
+
+def test_zone_is_clear_of_the_tray_and_the_fiducial():
+    """Plan §10 2026-10-16 "Die zone moved into the camera view": the zone square is >= 17 mm from the tray's outer
+    rim and >= 5 mm from the fiducial site."""
+    from so101_rl.sim.model import load_model
+
+    model, data = load_model()
+    z = DIE_TO_ZONE.zone
+    zone = (z.center_xy_m[0] - z.half_edge_m, z.center_xy_m[0] + z.half_edge_m,
+            z.center_xy_m[1] - z.half_edge_m, z.center_xy_m[1] + z.half_edge_m)  # fmt: skip
+    assert _rect_gap(zone, _tray_outer_xy(data, model)) >= 0.017 - 1e-9
+    assert _rect_gap(zone, _site_xy(data, model, "fiducial")) >= 0.005 - 1e-9
+
+
+def _site_xy(data, model, name):
+    c, h = data.site(name).xpos[:2], model.site(name).size[:2]
+    return c[0] - h[0], c[0] + h[0], c[1] - h[1], c[1] + h[1]
+
+
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
+def test_die_start_positions_are_in_the_camera_view(stage):
+    """Every die start is in the calibrated camera's view (``calib/camera.yaml``, the batched env's
+    ``SimDieTracker.in_view``: colour + depth image, half-blob border margin), sampled with the env's rule and, for
+    the table stages, on a grid over each rectangle shrunk by the smallest footprint half extent (occlusion by the
+    arm is not part of this check). The well is in view too; its rim hides the die from the oblique camera."""
+    import torch
+
+    from so101_rl.env.tasks import DIE_HALF_EDGE_M
+    from so101_rl.perception.camera_calib import load_camera_calib
+    from so101_rl.rl.gates import _die_starts
+    from so101_rl.sim.sim_tracker import NO_NOISE, CameraModel, SimDieTracker
+
+    xyz, _ = _die_starts(DIE_TO_ZONE, 5000, np.random.default_rng(1), 0.0115, stage)
+    if stage < DIE_TO_ZONE.die_start.well_stage:
+        h = DIE_HALF_EDGE_M
+        for x0, x1, y0, y1 in DIE_TO_ZONE.die_start.table_stages[stage].rects_xy_m:
+            gx, gy = np.meshgrid(np.linspace(x0 + h, x1 - h, 9), np.linspace(y0 + h, y1 - h, 9))
+            xyz = np.vstack([xyz, np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, xyz[0, 2])])])
+    calib = load_camera_calib()
+    tr = SimDieTracker(CameraModel.from_calib(calib, "color"), NO_NOISE, len(xyz), device="cpu", seed=0,
+                       depth_cam=CameraModel.from_calib(calib, "depth"))  # fmt: skip
+    ok = tr.in_view(torch.as_tensor(xyz, dtype=torch.float32)).numpy()
+    assert ok.all(), xyz[~ok][:5]
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_s0_s1_starts_are_unoccluded_with_the_arm_at_home(stage):
+    """S0 and S1 (the easy push stages) start with the die SEEN: with the arm at its home start pose, the sim tracker's
+    occlusion rule (jaws, arm links and the tray, ``SimDieTracker.occluded``) hides none of them. The placeholder
+    tray rim shadows x >= 0.15 for y -0.02..-0.125 from the oblique camera; S0 stays at x <= 0.149. Shown to fail: a
+    die in that shadow, next to the tray at (0.16, -0.06)."""
+    import mujoco
+    import torch
+
+    from so101_rl.perception.camera_calib import load_camera_calib
+    from so101_rl.rl.gates import _die_starts
+    from so101_rl.sim.model import load_model
+    from so101_rl.sim.sim_tracker import NO_NOISE, CameraModel, Occluders, SimDieTracker
+
+    model, data = load_model()
+    mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
+    mujoco.mj_forward(model, data)
+    occ = Occluders(model, "cpu")
+    xyz, _ = _die_starts(DIE_TO_ZONE, 500, np.random.default_rng(2), 0.0115, stage)
+    xyz = np.vstack([xyz, [0.16, -0.06, xyz[0, 2]]])  # the shown-to-fail point (last)
+    n = len(xyz)
+    calib = load_camera_calib()
+    tr = SimDieTracker(CameraModel.from_calib(calib, "color"), NO_NOISE, n, device="cpu", seed=0,
+                       depth_cam=CameraModel.from_calib(calib, "depth"))  # fmt: skip
+    bi = [model.body(b).id for b in occ.bodies]
+    c, h, rot = occ.compute(torch.as_tensor(data.xpos[bi], dtype=torch.float32)[None].expand(n, -1, -1),
+                            torch.as_tensor(data.xquat[bi], dtype=torch.float32)[None].expand(n, -1, -1))  # fmt: skip
+    tip = torch.as_tensor(data.site("gripper_tip").xpos, dtype=torch.float32)[None].expand(n, -1)
+    hidden = tr.occluded(torch.as_tensor(xyz, dtype=torch.float32), tip, c, h, rot).numpy()
+    assert not hidden[:-1].any(), xyz[:-1][hidden[:-1]][:5]
+    assert hidden[-1]

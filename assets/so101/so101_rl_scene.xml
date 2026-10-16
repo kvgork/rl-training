@@ -54,7 +54,7 @@
     <geom name="table" type="plane" size="0.6 0.6 0.05" pos="0 0 -0.02" material="table_mat" contype="3" conaffinity="3" friction="0.8 0.01 0.001"/>
     <site name="base" pos="0 0 0" size="0.003" group="3"/>
     <!-- Target zone, 60 x 60 mm, flat on the table -->
-    <site name="zone" type="box" pos="0.22 0.10 -0.0195" size="0.03 0.03 0.0005" rgba="0.1 0.7 0.2 0.5" group="1"/>
+    <site name="zone" type="box" pos="0.15 -0.13 -0.0195" size="0.03 0.03 0.0005" rgba="0.1 0.7 0.2 0.5" group="1"/>
     <!-- ArUco-sized fiducial (30 mm) for hand-eye calibration -->
     <site name="fiducial" type="box" pos="0.10 -0.16 -0.0195" size="0.015 0.015 0.0005" rgba="0 0 0 1" group="1"/>
     <!-- No camera here: the D435 cameras d435_color / d435_depth are added by sim/model.py build_spec from
