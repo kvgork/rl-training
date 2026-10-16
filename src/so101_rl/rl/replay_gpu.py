@@ -7,6 +7,11 @@ separately; only ``terminated`` stops the bootstrap.
 
 1-step returns only (the MVP trains reach, whose reward is dense); the FS10 ``n_step_discount`` field is therefore
 ``gamma`` for every sample. Everything lives on ``device``; ``sample`` makes no host sync.
+
+Demo mixing (RLPD-style, D2b of ``plans/die-to-zone-plan.md``): :func:`sample_mixed` draws a fixed share of each
+batch from a second ``GpuReplay`` filled with scripted demonstrations (``rl/scripted.py`` ``collect_demos``, the
+same transition format) and the rest from the online replay; with no demo replay or a zero share it is exactly
+``replay.sample``.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["Batch", "GpuReplay"]
+__all__ = ["Batch", "GpuReplay", "demo_count", "sample_mixed"]
 
 
 @dataclass
@@ -103,3 +108,31 @@ class GpuReplay:
             next_priv=self._next_priv[i], terminated=self._term[i], truncated=self._trunc[i],
             n_step_discount=torch.full((int(batch_size),), self.gamma, dtype=torch.float32, device=self.device),
         )  # fmt: skip
+
+
+def demo_count(batch_size: int, demo_ratio: float) -> int:
+    """Rows of a ``batch_size`` batch drawn from the demo replay: ``round(batch_size * demo_ratio)``, at least 1 for a
+    positive ratio and at most ``batch_size - 1`` (the online replay always contributes)."""
+    if not 0.0 <= demo_ratio < 1.0:
+        raise ValueError(f"demo_ratio must be in [0, 1), got {demo_ratio}")
+    if demo_ratio == 0.0:
+        return 0
+    return min(max(1, round(batch_size * demo_ratio)), batch_size - 1)
+
+
+def sample_mixed(
+    replay: GpuReplay,
+    demo: GpuReplay | None,
+    batch_size: int,
+    demo_ratio: float,
+    *,
+    generator: torch.Generator | None = None,
+) -> Batch:
+    """One training batch: :func:`demo_count` rows from ``demo``, the rest from ``replay`` (online rows first). No
+    demo replay or ``demo_ratio == 0``: ``replay.sample(batch_size, generator=generator)`` unchanged (same draws)."""
+    k = demo_count(batch_size, demo_ratio) if demo is not None else 0
+    if k == 0:
+        return replay.sample(batch_size, generator=generator)
+    a = replay.sample(batch_size - k, generator=generator)
+    b = demo.sample(k, generator=generator)
+    return Batch(**{f: torch.cat([getattr(a, f), getattr(b, f)], dim=0) for f in Batch.__dataclass_fields__})

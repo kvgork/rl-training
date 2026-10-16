@@ -53,6 +53,10 @@ randomises physics) and a proprio-noise amplitude; the policy observation (``q_n
 present ticks plus uniform integer noise in ``[-k, k]`` drawn every policy step. Reward, success and ``achieved``
 use the un-noised reading. ``info["dr_stage"]`` and the privileged ``dr_params`` block report the draws.
 
+Device: ``cuda`` steps MuJoCo Warp (``sim/warp_model.py``); ``cpu`` steps CPU MuJoCo through ``sim/cpu_sim.py``
+(same interface, one ``MjData`` per world, for a few worlds: CPU tests and the scripted die controller's evaluation,
+D2b). Everything above the physics is the same code.
+
 Host syncs: none per step except the overflow check every ``cfg.sim_warp.overflow_check_every_steps`` steps
 (one copy) and ``close()``; ``stats`` and ``render_worlds`` sync when called.
 """
@@ -212,7 +216,14 @@ class BatchedGoalEnv:
         self.device = dev = torch.device(device)
         self.model = model if model is not None else load_model()[0]
         m = self.model
-        self.ws = WarpSim(m, cfg.sim_warp, self.nworld, device=device)
+        # CUDA: MuJoCo Warp; CPU: the CPU MuJoCo stand-in with the same interface (sim/cpu_sim.py, D2b: CPU tests and
+        # the scripted die controller's evaluation)
+        if dev.type == "cpu":
+            from so101_rl.sim.cpu_sim import CpuSim
+
+            self.ws: Any = CpuSim(m, cfg.sim_warp, self.nworld)
+        else:
+            self.ws = WarpSim(m, cfg.sim_warp, self.nworld, device=device)
         self.chain = BatchedServoChain(cfg, calibration, KinematicChain.from_yaml(cfg.kinematics_path), self.nworld, device=dev)
         self.obs_dim = task.obs.dim
         self.priv_dim = PRIV_OBS.dim

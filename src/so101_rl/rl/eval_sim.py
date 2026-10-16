@@ -138,8 +138,9 @@ def build_env(
     success_radius_mm: float | None = None,
 ) -> Any:
     """The batched env of ``task`` with the DR stages around ``sim_params`` (the v0 MJCF prior is accepted for
-    reach, plan S4.5; its release is recorded). Needs CUDA. The training loop builds its envs through this
-    function too (tests replace it with the toy env). ``success_radius_mm`` replaces REACH's 15 mm success radius
+    reach, plan S4.5; its release is recorded). Needs CUDA, or ``device="cpu"`` (CPU MuJoCo through
+    ``sim/cpu_sim.py``, for a few worlds). The training loop builds its envs through this function too (tests
+    replace it with the toy env). ``success_radius_mm`` replaces REACH's 15 mm success radius
     (plan §10 2026-10-14; None = the task's); refused for the die task (:func:`task_spec`)."""
     base_spec = task_spec(task, success_radius_mm)
     dev = device or "cuda:0"
