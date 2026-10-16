@@ -386,8 +386,9 @@ def _well_half_m() -> float:
     return float(_WELL_HALF_M)
 
 
-def _die_starts(spec: Any, n: int, rng: np.random.Generator, well_half_m: float) -> np.ndarray:
-    """The batched env's die placement (``BatchedGoalEnv._place_die``) in numpy: die centre xyz [n, 3]."""
+def _die_starts(spec: Any, n: int, rng: np.random.Generator, well_half_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """The batched env's die placement (``BatchedGoalEnv._place_die``) in numpy: die centre xyz [n, 3] and the yaw
+    [n] its clipping assumed (the die must be placed with that yaw, or its footprint can overlap the funnel)."""
     from so101_rl.env.tasks import DIE_HALF_EDGE_M
 
     ds = spec.die_start
@@ -395,7 +396,7 @@ def _die_starts(spec: Any, n: int, rng: np.random.Generator, well_half_m: float)
     reach = DIE_HALF_EDGE_M * (np.abs(np.cos(yaw)) + np.abs(np.sin(yaw)))  # footprint half extent
     slack = np.clip(well_half_m - reach, 0.0, None)[:, None]
     xy = np.clip(rng.normal(size=(n, 2)) * ds.sigma_xy_m, -slack, slack) + np.asarray(ds.well_center_xy_m)
-    return np.column_stack([xy, np.full(n, spec.zone.z_table_m + DIE_HALF_EDGE_M)])
+    return np.column_stack([xy, np.full(n, spec.zone.z_table_m + DIE_HALF_EDGE_M)]), yaw
 
 
 def l1_die_cpu(spec: Any, *, n: int = 10_000, seed: int = 0, well_half_m: float | None = None) -> list[GateRow]:
@@ -409,7 +410,7 @@ def l1_die_cpu(spec: Any, *, n: int = 10_000, seed: int = 0, well_half_m: float 
     goal = zone.goal_xyz()
     c = np.asarray(ds.well_center_xy_m, np.float64)
     nearest = np.append(np.clip(goal[:2], c - wh, c + wh), zone.z_table_m + DIE_HALF_EDGE_M)
-    starts = np.vstack([nearest[None], _die_starts(spec, n, np.random.default_rng(seed), wh)])
+    starts = np.vstack([nearest[None], _die_starts(spec, n, np.random.default_rng(seed), wh)[0]])
     hit = success_np(starts, np.broadcast_to(goal, starts.shape), spec, visible=np.ones(len(starts), bool))
     margin = float((np.abs(starts[:, :2] - goal[:2]).max(axis=1) - zone.half_edge_m).min())
     return [GateRow("L1", "start_not_success", not bool(hit.any()),
@@ -510,7 +511,7 @@ def l2_die_do_nothing_cpu(cfg: Any, cal: Any, spec: Any, *, nworld: int = 16, se
     home = _home_ticks(cal)
     lo, hi = np.asarray(cfg.joints.min_ticks, np.int64), np.asarray(cfg.joints.max_ticks, np.int64)
     goal = spec.zone.goal_xyz()
-    starts = _die_starts(spec, nworld, rng, wh)
+    starts, yaws = _die_starts(spec, nworld, rng, wh)
     wins, max_move = 0, 0.0
     for w in range(nworld):
         mujoco.mj_resetDataKeyframe(m, data, m.key("home").id)
@@ -520,7 +521,7 @@ def l2_die_do_nothing_cpu(cfg: Any, cal: Any, spec: Any, *, nworld: int = 16, se
         for i in range(5):  # the arm joints; the gripper stays at the keyframe
             data.qpos[q_adr[i]] = q_arm[i]
             data.ctrl[act[i]] = q_arm[i]
-        yaw = rng.uniform(0.0, 2 * math.pi)
+        yaw = float(yaws[w])  # the yaw the start was clipped for (a fresh yaw pushed the die into the funnel)
         data.qpos[die_q : die_q + 3] = starts[w]
         data.qpos[die_q + 3 : die_q + 7] = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
         data.qvel[:] = 0.0
