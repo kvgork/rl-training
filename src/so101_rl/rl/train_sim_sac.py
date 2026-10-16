@@ -17,10 +17,19 @@ CURRENT DR stage (``eval_sim.run_episodes``), a checkpoint ``ckpt_<step>.pt`` + 
 (``review.json``; printed and logged, never switching anything) and the widening rule
 (``sim.domain_rand.next_stage``: one stage up at >= 70 % eval success, up to ``dr_max_stage``).
 
+Die start curriculum (``die_start_curriculum: true``, die_to_zone only; D2a, plan §10 2026-10-16): the die starts
+from ``DIE_TO_ZONE.die_start`` stage 0 (open table in front of the zone) instead of the well, and the same widening
+rule (>= 70 % eval success at the current stages) first moves the START stage up, S0 -> S1 -> S2 -> S3 (the well),
+with the DR stage held at ``dr_start_stage``; only at S3 do the DR stages widen as before. Evals run at the current
+start and DR stages; the exit gate (``stop_at_gate``) needs start stage S3 AND ``dr_max_stage``, with the same numeric
+thresholds. ``start_stage`` is a ``metrics.csv`` column (the well stage for die without the curriculum, empty for
+reach) and a checkpoint field (resume continues from it); ``ckpt_best`` ranks ``(start_stage, dr_stage, success)``.
+Off by default: without it the die starts in the well exactly as before.
+
 Eval cost: an eval is also deferred until this segment's eval time is at most ``eval_max_fraction`` (10 %) of its
 training time (the next eval, assumed as long as the last one, waits until it fits); ``eval_frac`` in ``metrics.csv`` is the measured
 fraction (the first eval of a segment is never deferred). Only the last ``keep_ckpts`` (3) numbered checkpoints are kept, plus ``ckpt_last.pt`` and
-``ckpt_best.pt`` (a hard link to the numbered checkpoint with the best ``(dr_stage, eval success)``).
+``ckpt_best.pt`` (a hard link to the numbered checkpoint with the best ``(start_stage, dr_stage, eval success)``).
 
 ``train_success_rate`` is NOT a success rate of the policy: it is the fraction of the episodes that ENDED in the log
 window that succeeded, with the stochastic (exploring) policy. Successful episodes end early, so it overstates
@@ -97,7 +106,7 @@ METRICS_FIELDS: Final[tuple[str, ...]] = (
     "env_step", "wall_s", "train_s", "env_steps_per_s", "grads_per_s", "dr_stage", "train_success_rate",
     "train_episodes", "mean_return", "critic_loss", "actor_loss", "alpha", "entropy", "q_mean", "q_max",
     "action_saturation", "eval_success_rate", "eval_wilson_lo", "eval_final_err_p50", "eval_final_err_p90",
-    "vram_mb", "gpu_temp_c", "thermal_paused_s", "review_triggers", "viz_disabled", "eval_frac",
+    "vram_mb", "gpu_temp_c", "thermal_paused_s", "review_triggers", "viz_disabled", "eval_frac", "start_stage",
 )  # fmt: skip
 _NUMBERED_CKPT: Final[re.Pattern[str]] = re.compile(r"^ckpt_(\d+)\.pt$")
 
@@ -134,6 +143,7 @@ class SimSacConfig:
     thermal_guard: bool = True  # the trainer's own NVML pause; False under the lab (the job owns the guard)
     success_radius_mm: float | None = None  # None = the task's (reach 15 mm); plan §10 2026-10-14; reach only
     allow_unverified_sim_params: bool = False  # die_to_zone only: the user's S4.6 waiver (module docstring)
+    die_start_curriculum: bool = False  # die_to_zone only: start stages S0..S3 before the DR stages (D2a)
 
 
 _REQUIRED: Final[tuple[str, ...]] = ("task", "nworld", "budget_min", "seed")
@@ -146,7 +156,7 @@ _TYPES: Final[dict[str, tuple[type, bool]]] = {  # name -> (type, nullable)
     "gamma": (float, True), "calibration": (str, True), "sim_params": (str, False), "vram_fraction": (float, False),
     "thermal_max_pause_min": (float, False), "tensorboard": (bool, False), "eval_max_fraction": (float, False),
     "keep_ckpts": (int, False), "thermal_guard": (bool, False), "success_radius_mm": (float, True),
-    "allow_unverified_sim_params": (bool, False),
+    "allow_unverified_sim_params": (bool, False), "die_start_curriculum": (bool, False),
 }  # fmt: skip
 
 
@@ -223,6 +233,8 @@ def _check_ranges(c: SimSacConfig, where: str) -> None:
     if c.task != "reach" and c.success_radius_mm is not None:
         raise bad(f"success_radius_mm is a reach-only override (plan §10 2026-10-14); {c.task} success is the zone "
                   "square (env/tasks.py)")  # fmt: skip
+    if c.task != "die_to_zone" and c.die_start_curriculum:
+        raise bad(f"die_start_curriculum is a die_to_zone option; {c.task} has no die start stages")
     if c.nworld < 1:
         raise bad("nworld must be >= 1")
     if not (math.isfinite(c.budget_min) and c.budget_min >= 0):
@@ -328,6 +340,12 @@ def review_triggers(history: list[dict[str, float]], *, train_h: float, n_update
     if train_h >= after_h and evals and evals[-1]["eval_success_rate"] < min_ok:
         out.append(f"{task} success {evals[-1]['eval_success_rate']:.2f} < {min_ok:g} after {train_h:.2f} GPU-h")
     return out
+
+
+def trigger_kind(trigger: str) -> str:
+    """The trigger without its numbers (``"alpha 9.1e-05 < 1e-4"`` -> ``"alpha # < #"``): each kind is recorded once
+    per run, not on every log line its condition still holds (die run 1 wrote dozens of copies to ``review.json``)."""
+    return re.sub(r"[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", "#", trigger)
 
 
 # ------------------------------------------------------------------------------------------------ training
@@ -465,10 +483,18 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         sac.load_state_dict(ck["sac"])
         env_step, train_s0 = int(ck["env_step"]), float(ck["train_s"])
     replay = GpuReplay(cfg.replay_capacity, obs_dim, priv_dim, act_dim, device=dev, gamma=gamma)
+    # die start curriculum (module docstring): None for reach; the well stage unless the curriculum is on
+    die_start = DIE_TO_ZONE.die_start if cfg.task == "die_to_zone" else None
+    well_stage = die_start.well_stage if die_start is not None else None
+    start_stage = well_stage
+    if cfg.die_start_curriculum:
+        start_stage = int(ck["start_stage"]) if ck is not None and ck.get("start_stage") is not None else 0
+        env.set_start_stage(start_stage)
     gen = torch.Generator(device=dev)
     gen.manual_seed(cfg.seed + 12345)
     meta = {"config": dataclasses.asdict(cfg), "env": dict(getattr(env, "metadata", {})), "git_sha": eval_sim.git_sha(),
-            "resumed_from_step": env_step if ck is not None else None, "sac": sac_cfg.to_dict()}  # fmt: skip
+            "resumed_from_step": env_step if ck is not None else None, "sac": sac_cfg.to_dict(),
+            "start_stages": [die_start.stage_name(k) for k in range(die_start.n_stages)] if die_start else None}  # fmt: skip
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
     from so101_rl.viz.monitor import TrainingMonitor, VizConfig
@@ -479,6 +505,10 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
     guard = ThermalGuard(read_gpu_temp_c) if cfg.thermal_guard else None
     history: list[dict[str, float]] = []
     review: list[dict[str, Any]] = []
+    if ck is not None and (out_dir / "review.json").exists():  # a resume keeps the run's triggers (each fires once)
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+            review = [r for r in json.loads((out_dir / "review.json").read_text())["triggers"]
+                      if int(r["env_step"]) <= env_step]  # fmt: skip
     last_ckpt: Path | None = (out_dir / "ckpt_last.pt") if (out_dir / "ckpt_last.pt").exists() and ck is not None else None
     status: str = "budget_exhausted"
     reason = ""
@@ -495,7 +525,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
     if ck is not None and best_path.exists():
         with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
             b = json.loads(best_path.read_text())
-            best_key = (int(b["dr_stage"]), float(b["success_rate"]))
+            ss = b.get("start_stage", well_stage)
+            best_key = (int(ss) if ss is not None else 0, int(b["dr_stage"]), float(b["success_rate"]))
     seg_train_s0 = train_s0
     n = int(env.nworld)
     # per-window accumulators (device)
@@ -513,7 +544,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         nonlocal last_ckpt
         d = {
             "format": CKPT_FORMAT, "version": CKPT_VERSION, "task": cfg.task, "env_step": env_step, "train_s": train_s,
-            "dr_stage": int(env.dr_stage), "sac": sac.state_dict(), "config": dataclasses.asdict(cfg),
+            "dr_stage": int(env.dr_stage), "start_stage": start_stage, "sac": sac.state_dict(),
+            "config": dataclasses.asdict(cfg),
             "obs_layout_version": _obs_layout_version(), "policy_input_dim": obs_dim, "act_dim": act_dim,
             "sim_params_release": meta["env"].get("sim_params_release"), "git_sha": meta["git_sha"],
             "calibration_sha256": meta["env"].get("calibration_sha256"),
@@ -523,11 +555,13 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         if numbered:
             num = out_dir / f"ckpt_{env_step}.pt"
             _save(num, d)
-            key = (int(env.dr_stage), float((last_eval or {}).get("success_rate", -1.0)))
+            key = (start_stage if start_stage is not None else 0, int(env.dr_stage),
+                   float((last_eval or {}).get("success_rate", -1.0)))  # fmt: skip
             if last_eval and (best_key is None or key >= best_key):
                 best_key = key
                 _link_or_copy(num, out_dir / "ckpt_best.pt")
-                best_path.write_text(json.dumps({"env_step": env_step, "dr_stage": key[0], "success_rate": key[1]}))
+                best_path.write_text(json.dumps({"env_step": env_step, "start_stage": start_stage, "dr_stage": key[1],
+                                                 "success_rate": key[2]}))  # fmt: skip
             _prune_ckpts(out_dir, cfg.keep_ckpts)
         _save(out_dir / "ckpt_last.pt", d)
         last_ckpt = out_dir / "ckpt_last.pt"
@@ -544,7 +578,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         row: dict[str, Any] = {
             "env_step": env_step, "wall_s": round(now - t_wall0, 3), "train_s": round(train_s, 3),
             "env_steps_per_s": round((env_step - win_step) / dt, 1), "grads_per_s": round((sac.updates - win_upd) / dt, 1),
-            "dr_stage": int(env.dr_stage), "train_success_rate": float(ep_succ) / done if done else None,
+            "dr_stage": int(env.dr_stage), "start_stage": start_stage,
+            "train_success_rate": float(ep_succ) / done if done else None,
             "train_episodes": int(done), "mean_return": float(ep_ret_sum) / done if done else None,
             "vram_mb": round(torch.cuda.max_memory_allocated(dev) / 2**20, 1) if dev.type == "cuda" else 0.0,
             "gpu_temp_c": guard.last_c if guard is not None else None, "thermal_paused_s": round(paused_s, 1),
@@ -558,7 +593,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         history.append(hist)
         trig = review_triggers(history, train_h=train_s / 3600.0, n_updates_per_transition=cfg.grad_steps_per_env_step / n,
                                task=cfg.task)  # fmt: skip
-        new = [t for t in trig if t not in {r["trigger"] for r in review}]
+        seen = {trigger_kind(r["trigger"]) for r in review}
+        new = [t for t in trig if trigger_kind(t) not in seen]
         for t in new:
             review.append({"env_step": env_step, "trigger": t})
             print(f"[train-sim-sac] REVIEW TRIGGER @ {env_step}: {t} (recorded; the method is not switched)", flush=True)
@@ -589,13 +625,15 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
                                           success_radius_mm=cfg.success_radius_mm)  # fmt: skip
         if getattr(eval_env, "randomizer", None) is not None:
             eval_env.randomizer.set_stage(int(env.dr_stage))
+        if cfg.die_start_curriculum:
+            eval_env.set_start_stage(start_stage)
         sac.actor.eval()
         st = eval_sim.run_episodes(eval_env, lambda x: sac.act(x, deterministic=True), cfg.eval_episodes)
         sac.actor.train()
         lo, hi = eval_sim.wilson_interval(st["successes"], st["episodes"])
         return {"success_rate": st["success_rate"], "wilson_lo": lo, "wilson_hi": hi, "episodes": st["episodes"],
                 "successes": st["successes"], "final_err_m": st["final_err_m"], "dr_stage": int(env.dr_stage),
-                "env_step": env_step}  # fmt: skip
+                "start_stage": start_stage, "env_step": env_step}  # fmt: skip
 
     obs, priv = (x.clone() for x in env.reset()[:2])
     last_ev: dict[str, Any] | None = dict(ck["last_eval"]) if ck is not None and ck.get("last_eval") else None
@@ -672,9 +710,19 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
                 last_ev = ev
                 checkpoint(ev, numbered=True)
                 passed, _ = eval_sim.gate_verdict(ev["successes"], ev["episodes"], ev["dr_stage"])
-                if passed and cfg.stop_at_gate and ev["dr_stage"] >= cfg.dr_max_stage:
+                at_target_start = start_stage == well_stage  # reach: both None; die: the well (S3)
+                if passed and cfg.stop_at_gate and ev["dr_stage"] >= cfg.dr_max_stage and at_target_start:
                     status, reason = "completed", f"numeric exit gate passed at stage {ev['dr_stage']}"
                     break
+                if not at_target_start:  # the start curriculum first; the DR stage waits for the well
+                    new_start = _next_stage(start_stage, ev["success_rate"], well_stage)
+                    if new_start != start_stage:
+                        start_stage = new_start
+                        env.set_start_stage(start_stage)
+                        print(f"[train-sim-sac] start stage {start_stage - 1} -> {start_stage} "
+                              f"({die_start.stage_name(start_stage)}) at {env_step} (eval success "
+                              f"{ev['success_rate']:.3f})", flush=True)  # fmt: skip
+                    continue
                 new_stage = _next_stage(int(env.dr_stage), ev["success_rate"], cfg.dr_max_stage)
                 if new_stage != int(env.dr_stage):
                     env.randomizer.set_stage(new_stage)

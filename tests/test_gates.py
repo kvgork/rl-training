@@ -191,6 +191,10 @@ def test_cli_die_runs_on_cpu(tmp_path, monkeypatch):
     assert doc["task"] == "die_to_zone" and not doc["passed"]
     cpu = ("start_not_success", "adversarial", "independent_predicate", "independent_settle", "do_nothing")
     assert all(rows[n]["passed"] for n in cpu), rows
+    # the start curriculum (D2a): start_not_success and do_nothing once per stage; S3 = the well keeps the names
+    per_stage = [f"{g}_S{k}" for g in ("start_not_success", "do_nothing") for k in range(3)]
+    assert all(rows[n]["passed"] for n in per_stage), rows
+    assert rows["start_not_success"]["value"].startswith("S3 well") and rows["do_nothing_S0"]["value"].startswith("S0")
     assert not rows["do_nothing_batched"]["passed"] and "CUDA unavailable" in rows["do_nothing_batched"]["value"]
     assert not rows["random_policy"]["passed"]
 
@@ -222,3 +226,32 @@ def test_die_do_nothing_cpu_places_the_die_at_rest(cfg, calibration):
     assert row.passed
     moved_mm = float(row.value.split("at most ")[1].split(" mm")[0])
     assert moved_mm < 0.5
+
+
+# ------------------------------------------------------------------------------------------------ start curriculum (D2a)
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
+def test_l1_die_start_not_success_per_stage_and_its_twin(stage):
+    row = gates.l1_die_cpu(DIE_TO_ZONE, n=2000, stage=stage)[0]
+    assert row.passed and row.name == ("start_not_success" if stage == 3 else f"start_not_success_S{stage}"), row
+    if stage == 3:
+        return
+    # shown to fail: a zone whose edge reaches 5 mm into the stage's first rectangle holds starts (worst case finds it)
+    x0, x1, y0, _ = DIE_TO_ZONE.die_start.table_stages[stage].rects_xy_m[0]
+    zone_xy = ((x0 + x1) / 2, y0 - DIE_TO_ZONE.zone.half_edge_m + 0.005 + 0.008)
+    assert not gates.l1_die_cpu(_zone_at(zone_xy), n=2000, stage=stage)[0].passed
+
+
+def test_die_do_nothing_cpu_per_stage_and_its_twin(rig):
+    """S0: the die rests on the open table and stays put; shown to fail: the zone moved onto the S0 rectangle."""
+    cfg, cal, _ = rig
+    row = gates.l2_die_do_nothing_cpu(cfg, cal, DIE_TO_ZONE, nworld=2, stage=0)[0]
+    assert row.passed and row.name == "do_nothing_S0", row
+    assert float(row.value.split("at most ")[1].split(" mm")[0]) < 0.5  # placed at rest
+    x0, x1, y0, y1 = DIE_TO_ZONE.die_start.table_stages[0].rects_xy_m[0]
+    row = gates.l2_die_do_nothing_cpu(cfg, cal, _zone_at(((x0 + x1) / 2, (y0 + y1) / 2)), nworld=2, stage=0)[0]
+    assert not row.passed, row
+
+
+def test_die_starts_twin_rejects_an_unknown_stage():
+    with pytest.raises(ValueError, match="outside"):
+        gates._die_starts(DIE_TO_ZONE, 4, np.random.default_rng(0), 0.0115, 4)

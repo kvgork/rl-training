@@ -33,6 +33,10 @@ the die settled (moved <= ``settle_m`` between them).
 - ``start_not_success`` (L1, CPU): no die start lies in the zone. Worst case over the whole start set (the batched
   env clips the die centre to the flat floor of the start well, ``batched_env._WELL_HALF_M``: the well square's
   point nearest the zone centre) plus 1e4 sampled starts (the env's draw: N(centre, sigma), clipped).
+- Start curriculum (D2a, plan §10 2026-10-16): ``start_not_success`` and ``do_nothing`` run once per start stage of
+  ``DIE_TO_ZONE.die_start``. The well stage (S3, the target) keeps the row names; the open-table stages S0..S2 add
+  ``_S<k>`` (worst case: each footprint rectangle shrunk by the smallest footprint half extent, its point nearest
+  the zone centre; samples: the env's rectangle-by-area, uniform-centre draw). The GPU rows stay at the well.
 - ``adversarial`` (L2, CPU): the die predicate table (zone centre, 0.1 mm inside / outside an edge, the inside
   corner (a Euclidean predicate fails it), 0.1 mm under / over the height bound, held 20 mm up, invisible, NaN).
 - ``independent_predicate`` (L2, CPU): a separately written predicate agrees with ``tasks.success_np`` on 1e5
@@ -386,36 +390,72 @@ def _well_half_m() -> float:
     return float(_WELL_HALF_M)
 
 
-def _die_starts(spec: Any, n: int, rng: np.random.Generator, well_half_m: float) -> tuple[np.ndarray, np.ndarray]:
-    """The batched env's die placement (``BatchedGoalEnv._place_die``) in numpy: die centre xyz [n, 3] and the yaw
-    [n] its clipping assumed (the die must be placed with that yaw, or its footprint can overlap the funnel)."""
+def _start_stage(spec: Any, stage: int | None) -> int:
+    ds = spec.die_start
+    k = ds.well_stage if stage is None else int(stage)
+    ds.stage_name(k)  # validates the range
+    return k
+
+
+def _stage_label(spec: Any, k: int) -> str:
+    return f"S{k} {spec.die_start.stage_name(k)}"
+
+
+def _row_name(name: str, spec: Any, k: int) -> str:
+    """The well stage (the target start) keeps the D1 row names; the curriculum's table stages get ``_S<k>``."""
+    return name if k == spec.die_start.well_stage else f"{name}_S{k}"
+
+
+def _die_starts(spec: Any, n: int, rng: np.random.Generator, well_half_m: float, stage: int | None = None,
+                ) -> tuple[np.ndarray, np.ndarray]:  # fmt: skip
+    """The batched env's die placement (``BatchedGoalEnv._place_die``) in numpy for start stage ``stage`` (None = the
+    well, the env's default): die centre xyz [n, 3] and the yaw [n] its clipping assumed (the die must be placed with
+    that yaw, or its footprint can overlap the funnel / leave its rectangle). Same rule, not the same random
+    stream."""
     from so101_rl.env.tasks import DIE_HALF_EDGE_M
 
     ds = spec.die_start
+    k = _start_stage(spec, stage)
     yaw = rng.uniform(0.0, 2 * math.pi, size=n)
     reach = DIE_HALF_EDGE_M * (np.abs(np.cos(yaw)) + np.abs(np.sin(yaw)))  # footprint half extent
-    slack = np.clip(well_half_m - reach, 0.0, None)[:, None]
-    xy = np.clip(rng.normal(size=(n, 2)) * ds.sigma_xy_m, -slack, slack) + np.asarray(ds.well_center_xy_m)
+    if k == ds.well_stage:
+        slack = np.clip(well_half_m - reach, 0.0, None)[:, None]
+        xy = np.clip(rng.normal(size=(n, 2)) * ds.sigma_xy_m, -slack, slack) + np.asarray(ds.well_center_xy_m)
+    else:
+        reg = ds.table_stages[k]
+        rects = np.asarray(reg.rects_xy_m, np.float64)
+        r = rects[rng.choice(len(rects), size=n, p=reg.areas / reg.areas.sum())]
+        lo = r[:, [0, 2]] + reach[:, None]
+        hi = r[:, [1, 3]] - reach[:, None]
+        xy = lo + rng.uniform(size=(n, 2)) * (hi - lo)
     return np.column_stack([xy, np.full(n, spec.zone.z_table_m + DIE_HALF_EDGE_M)]), yaw
 
 
-def l1_die_cpu(spec: Any, *, n: int = 10_000, seed: int = 0, well_half_m: float | None = None) -> list[GateRow]:
-    """``start_not_success``: the worst case over the start set, then sampled starts (see the module docstring)."""
+def l1_die_cpu(spec: Any, *, n: int = 10_000, seed: int = 0, well_half_m: float | None = None,
+               stage: int | None = None) -> list[GateRow]:  # fmt: skip
+    """``start_not_success`` for start stage ``stage`` (None = the well): the worst case over the stage's start set,
+    then sampled starts (see the module docstring)."""
     from so101_rl.env.tasks import DIE_HALF_EDGE_M, success_np
 
     zone, ds = spec.zone, spec.die_start
     if zone is None or ds is None:
         raise ValueError(f"task {spec.name!r} has no zone / die start")
+    k = _start_stage(spec, stage)
     wh = _well_half_m() if well_half_m is None else float(well_half_m)
     goal = zone.goal_xyz()
-    c = np.asarray(ds.well_center_xy_m, np.float64)
-    nearest = np.append(np.clip(goal[:2], c - wh, c + wh), zone.z_table_m + DIE_HALF_EDGE_M)
-    starts = np.vstack([nearest[None], _die_starts(spec, n, np.random.default_rng(seed), wh)[0]])
+    if k == ds.well_stage:  # the clipped centre square of the well floor
+        c = np.asarray(ds.well_center_xy_m, np.float64)
+        boxes = [(c - wh, c + wh)]
+    else:  # every rectangle shrunk by the smallest footprint half extent (yaw 0): the union of all centres
+        boxes = [(np.array([x0, y0]) + DIE_HALF_EDGE_M, np.array([x1, y1]) - DIE_HALF_EDGE_M)
+                 for x0, x1, y0, y1 in ds.table_stages[k].rects_xy_m]  # fmt: skip
+    nearest = np.array([np.append(np.clip(goal[:2], lo, hi), zone.z_table_m + DIE_HALF_EDGE_M) for lo, hi in boxes])
+    starts = np.vstack([nearest, _die_starts(spec, n, np.random.default_rng(seed), wh, k)[0]])
     hit = success_np(starts, np.broadcast_to(goal, starts.shape), spec, visible=np.ones(len(starts), bool))
     margin = float((np.abs(starts[:, :2] - goal[:2]).max(axis=1) - zone.half_edge_m).min())
-    return [GateRow("L1", "start_not_success", not bool(hit.any()),
-                    f"{int(hit.sum())} of {len(starts)} starts (worst case + {n} sampled) in the zone; nearest start "
-                    f"{margin * 1000:.1f} mm outside the zone edge", "0")]  # fmt: skip
+    return [GateRow("L1", _row_name("start_not_success", spec, k), not bool(hit.any()),
+                    f"{_stage_label(spec, k)}: {int(hit.sum())} of {len(starts)} starts (worst case + {n} sampled) in "
+                    f"the zone; nearest start {margin * 1000:.1f} mm outside the zone edge", "0")]  # fmt: skip
 
 
 def l2_die_cpu(spec: Any, *, predicate: Predicate | None = None, debounce: Callable[..., Any] | None = None,
@@ -491,8 +531,10 @@ def l2_die_cpu(spec: Any, *, predicate: Predicate | None = None, debounce: Calla
 
 
 def l2_die_do_nothing_cpu(cfg: Any, cal: Any, spec: Any, *, nworld: int = 16, seed: int = 0,
-                          start_noise_ticks: int = 30, well_half_m: float | None = None) -> list[GateRow]:  # fmt: skip
-    """``do_nothing`` on CPU MuJoCo (see the module docstring): every world holds its start pose for one episode."""
+                          start_noise_ticks: int = 30, well_half_m: float | None = None,
+                          stage: int | None = None) -> list[GateRow]:  # fmt: skip
+    """``do_nothing`` on CPU MuJoCo (see the module docstring) for start stage ``stage`` (None = the well): every
+    world holds its start pose for one episode."""
     import mujoco
 
     from so101_rl.config import JOINT_NAMES, ticks_to_rad
@@ -511,7 +553,8 @@ def l2_die_do_nothing_cpu(cfg: Any, cal: Any, spec: Any, *, nworld: int = 16, se
     home = _home_ticks(cal)
     lo, hi = np.asarray(cfg.joints.min_ticks, np.int64), np.asarray(cfg.joints.max_ticks, np.int64)
     goal = spec.zone.goal_xyz()
-    starts, yaws = _die_starts(spec, nworld, rng, wh)
+    k = _start_stage(spec, stage)
+    starts, yaws = _die_starts(spec, nworld, rng, wh, k)
     wins, max_move = 0, 0.0
     for w in range(nworld):
         mujoco.mj_resetDataKeyframe(m, data, m.key("home").id)
@@ -537,9 +580,9 @@ def l2_die_do_nothing_cpu(cfg: Any, cal: Any, spec: Any, *, nworld: int = 16, se
             prev = die
         wins += int(won)
         max_move = max(max_move, float(np.linalg.norm(data.xpos[die_b] - start)))
-    return [GateRow("L2", "do_nothing", wins == 0,
-                    f"{wins} of {nworld} CPU episodes succeed (perfect always-visible tracker); die moved at most "
-                    f"{max_move * 1000:.2f} mm", "0")]  # fmt: skip
+    return [GateRow("L2", _row_name("do_nothing", spec, k), wins == 0,
+                    f"{_stage_label(spec, k)}: {wins} of {nworld} CPU episodes succeed (perfect always-visible "
+                    f"tracker); die moved at most {max_move * 1000:.2f} mm", "0")]  # fmt: skip
 
 
 def l_die_gpu(nworld: int = 1024, *, seed: int = 0, calibration: str | None = None) -> list[GateRow]:
@@ -565,9 +608,10 @@ def run_die_gates(*, gpu: bool | None = None, calibration: str | None = None, se
     from so101_rl.env.tasks import DIE_TO_ZONE
 
     cfg, cal, _fk = _setup(calibration)
-    rows = l1_die_cpu(DIE_TO_ZONE, seed=seed)
+    stages = range(DIE_TO_ZONE.die_start.n_stages)  # the start curriculum S0..S3 (S3 = the well, the target)
+    rows = [r for k in stages for r in l1_die_cpu(DIE_TO_ZONE, seed=seed, stage=k)]
     rows += l2_die_cpu(DIE_TO_ZONE, seed=seed)
-    rows += l2_die_do_nothing_cpu(cfg, cal, DIE_TO_ZONE, nworld=nworld_cpu, seed=seed)
+    rows += [r for k in stages for r in l2_die_do_nothing_cpu(cfg, cal, DIE_TO_ZONE, nworld=nworld_cpu, seed=seed, stage=k)]
     use_gpu = torch.cuda.is_available() if gpu is None else gpu
     if use_gpu:
         rows += l_die_gpu(seed=seed, calibration=calibration)

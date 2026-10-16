@@ -321,3 +321,86 @@ def test_step_reward_penalises_terminal_trips_only_np_and_torch_agree():
     assert float(step_reward_np(d, d, REACH, info={"trips": int(TripCause.NAN)})) == REACH.trip_penalty
     with pytest.raises(KeyError):
         step_reward_np(d, d, REACH, info={})  # a missing trip field is never "no trip"
+
+
+# ------------------------------------------------------------------------------------------------ start curriculum (D2a)
+def _tray_outer_xy(data, model):
+    """(x_lo, x_hi, y_lo, y_hi) of the tray's outer rim faces, from the scene's axis-aligned rim boxes."""
+    lo, hi = np.full(2, np.inf), np.full(2, -np.inf)
+    for g in range(model.ngeom):
+        if model.geom(g).name.startswith("tray_rim_"):
+            c, h = data.geom_xpos[g][:2], model.geom_size[g][:2]
+            lo, hi = np.minimum(lo, c - h), np.maximum(hi, c + h)
+    return lo[0], hi[0], lo[1], hi[1]
+
+
+def _rect_gap(a, b):
+    """Separation of two xy rectangles (x_lo, x_hi, y_lo, y_hi); <= 0 when they overlap."""
+    dx = max(b[0] - a[1], a[0] - b[1])
+    dy = max(b[2] - a[3], a[2] - b[3])
+    return max(dx, dy)
+
+
+def test_die_start_stages_s0_to_s3():
+    """Plan §10 2026-10-16 "Die start curriculum (attempt 2, D2a)": S0..S2 on the open table, S3 the (unchanged) well,
+    the default and exit-gate stage."""
+    ds = DIE_TO_ZONE.die_start
+    assert ds.n_stages == 4 and ds.well_stage == 3
+    assert [ds.stage_name(k) for k in range(4)] == ["table_near", "table_far", "tray_rim", "well"]
+    assert (ds.well_center_xy_m, ds.sigma_xy_m, ds.yaw) == ((0.20, -0.05), 0.005, "uniform")
+    with pytest.raises(ValueError):
+        ds.stage_name(4)
+
+
+def test_die_start_region_needs_room_for_every_yaw():
+    from so101_rl.env.tasks import DIE_MAX_FOOTPRINT_HALF_M, DieStartRegion
+
+    DieStartRegion("ok", ((0.0, 2 * DIE_MAX_FOOTPRINT_HALF_M, 0.0, 0.05),))
+    with pytest.raises(ValueError, match="too small"):
+        DieStartRegion("narrow", ((0.0, 2 * DIE_MAX_FOOTPRINT_HALF_M - 1e-4, 0.0, 0.05),))
+    with pytest.raises(ValueError):
+        DieStartRegion("empty", ())
+
+
+def test_die_start_table_stages_are_on_the_open_table_and_reachable(cfg):
+    """Every footprint rectangle: inside the safety box (xy), >= 2 mm clear of the tray's outer rim, >= 10 mm clear
+    of the zone square, its corners 0.12..0.26 m from the base (where the jaws reach a resting die,
+    tests/test_die_reach_feasibility.py) at a bearing of at most 35 deg."""
+    from so101_rl.sim.model import load_model
+
+    model, data = load_model()
+    tray = _tray_outer_xy(data, model)
+    assert tray == pytest.approx((0.167, 0.233, -0.083, -0.017), abs=1e-6)
+    z = DIE_TO_ZONE.zone
+    zone = (z.center_xy_m[0] - z.half_edge_m, z.center_xy_m[0] + z.half_edge_m,
+            z.center_xy_m[1] - z.half_edge_m, z.center_xy_m[1] + z.half_edge_m)  # fmt: skip
+    box = cfg.box
+    for reg in DIE_TO_ZONE.die_start.table_stages:
+        for r in reg.rects_xy_m:
+            assert box.x[0] <= r[0] < r[1] <= box.x[1] and box.y[0] <= r[2] < r[3] <= box.y[1], (reg.name, r)
+            assert _rect_gap(r, tray) >= 0.002 - 1e-9, (reg.name, r)
+            assert _rect_gap(r, zone) >= 0.010, (reg.name, r)
+            corners = np.array([(x, y) for x in r[:2] for y in r[2:]])
+            radius = np.hypot(corners[:, 0], corners[:, 1])
+            assert radius.min() >= 0.12 and radius.max() <= 0.26, (reg.name, r)
+            assert np.degrees(np.abs(np.arctan2(corners[:, 1], corners[:, 0]))).max() <= 35.0, (reg.name, r)
+
+
+def _dist_to_zone(xy):
+    z = DIE_TO_ZONE.zone
+    d = np.clip(np.abs(xy - np.asarray(z.center_xy_m)) - z.half_edge_m, 0.0, None)
+    return np.hypot(d[:, 0], d[:, 1])
+
+
+@pytest.mark.parametrize(("stage", "lo", "hi"), [(0, 0.019, 0.063), (1, 0.06, 0.127), (2, 0.06, 0.152)])
+def test_die_start_stage_distances_to_the_zone(stage, lo, hi):
+    """Die centre to the zone square: S0 2-6.2 cm (a straight +y push), S1 6.5-12.5 cm, S2 (at the rim) 6.3-15 cm. Sampled
+    with the env's rule (the numpy twin ``rl.gates._die_starts``), so the yaw-dependent clipping is included."""
+    from so101_rl.rl.gates import _die_starts
+
+    xyz, _ = _die_starts(DIE_TO_ZONE, 20_000, np.random.default_rng(0), 0.0115, stage)
+    d = _dist_to_zone(xyz[:, :2])
+    assert lo <= d.min() and d.max() <= hi, (d.min(), d.max())
+    if stage == 0:  # in front of the zone: within its x span, so the push is straight in +y
+        z = DIE_TO_ZONE.zone
+        assert (np.abs(xyz[:, 0] - z.center_xy_m[0]) <= z.half_edge_m).all()

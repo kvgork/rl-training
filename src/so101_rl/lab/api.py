@@ -26,7 +26,7 @@ MAX_AI_PAUSES = 2  # P7: the AI may pause and resume a sim attempt at most twice
 MAX_WAIT_S = 300
 METRIC_ROWS = 20
 METRIC_COLS = 8
-# the columns an AI needs to judge a fastsac_sim run (train_sim_sac.METRICS_FIELDS has 26); others: the first 8
+# the columns an AI needs to judge a fastsac_sim run (train_sim_sac.METRICS_FIELDS has 27); others: the first 8
 KEY_METRIC_COLS = ("env_step", "train_s", "dr_stage", "train_success_rate", "mean_return", "critic_loss",
                    "eval_success_rate", "eval_wilson_lo")  # fmt: skip
 # what a column does NOT mean (returned with the metrics, so an AI is not misled)

@@ -390,3 +390,104 @@ def test_bench_cli_has_allow_provisional_flag():
     from so101_rl.env import batched_env
 
     assert "--allow-provisional-camera" in inspect.getsource(batched_env._bench)
+
+
+# ---- die start curriculum (D2a): the torch placement on CPU through a stub (no MuJoCo Warp needed)
+def _die_stub(stage=None, n=4096, seed=0):
+    import types
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    ds = DIE_TO_ZONE.die_start
+    return types.SimpleNamespace(task=DIE_TO_ZONE, nworld=n, _gen=g, device=torch.device("cpu"), _die_q=0,
+                                 _start_stage=ds.well_stage if stage is None else stage)  # fmt: skip
+
+
+def _place(stub):
+    from so101_rl.env.batched_env import BatchedGoalEnv
+
+    q = torch.zeros((stub.nworld, 7))
+    BatchedGoalEnv._place_die(stub, q)
+    yaw = 2 * torch.atan2(q[:, 6], q[:, 3])
+    return q, yaw
+
+
+def test_die_well_stage_placement_is_the_pre_curriculum_draw():
+    """Without a curriculum (the default well stage) the die placement is bit-identical to the D1 env's: same draws,
+    same order, same clipping."""
+    import math
+
+    from so101_rl.env.batched_env import _WELL_HALF_M
+    from so101_rl.env.tasks import DIE_HALF_EDGE_M
+    from so101_rl.sim.model import TABLE_Z_M
+
+    stub = _die_stub()
+    q, _ = _place(stub)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(0)
+    n, ds = stub.nworld, DIE_TO_ZONE.die_start
+    yaw = torch.rand(n, generator=g) * (2 * math.pi)
+    reach = DIE_HALF_EDGE_M * (torch.cos(yaw).abs() + torch.sin(yaw).abs())
+    slack = (_WELL_HALF_M - reach).clamp_min(0.0)[:, None]
+    xy = torch.randn((n, 2), generator=g) * ds.sigma_xy_m
+    xy = torch.maximum(torch.minimum(xy, slack), -slack)
+    assert torch.equal(q[:, :2], torch.tensor(ds.well_center_xy_m, dtype=torch.float32) + xy)
+    assert torch.equal(q[:, 3], torch.cos(yaw / 2)) and torch.equal(q[:, 6], torch.sin(yaw / 2))
+    assert torch.allclose(q[:, 2], torch.full((n,), TABLE_Z_M + DIE_HALF_EDGE_M))
+
+
+@pytest.mark.parametrize("stage", [0, 1, 2])
+def test_die_table_stage_footprint_stays_in_its_rectangles_for_the_used_yaw(stage):
+    """Open-table stage: every die footprint (the 4 corners at the quaternion's yaw) lies inside one of the stage's
+    rectangles, every rectangle is used about in proportion to its area, and the numpy twin (``rl.gates._die_starts``)
+    draws the same distribution."""
+    from so101_rl.env.tasks import DIE_HALF_EDGE_M
+    from so101_rl.rl.gates import _die_starts
+
+    reg = DIE_TO_ZONE.die_start.table_stages[stage]
+    q, yaw = _place(_die_stub(stage, n=20_000))
+    xy = q[:, :2].double().numpy()
+    c, s = np.cos(yaw.double().numpy()), np.sin(yaw.double().numpy())
+    corners = [xy + DIE_HALF_EDGE_M * np.column_stack([sx * c - sy * s, sx * s + sy * c])
+               for sx in (-1, 1) for sy in (-1, 1)]  # fmt: skip
+    inside = np.zeros((len(reg.rects_xy_m), len(xy)), bool)
+    for i, (x0, x1, y0, y1) in enumerate(reg.rects_xy_m):
+        inside[i] = np.all([(p[:, 0] >= x0 - 1e-6) & (p[:, 0] <= x1 + 1e-6) & (p[:, 1] >= y0 - 1e-6)
+                            & (p[:, 1] <= y1 + 1e-6) for p in corners], axis=0)  # fmt: skip
+    assert inside.any(axis=0).all()
+    share = inside.argmax(axis=0)
+    np.testing.assert_allclose(np.bincount(share, minlength=len(reg.areas)) / len(xy), reg.areas / reg.areas.sum(),
+                               atol=0.02)  # fmt: skip
+    twin, _ = _die_starts(DIE_TO_ZONE, 20_000, np.random.default_rng(0), 0.0115, stage)
+    np.testing.assert_allclose(xy.mean(axis=0), twin[:, :2].mean(axis=0), atol=1.5e-3)
+    np.testing.assert_allclose(xy.min(axis=0), twin[:, :2].min(axis=0), atol=1e-3)
+    np.testing.assert_allclose(xy.max(axis=0), twin[:, :2].max(axis=0), atol=1e-3)
+
+
+def test_set_start_stage_validates():
+    import types
+
+    from so101_rl.env.batched_env import BatchedGoalEnv
+
+    stub = _die_stub()
+    BatchedGoalEnv.set_start_stage(stub, 0)
+    assert stub._start_stage == 0
+    with pytest.raises(ValueError, match="outside"):
+        BatchedGoalEnv.set_start_stage(stub, 4)
+    with pytest.raises(ValueError, match="no die start"):
+        BatchedGoalEnv.set_start_stage(types.SimpleNamespace(task=REACH), 0)
+
+
+@gpu
+def test_die_start_stage_on_the_batched_env(scene, mcfg, mcal):
+    """The env defaults to the well; after ``set_start_stage(0)`` every reset places the die in front of the zone."""
+    env = _env(scene, mcfg, mcal, DIE_TO_ZONE, n=64)
+    try:
+        assert env.start_stage == DIE_TO_ZONE.die_start.well_stage
+        env.set_start_stage(0)
+        env.reset(phase_randomise=False)
+        x0, x1, y0, y1 = DIE_TO_ZONE.die_start.table_stages[0].rects_xy_m[0]
+        die = env.ws.body_xpos("die").cpu().numpy()
+        assert ((die[:, 0] > x0) & (die[:, 0] < x1) & (die[:, 1] > y0) & (die[:, 1] < y1)).all()
+    finally:
+        env.close()
