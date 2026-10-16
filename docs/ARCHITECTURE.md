@@ -1,6 +1,6 @@
 # SO-101 Self-Learning RL — Architecture
 
-> **Status:** v0.57 (2026-10-16). This describes the *target* architecture for Stage A. **Implemented so far:**
+> **Status:** v0.58 (2026-10-16). This describes the *target* architecture for Stage A. **Implemented so far:**
 > - *Wave 0:* the package skeleton, the pixi environments, `config/`, the shared-memory primitive, the bus, timing and safety-type contracts, the vendored TD-MPC2 and the MJCF assets.
 > - *Wave 1:* the servo backends and heartbeat link (U1), the safety layer (U2), the MuJoCo backend (U4), Stage A perception (U5), episode logging (U6), and the watchdog firmware with the hardware checklist (U7).
 > - *Wave 2:* the servo core, the servo process and CLI, the soak harness and gate, and the latency hooks (U3). Exercised on the fake and MuJoCo backends only; nothing has run on the real arm yet.
@@ -145,6 +145,7 @@ rl-trainer/
 ├── scripts/                      # fetch_assets.py, extract_kinematics.py, vendor_tdmpc2.py (reproducible generators),
 │                                 # bench_warp.py (MuJoCo Warp throughput/VRAM/overflow/parity + the S0 gate)
 │                                 # finetune_critic_diag.py, finetune_awr_offline.py, finetune_awr_eval.py (offline, CPU-only fine-tune experiments)
+│                                 # point_tip.py (hold the tip at a base-frame point, e.g. to mark the die zone)
 ├── assets/so101/                 # official TheRobotStudio MJCF (+ licence), jaw primitives, keyframes
 │   └── upstream/                 # fetched unmodified at a pinned commit (UPSTREAM.json holds sha + sha256 per file)
 ├── calib/                        # camera.yaml (THE D435 model: intrinsics + pose, SUC), distractors.yaml (C.5), hand_eye.yaml,
@@ -651,3 +652,4 @@ Bump the version line at the top and add an entry below.
 | 0.55 | 2026-10-16 | **Sim tracker ring rule** (`sim/sim_tracker.py` `ring_occluded_fraction`, `RING_PX` / `RING_OCCLUDED_FRACTION` / `RING_DEPTH_M`; plan §10 2026-10-16 "Start-well occlusion parity fixed"): the sim die is also invisible when more than 15 % of a ring around its blob (the blob's equivalent radius plus 1.5 px) sees an occluder box at least 2 cm nearer than the die, the real tracker's ring test. Closes the start-well parity gap (`tests/test_die_convention.py` xfail now passes); constants pinned to `perception/die_tracker.py` by a test. |
 | 0.56 | 2026-10-16 | **Register-read retry** (`servo/feetech_bus.py` `read_reg`, `REG_READ_RETRIES` 2; plan §10 2026-10-16): a single-register read is retried up to 2 more times on a failed transaction (no reply, corrupted status packet), e.g. re-energise's Goal_Position read-back; values are still compared strictly; writes and the per-tick sync read are not retried. |
 | 0.57 | 2026-10-16 | **Die start curriculum** (`plans/die-to-zone-plan.md` D2a; plan §10 2026-10-16 "Die start curriculum (attempt 2, D2a)"; `env/tasks.py` `DieStartRegion`, `DieStartSpec.table_stages` / `well_stage` / `n_stages` / `stage_name`, `DIE_START_TABLE_STAGES`; `env/batched_env.py` `set_start_stage` / `start_stage`; `rl/gates.py` per-stage `start_not_success` / `do_nothing`; `rl/train_sim_sac.py` `die_start_curriculum`, the `start_stage` metrics column and checkpoint field, `trigger_kind`; `rl/toy_batched_env.py`). §3 "Die start curriculum". Without the new key nothing changes (the die starts in the well, reach untouched). Also fixed: a review trigger whose text carries numbers (the die low-success trigger) was recorded on every log line once it held; now once per run. |
+| 0.58 | 2026-10-16 | **`scripts/point_tip.py`** (plan §10 2026-10-16 "Die zone moved into the camera view"): drives the gripper tip to a base-frame point with the reach policy (deploy-policy's servo checks, attended / no-watchdog refusal, keep-alive and episode loop) and holds it there with zero-delta RUN commands (not HOLD: a HOLD inside RUN trips the stuck monitor after 3 s), then lets the stale-command stop take the arm to rest. Used to mark the die zone on the table. |
