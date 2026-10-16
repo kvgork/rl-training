@@ -19,7 +19,11 @@ blob, bad depth or an occluding nearer object):
   occluder boxes that are NEARER to the camera than the die (ray cast from the true colour and depth camera
   centres); invisible when the covered fraction exceeds ``occlusion_fraction``, OR when the gripper tip lies within
   ``occlusion_radius_m`` of the camera's ray to the die, in front of it (the cheap fallback; overhead it was "the
-  tip above the die"). The real tracker's ring test ("a nearer object touches the blob") approximates the same.
+  tip above the die"). ALSO invisible when more than ``RING_OCCLUDED_FRACTION`` (15 %) of a ring around the disc
+  (``RING_PX`` pixels outside its edge at the die's depth) sees an occluder box at least ``RING_DEPTH_M`` (2 cm)
+  nearer than the die (the ring's middle: the blob's equivalent radius plus half the band): the real tracker's ring test (``HsvDepthDieTracker._occluded``, a 7x7 dilation ring and a
+  2 cm depth window), which rejects a die sitting in a recess such as the start-well tray from the oblique camera
+  even when the die itself is unobstructed (camera parity, plan section 10 2026-10-16).
 * Noise per frame: Gaussian in the CAMERA frame (``sigma_xy_m`` across, ``sigma_z_m`` along the optical axis), then
   a per-episode camera-pose error: the true camera is the calibrated one rotated about its centre (up to
   ``rot_bias_max_rad``) and shifted (up to ``bias_max_m``); visibility uses the true pose, the reported position
@@ -69,6 +73,11 @@ __all__ = [
 ]
 
 DIE_DISC_RADIUS_M: Final[float] = DIE_EDGE_M / 2  # 8 mm
+# the real tracker's ring test (perception/die_tracker.py: _RING_KERNEL 7x7 -> 3 px, _OCCLUDED_RING_FRACTION, the
+# default depth_window_m); tests/test_die_convention.py asserts they match
+RING_PX: Final[float] = 3.0
+RING_OCCLUDED_FRACTION: Final[float] = 0.15
+RING_DEPTH_M: Final[float] = 0.02
 NEVER_SEEN_AGE: Final[int] = 10_000  # age_frames until the first sighting after a reset
 TABLE_HALF_M: Final[float] = 0.6  # scene table plane half size (so101_rl_scene.xml)
 _N_DISC: Final[int] = 32
@@ -558,13 +567,11 @@ class SimDieTracker:
         v = cm.fy * pc[..., 1] / zs + cm.cy
         return torch.stack([u, v], dim=-1), z
 
-    def _covered_from(self, die, R, t, jaw_centers, jaw_half, jaw_rot) -> torch.Tensor:
+    @staticmethod
+    def _box_hits(pts, o, jaw_centers, jaw_half, jaw_rot, s_max) -> torch.Tensor:
+        """bool[N,P]: the ray ``o + s (pts - o)`` enters one of the boxes at some ``s < s_max`` (slab test)."""
         n, m = jaw_centers.shape[:2]
-        ax, ay = R[:, :, 0], R[:, :, 1]  # [N,3] camera x / y axes in base
-        r = DIE_DISC_RADIUS_M
-        pts = die[:, None, :] + r * (self._disc[None, :, 0:1] * ax[:, None] + self._disc[None, :, 1:2] * ay[:, None])
-        o = t  # [N,3] camera centres
-        d = pts - o[:, None]  # ray o + s d reaches the disc point at s = 1
+        d = pts - o[:, None]  # ray o + s d reaches the point at s = 1
         c = jaw_centers.float()
         h = jaw_half.float()
         if jaw_rot is None:
@@ -579,8 +586,42 @@ class SimDieTracker:
         t2 = (h[:, None] - o_l) / d_l
         t_in = torch.minimum(t1, t2).amax(dim=-1)
         t_out = torch.maximum(t1, t2).amin(dim=-1)
-        hit = (t_out >= t_in.clamp_min(0.0)) & (t_in < 1.0)  # [N,32,M]
-        return hit.any(dim=-1).float().mean(dim=1)
+        if not torch.is_tensor(s_max):
+            s_max = torch.tensor(float(s_max), device=pts.device)
+        hit = (t_out >= t_in.clamp_min(0.0)) & (t_in < s_max[..., None])  # [N,P,M]
+        return hit.any(dim=-1)
+
+    def _disc_pts(self, die, R, radius) -> torch.Tensor:
+        ax, ay = R[:, :, 0], R[:, :, 1]  # [N,3] camera x / y axes in base
+        r = radius if torch.is_tensor(radius) else torch.full((die.shape[0],), float(radius), device=die.device)
+        return die[:, None, :] + r[:, None, None] * (self._disc[None, :, 0:1] * ax[:, None] + self._disc[None, :, 1:2] * ay[:, None])
+
+    def _covered_from(self, die, R, t, jaw_centers, jaw_half, jaw_rot) -> torch.Tensor:
+        pts = self._disc_pts(die, R, DIE_DISC_RADIUS_M)
+        return self._box_hits(pts, t, jaw_centers, jaw_half, jaw_rot, 1.0).float().mean(dim=1)
+
+    def _ring_from(self, die, R, t, cm, jaw_centers, jaw_half, jaw_rot) -> torch.Tensor:
+        z = self._to_cam(die, R, t)[:, 2].clamp_min(1e-6)  # the die's depth along this sensor's optical axis
+        # the ring's middle: the blob's equivalent radius (from its projected area) plus half the 3 px band
+        blob_px = (self.die_area_px(die).clamp_min(0.0) / math.pi).sqrt()
+        radius = (blob_px + RING_PX / 2) * z / float(cm.fx)
+        pts = self._disc_pts(die, R, radius)
+        rng = (pts - t[:, None]).norm(dim=-1).clamp_min(1e-6)  # [N,P]
+        return self._box_hits(pts, t, jaw_centers, jaw_half, jaw_rot, 1.0 - RING_DEPTH_M / rng).float().mean(dim=1)
+
+    def ring_occluded_fraction(
+        self,
+        die_xyz_true: torch.Tensor,
+        jaw_centers: torch.Tensor,
+        jaw_half: torch.Tensor,
+        jaw_rot: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """float[N]: fraction of the ring around the die's disc (``RING_PX`` outside its edge) whose ray meets an
+        occluder box at least ``RING_DEPTH_M`` before the ring point (the real ring test), the larger of the colour
+        and depth sensors."""
+        die = die_xyz_true.float()
+        fr = [self._ring_from(die, R, t, cm, jaw_centers, jaw_half, jaw_rot) for R, t, cm in self._poses()]
+        return torch.stack(fr).amax(dim=0)
 
     def covered_fraction(
         self,
@@ -618,7 +659,8 @@ class SimDieTracker:
         """bool[N]; the rule the real tracker's ring test approximates (module docstring)."""
         die, tip = die_xyz_true.float(), tip_xyz.float()
         cov = self.covered_fraction(die, jaw_centers, jaw_half, jaw_rot)
-        return self._tip_in_front(die, tip) | (cov > self.noise.occlusion_fraction)
+        ring = self.ring_occluded_fraction(die, jaw_centers, jaw_half, jaw_rot)
+        return self._tip_in_front(die, tip) | (cov > self.noise.occlusion_fraction) | (ring > RING_OCCLUDED_FRACTION)
 
     def _in_image(self, p: torch.Tensor, margin_px: torch.Tensor | float = 0.0) -> torch.Tensor:
         """Projected point inside the image(s). ``margin_px`` (scalar or ``[N, ...]``) shrinks the COLOUR image on all
@@ -671,7 +713,13 @@ class SimDieTracker:
         n = self.nworld
         die = die_xyz_true.float()
         covered = self.covered_fraction(die, jaw_centers, jaw_half, jaw_rot)
-        base_ok = self.in_view(die) & ~self._tip_in_front(die, tip_xyz.float()) & ~(covered > nz.occlusion_fraction)
+        ring = self.ring_occluded_fraction(die, jaw_centers, jaw_half, jaw_rot)
+        base_ok = (
+            self.in_view(die)
+            & ~self._tip_in_front(die, tip_xyz.float())
+            & ~(covered > nz.occlusion_fraction)
+            & ~(ring > RING_OCCLUDED_FRACTION)
+        )
         conf = (1.0 - covered).clamp(0.0, 1.0)
         target = die
         fp = torch.zeros(n, dtype=torch.bool, device=dev)
