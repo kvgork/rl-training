@@ -116,6 +116,18 @@ def test_l1_die_start_not_success_and_its_twin():
     assert not row.passed, row
 
 
+def test_zone_in_view_and_its_twin():
+    """Plan §10 2026-10-16 "Die zone moved into the camera view": every point of the zone square (7 x 7 incl. the
+    corners) is in the calibrated camera's view. Shown to fail: the old zone (0.22, 0.10), entirely out of view, and a
+    zone straddling the view's +y edge (only some points out)."""
+    row = gates.zone_in_view_cpu(DIE_TO_ZONE)[0]
+    assert row.passed and row.name == "zone_in_view" and row.value.startswith("49 of 49"), row
+    old = gates.zone_in_view_cpu(_zone_at((0.22, 0.10)))[0]
+    assert not old.passed and old.value.startswith("0 of 49"), old
+    edge = gates.zone_in_view_cpu(_zone_at((0.20, 0.03)))[0]
+    assert not edge.passed and not edge.value.startswith("0 of"), edge
+
+
 def test_l2_die_passes_with_the_task_predicate():
     rows = {r.name: r for r in gates.l2_die_cpu(DIE_TO_ZONE, n=20_000)}
     assert set(rows) == {"adversarial", "independent_predicate", "independent_settle"}
@@ -189,7 +201,7 @@ def test_cli_die_runs_on_cpu(tmp_path, monkeypatch):
     doc = json.loads(out.read_text())
     rows = {r["name"]: r for r in doc["rows"]}
     assert doc["task"] == "die_to_zone" and not doc["passed"]
-    cpu = ("start_not_success", "adversarial", "independent_predicate", "independent_settle", "do_nothing")
+    cpu = ("zone_in_view", "start_not_success", "adversarial", "independent_predicate", "independent_settle", "do_nothing")
     assert all(rows[n]["passed"] for n in cpu), rows
     # the start curriculum (D2a): start_not_success and do_nothing once per stage; S3 = the well keeps the names
     per_stage = [f"{g}_S{k}" for g in ("start_not_success", "do_nothing") for k in range(3)]

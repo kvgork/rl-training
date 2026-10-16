@@ -91,8 +91,12 @@ def _reach_resting_die(cfg, cal, fk, box, target_xy) -> tuple[np.ndarray, float,
     mesh = ExactMesh(cal)
     grid = _arm_grid(cfg)
     xyz = fk_tip_batch(fk, grid)
-    r_t = float(np.hypot(*target_xy))
-    near = (np.abs(np.hypot(xyz[:, 0], xyz[:, 1]) - r_t) < 0.004) & (xyz[:, 2] >= box.z[0]) & (xyz[:, 2] <= DIE_TOP)
+    # radius about the shoulder_pan axis (not the base origin: the axis sits ~39 mm in front of it, which matters at
+    # the zone's -41 deg bearing), so a pan rotation of a grid pose can land on the target
+    chain = KinematicChain.from_yaml(cfg.kinematics_path)
+    axis = (chain.base_T @ chain.parent_T[0])[:2, 3]
+    r_t = float(np.hypot(*(np.asarray(target_xy) - axis)))
+    near = (np.abs(np.hypot(xyz[:, 0] - axis[0], xyz[:, 1] - axis[1]) - r_t) < 0.004) & (xyz[:, 2] >= box.z[0]) & (xyz[:, 2] <= DIE_TOP)
     best = None
     tmp = np.zeros(3)
     for t in grid[near]:
@@ -103,8 +107,10 @@ def _reach_resting_die(cfg, cal, fk, box, target_xy) -> tuple[np.ndarray, float,
         margin = min(low - box.gripper_floor_z_m, DIE_TOP - jz.max(), jz.min() - TABLE_Z_M)
         if margin <= 0 or (best is not None and margin <= best[1]):
             continue
-        pans = np.tile(t, (801, 1))
-        pans[:, 0] = np.arange(1647, 2448)
+        # the whole calibrated pan range (was +-400 ticks = +-35 deg; the zone at (0.15, -0.13) bears -41 deg)
+        pan = np.arange(int(cfg.joints.min_ticks[0]), int(cfg.joints.max_ticks[0]) + 1)
+        pans = np.tile(t, (len(pan), 1))
+        pans[:, 0] = pan
         p = fk_tip_batch(fk, pans)
         inside = np.array([fk.in_box_gripper(pp, floor_z, box) for pp in p])
         err = np.where(inside, np.hypot(p[:, 0] - target_xy[0], p[:, 1] - target_xy[1]), np.inf)

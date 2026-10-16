@@ -185,18 +185,23 @@ class DieStartSpec:
         return "well" if int(k) == self.well_stage else self.table_stages[int(k)].name
 
 
-# The die start curriculum (plan §10 2026-10-16 "Die start curriculum (attempt 2, D2a)"): footprint rectangles on the
-# open table, clear of the tray (outer rim x 0.167..0.233, y -0.083..-0.017; >= 2 mm) and of the zone square
-# (x 0.19..0.25, y 0.07..0.13; >= 12 mm), inside the safety box and the radius band where the jaws reach a resting
-# die (0.12..0.26 m from the base, |bearing| <= 35 deg). Distances = die centre to the zone square
-# (tests/test_tasks.py checks all of it against the scene).
+# The die start curriculum (plan §10 2026-10-16 "Die start curriculum (attempt 2, D2a)", redrawn around the moved zone,
+# plan §10 2026-10-16 "Die zone moved into the camera view"): footprint rectangles on the open table, clear of the tray
+# (outer rim x 0.167..0.233, y -0.083..-0.017; >= 2 mm) and of the zone square (x 0.12..0.18, y -0.16..-0.10;
+# >= 10 mm), inside the safety box and the radius band where the jaws reach a resting die (0.12..0.26 m from the
+# base, |bearing| <= 35 deg), and in the calibrated camera's view (``SimDieTracker.in_view``). Distances = die centre
+# to the zone square (tests/test_tasks.py checks all of it against the scene and calib/camera.yaml).
 DIE_START_TABLE_STAGES: Final[tuple[DieStartRegion, ...]] = (
-    # S0: straight in front of the zone (between the tray and the zone): push 2-6.2 cm in +y to the zone edge
-    DieStartRegion("table_near", ((0.185, 0.240, 0.000, 0.058),)),
-    # S1: the open table left of the tray (towards the base): 6.5-12.5 cm from the zone, a diagonal push
-    DieStartRegion("table_far", ((0.125, 0.155, -0.050, 0.030),)),
-    # S2: just outside the tray rim (2-32 mm off it) on its zone side and its base side: 6.3-15 cm (the well: 12 cm)
-    DieStartRegion("tray_rim", ((0.167, 0.233, -0.015, 0.015), (0.135, 0.165, -0.083, -0.017))),
+    # S0: straight in front of the zone (between the base, the tray and the zone): push 2-6 cm in -y to the zone edge.
+    # x <= 0.149 keeps the die and its whole push lane out of the placeholder tray rim's shadow (x >= 0.15 for
+    # y -0.02..-0.125 from the oblique camera): visible at the start and all the way into the zone
+    DieStartRegion("table_near", ((0.126, 0.149, -0.088, -0.032),)),
+    # S1: the same lane farther out, left of the tray (towards +y): 7.6-12 cm, a longer straight -y push
+    DieStartRegion("table_far", ((0.126, 0.165, -0.032, 0.028),)),
+    # S2: just outside the tray rim (2-30 mm off it) on its zone-facing side (-y, beside the zone: 1.9-4.2 cm; the rim
+    # hides part of this strip from the oblique camera, as it hides the well) and its far side (+y: 9.3-11.5 cm, the
+    # die must be brought around the tray). S3, the well, is 4.9-5.8 cm from the zone.
+    DieStartRegion("tray_rim", ((0.191, 0.230, -0.113, -0.085), (0.167, 0.233, -0.015, 0.015))),
 )
 
 
@@ -234,7 +239,8 @@ class TaskSpec:
             raise ValueError("settle_m needs success_debounce_steps >= 2 and a positive distance")
 
 
-_ZONE_CENTER_XY_M: Final[tuple[float, float]] = (0.22, 0.10)  # scene site `zone` (test-enforced)
+# scene site `zone` (test-enforced); in the calibrated camera's view (plan §10 2026-10-16, gate `zone_in_view`)
+_ZONE_CENTER_XY_M: Final[tuple[float, float]] = (0.15, -0.13)
 _ZONE_HALF_EDGE_M: Final[float] = 0.030
 
 

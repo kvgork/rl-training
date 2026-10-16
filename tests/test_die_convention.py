@@ -25,8 +25,8 @@ from so101_rl.sim.sim_tracker import NO_NOISE, CameraModel, SimDieTracker, Track
 pytestmark = pytest.mark.usefixtures("provisional_camera")
 
 CPU = torch.device("cpu")
-# resting die positions clear of the arm at home: start well (hidden by its rim from the oblique camera), zone, two
-# more on the table
+# resting die positions clear of the arm at home: start well (hidden by its rim from the oblique camera), the pre-0.59
+# zone centre, two more on the table
 SCENES = [(0.20, -0.05, 0.0), (0.22, 0.10, 0.6), (0.26, -0.10, 1.1), (0.15, 0.08, 0.3)]
 
 

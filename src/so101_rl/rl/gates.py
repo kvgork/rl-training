@@ -30,6 +30,10 @@ predicate (``env/tasks.py``): visible AND ``|dx|, |dy| <= zone.half_edge_m`` (a 
 ``z - z_goal <= zone.max_height_m``; termination needs ``success_debounce_steps`` consecutive predicate steps with
 the die settled (moved <= ``settle_m`` between them).
 
+- ``zone_in_view`` (L1, CPU): every point of a 7 x 7 lattice over the zone square (corners included) at the resting
+  die height is in the calibrated D435's view (``calib/camera.yaml``, ``SimDieTracker.in_view``: colour and depth
+  image with the half-blob border margin). A zone the camera cannot see makes the task unsolvable (the old zone at
+  (0.22, 0.10) was entirely out of view; plan §10 2026-10-16 "Die zone moved into the camera view").
 - ``start_not_success`` (L1, CPU): no die start lies in the zone. Worst case over the whole start set (the batched
   env clips the die centre to the flat floor of the start well, ``batched_env._WELL_HALF_M``: the well square's
   point nearest the zone centre) plus 1e4 sampled starts (the env's draw: N(centre, sigma), clipped).
@@ -458,6 +462,36 @@ def l1_die_cpu(spec: Any, *, n: int = 10_000, seed: int = 0, well_half_m: float 
                     f"the zone; nearest start {margin * 1000:.1f} mm outside the zone edge", "0")]  # fmt: skip
 
 
+def zone_in_view_cpu(spec: Any, *, camera: Any = None, grid: int = 7) -> list[GateRow]:
+    """``zone_in_view`` (L1, CPU): every point of a ``grid`` x ``grid`` lattice over the zone square (corners
+    included) at the resting die height is in the calibrated camera's view by the simulated tracker's rule
+    (``SimDieTracker.in_view``: colour and depth image, half-blob border margin; nominal pose, no DR), else no success
+    can ever be seen there (plan §10 2026-10-16 "Die zone moved into the camera view"). ``camera``: a
+    ``CameraCalib`` or a path (default ``calib/camera.yaml``)."""
+    from so101_rl.perception.camera_calib import CameraCalib, load_camera_calib
+    from so101_rl.sim.sim_tracker import NO_NOISE, CameraModel, SimDieTracker
+
+    zone = spec.zone
+    if zone is None:
+        raise ValueError(f"task {spec.name!r} has no zone")
+    calib = camera if isinstance(camera, CameraCalib) else load_camera_calib(camera)
+    goal = zone.goal_xyz()
+    s = np.linspace(-zone.half_edge_m, zone.half_edge_m, int(grid))
+    dx, dy = (a.ravel() for a in np.meshgrid(s, s, indexing="ij"))
+    pts = np.column_stack([goal[0] + dx, goal[1] + dy, np.full(dx.size, goal[2])])
+    color = CameraModel.from_calib(calib, "color")
+    tr = SimDieTracker(color, NO_NOISE, len(pts), device="cpu", seed=0, depth_cam=CameraModel.from_calib(calib, "depth"))
+    ok = tr.in_view(torch.as_tensor(pts, dtype=torch.float32)).numpy()
+    uv, _ = color.project(pts)
+    out = pts[~ok][:, :2]
+    worst = f"; out of view e.g. ({out[0][0]:.3f}, {out[0][1]:.3f})" if len(out) else ""
+    return [GateRow("L1", "zone_in_view", bool(ok.all()),
+                    f"{int(ok.sum())} of {len(pts)} zone points (centre ({goal[0]:.3f}, {goal[1]:.3f}), "
+                    f"{int(grid)}x{int(grid)} incl. corners) in view; colour px u {uv[:, 0].min():.0f}..{uv[:, 0].max():.0f} "
+                    f"v {uv[:, 1].min():.0f}..{uv[:, 1].max():.0f} of {color.width}x{color.height}{worst}",
+                    "all")]  # fmt: skip
+
+
 def l2_die_cpu(spec: Any, *, predicate: Predicate | None = None, debounce: Callable[..., Any] | None = None,
                n: int = 100_000, seed: int = 0) -> list[GateRow]:  # fmt: skip
     """``adversarial``, ``independent_predicate`` and ``independent_settle``. ``predicate(a, d, visible)`` and
@@ -609,7 +643,8 @@ def run_die_gates(*, gpu: bool | None = None, calibration: str | None = None, se
 
     cfg, cal, _fk = _setup(calibration)
     stages = range(DIE_TO_ZONE.die_start.n_stages)  # the start curriculum S0..S3 (S3 = the well, the target)
-    rows = [r for k in stages for r in l1_die_cpu(DIE_TO_ZONE, seed=seed, stage=k)]
+    rows = zone_in_view_cpu(DIE_TO_ZONE)
+    rows += [r for k in stages for r in l1_die_cpu(DIE_TO_ZONE, seed=seed, stage=k)]
     rows += l2_die_cpu(DIE_TO_ZONE, seed=seed)
     rows += [r for k in stages for r in l2_die_do_nothing_cpu(cfg, cal, DIE_TO_ZONE, nworld=nworld_cpu, seed=seed, stage=k)]
     use_gpu = torch.cuda.is_available() if gpu is None else gpu
