@@ -210,3 +210,15 @@ def test_scripted_reach_do_nothing_random_gpu():
     assert rows["scripted_reach"].passed, rows["scripted_reach"]
     assert rows["do_nothing"].passed, rows["do_nothing"]
     assert rows["random_policy"].passed, rows["random_policy"]
+
+
+def test_die_do_nothing_cpu_places_the_die_at_rest(cfg, calibration):
+    """The CPU do-nothing gate places the die with the yaw its start was clipped for: it stays at rest (a second,
+    fresh yaw let the footprint overlap the funnel and the die was pushed out by up to 2.4 mm, 2026-10-16)."""
+    from so101_rl.env.tasks import DIE_TO_ZONE
+    from so101_rl.rl.gates import l2_die_do_nothing_cpu
+
+    row = l2_die_do_nothing_cpu(cfg, calibration, DIE_TO_ZONE, nworld=8)[0]
+    assert row.passed
+    moved_mm = float(row.value.split("at most ")[1].split(" mm")[0])
+    assert moved_mm < 0.5
