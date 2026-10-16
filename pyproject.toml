@@ -139,6 +139,7 @@ camera-intrinsics = "python -m so101_rl.perception.camera_intrinsics"   # --seri
 camera-calibrate = { cmd = "python -m so101_rl.perception.camera_calibrate", env = { MUJOCO_GL = "egl" } }   # --method arm-shape [--poses K] [--from-capture DIR]
 camera-overlay = { cmd = "python -m so101_rl.perception.camera_overlay", env = { MUJOCO_GL = "egl" } }
 camera-distractors = "python -m so101_rl.perception.distractors"
+perception = { cmd = "python -m so101_rl.perception.process", env = { MUJOCO_GL = "egl" } }   # D3: D435 -> die tracker -> object table shm (single writer); --backend sim = MuJoCo renders
 # MVP (plans/mvp-plan.md): sim reach trainer (M1-M4) and the minimal lab connector (M5).
 sim-gates = "python -m so101_rl.rl.gates"   # --task reach: L1/L2 PASS/FAIL table, exit 0 only when all pass
 train-sim-sac = "python -m so101_rl.rl.train_sim_sac"   # --task reach --nworld N --budget-min M
