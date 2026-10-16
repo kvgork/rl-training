@@ -41,6 +41,7 @@ class World:
             m[7] = 250  # factory Return_Delay_Time
         self.fail_sync_read = False
         self.silent = set()  # ids that never answer
+        self.corrupt_reads = 0  # the next N single-register reads return a corrupted status packet
         self.sync_writes = []  # (start_address, data_length, param bytes)
         self.reg_writes = []  # (id, addr, length, data bytes)
         self.closed = False
@@ -96,6 +97,9 @@ class World:
     def _read_n(self, motor_id, addr, n):
         if not self._alive(motor_id):
             return 0, scs.COMM_RX_TIMEOUT, 0
+        if self.corrupt_reads > 0:
+            self.corrupt_reads -= 1
+            return 0, scs.COMM_RX_CORRUPT, 0
         return self.get_reg(motor_id, addr, n), scs.COMM_SUCCESS, 0
 
     def read1ByteTxRx(self, port, motor_id, addr):
@@ -342,3 +346,29 @@ def test_block_read_latency():
             assert bus.read_reg("Return_Delay_Time", motor_id) == 0
     finally:
         bus.disconnect()
+
+
+def test_read_reg_retries_a_corrupted_status_packet(bus, world):
+    """The real bus returned "Incorrect status packet" on a start-up Goal_Position read (2026-10-14 id 5,
+    2026-10-16 id 4): read_reg retries up to REG_READ_RETRIES more times."""
+    from so101_rl.servo.feetech_bus import REG_READ_RETRIES
+
+    world.set_reg(4, ADDR["Goal_Position"], 2048, 2)
+    world.corrupt_reads = REG_READ_RETRIES
+    assert bus.read_reg("Goal_Position", 4) == 2048
+    assert world.corrupt_reads == 0
+
+
+def test_read_reg_still_fails_after_the_retries(bus, world):
+    from so101_rl.servo.feetech_bus import REG_READ_RETRIES
+
+    world.corrupt_reads = REG_READ_RETRIES + 1
+    with pytest.raises(ConnectionError):
+        bus.read_reg("Goal_Position", 4)
+
+
+def test_write_reg_is_not_retried(bus, world):
+    world.silent.add(2)
+    with pytest.raises(ConnectionError):
+        bus.write_reg("P_Coefficient", 2, 17)
+    assert world.reg_writes == []

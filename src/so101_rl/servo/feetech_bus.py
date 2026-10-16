@@ -21,6 +21,7 @@ from so101_rl.servo.bus import BLOCK_ADDR, BLOCK_LEN, BlockRead
 from so101_rl.servo.timing import Clock, RealClock
 
 _SIGN_BIT_16 = 15  # Present_Position, Present_Velocity, Goal_Position
+REG_READ_RETRIES = 2  # read_reg: up to 3 transactions per register read (plan section 10 2026-10-16)
 _SIGN_BIT_LOAD = 10
 _TICK_MAX = 4095
 _OFF = {"pos": 0, "vel": 2, "load": 4, "volt": 6, "temp": 7, "status": 9, "moving": 10}
@@ -152,7 +153,11 @@ class FeetechBus:
         return True
 
     def read_reg(self, name: str, motor_id: int) -> int:
-        return int(self._bus.read(name, self._name_of_id[motor_id], normalize=False))
+        """One register read, retried up to ``REG_READ_RETRIES`` more times on a failed transaction (no reply or a
+        corrupted status packet: twice at start-up on the real bus, 2026-10-14 / 2026-10-16; plan section 10
+        2026-10-16). A read has no side effects; a value that arrives is returned as is (callers compare it), and
+        writes are never retried."""
+        return int(self._bus.read(name, self._name_of_id[motor_id], normalize=False, num_retry=REG_READ_RETRIES))
 
     def write_reg(self, name: str, motor_id: int, value: int) -> None:
         self._bus.write(name, self._name_of_id[motor_id], int(value), normalize=False)
