@@ -165,6 +165,7 @@ def build_env(
     env = BatchedGoalEnv(cfg, cal, base_spec, nworld, sim_params=spf.params, randomizer=rnd, model=model, seed=seed, device=dev)
     env.metadata.update({
         "calibration": str(cal_path), "calibration_sha256": _sha256(cal_path), "sim_params": str(sim_params), "sim_params_release": spf.meta.version,
+        "sim_params_sha256": _sha256(Path(sim_params)),
         "sim_params_verified": not spf.meta.verification_problems(MAX_RMS_PCT), "success_radius_m": base_spec.success_radius_m,
     })  # fmt: skip
     if not base_spec.obs.has_die:  # die tasks keep the env's own camera_pose_method (the calib/camera.yaml pose)

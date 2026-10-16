@@ -532,3 +532,33 @@ arm torque-off for the user.
   critic offline and score the moved actor in sim (`scripts/finetune_critic_diag.py`); if it degrades in sim, do not
   unfreeze the actor on the arm. Resume a rolled-back run from `best_policy.pt`, not `model.zip`'s actor.
 - **Shown-to-fail:** step 1 without `--attended` against the feetech servo must refuse (exit 2) with no motion.
+
+## HS6 - Zero-shot die-to-zone eval on the real arm (software ready, not runnable yet)
+
+Added 2026-10-16 (plan §10 "Die support in deploy-policy (D5)"; ARCHITECTURE 0.62; sim plan HS6). Attended.
+
+- **Needs (none met yet):** the die policy retrained on a verified `sim_params` release >= 1 (HS1-HS3; the v0 attempt-2
+  policy is refused on the real arm by `deploy-policy`, plan §10 2026-10-16), H8 (hand-eye with the fiducial), the
+  perception process writing the object table (D3), H9 (the tray; until it is measured only `--manual-die-reset`
+  runs), the Phase 4 feasibility gate (D4), the verifier's false-accept check <= 2 %.
+- **Dry run first** against the sim servo with the perception process (or a fake writer) on the object table:
+  `deploy-policy --policy <die export> --protocol zero-shot` then `servo --backend mujoco` (a v0 export is allowed
+  there, with a note).
+- **Procedure:** as HS4 (start `deploy-policy` first, then the servo), with the perception process already running:
+  `deploy-policy --policy <die export> --protocol zero-shot --seed 7 --attended [--accept-no-watchdog]
+  [--object-table <name>] [--manual-die-reset]`. The task comes from the export; the ladder is 10 / 10 / 30 episodes
+  at 0.5 / 0.75 / 1.0 with the HS4 advance rule; the goal is the zone. Refused before anything moves: a v0 /
+  unverified die export, no or stale object table (> 1 s) or the fiducial not OK, and (no tray) a run without
+  `--manual-die-reset`.
+- **Manual die reset (until H9):** before every episode the arm goes home and holds; place the die at its start, take
+  your hand out, then press Enter in the deploy terminal (or `touch <run dir>/die_ready`; `<run dir>/die_reset_waiting`
+  shows the episode it waits for). With the tray, the attendant resets nothing.
+- **Stops:** a trip / stall as in HS4; the tracker UNKNOWN on > 50 % of an episode's steps (`halt_reason`
+  `tracker_unknown`: look at the camera, the die and perception, then `--resume`); the object table going stale or
+  the fiducial failing before an episode (`perception_stale`).
+- **Artifact:** `runs/deploy/<ts>/{episodes.jsonl, summary.json, episodes/*.h5}`; per episode `visible_fraction`,
+  `final_die_xyz`, success and trips. Count push vs place from the tracker trace (the die block of the observations
+  in the episode files) or the camera.
+- **Pass:** n = 30 at full speed with the Wilson 95 % lower bound >= 0.60 (`verdict.finetune_eligible`).
+- **Shown-to-fail:** the v0 attempt-2 export (`runs/sac-sim/die-a2-20261016-185514`) against the feetech servo must
+  refuse (exit 2) with no motion.

@@ -4,8 +4,11 @@
 
 The export is a plain dict saved with ``torch.save`` (tensors, numbers, strings, lists only: loadable with
 ``weights_only=True``, no pickled classes): the SB3-shaped actor's ``state_dict`` plus what deployment must check
-(``export_version``, ``obs_layout_version``, task, input/action dims, hidden sizes, sim-params release, DR stage, git
-sha, the checkpoint's last sim eval).
+(``export_version``, ``obs_layout_version``, task, input/action dims, hidden sizes, sim-params release / verified /
+sha256, DR stage, git sha, the checkpoint's last sim eval). ``deploy-policy`` and ``train-reach-sac`` refuse a
+die_to_zone export on the REAL arm unless it records ``sim_params_release`` >= 1 and ``sim_params_verified`` true
+(plan §10 2026-10-16: the policy trained on the v0 prior under the S4.6 waiver is never deployed); a missing field
+counts as unverified.
 
 :func:`load_policy` returns a callable ``obs -> action``: ``obs`` float ``[..., D]`` is the FS3 policy input, i.e.
 the task's observation (``env/obs.py``, reach: 21, die_to_zone: 26) with ``desired_goal`` (3) appended
@@ -53,6 +56,9 @@ def export_policy(ckpt: Path, out: Path) -> Path:
         "log_std_bounds": [float(x) for x in sac["cfg"]["log_std_bounds"]],
         "actor": {k: v.detach().cpu().clone() for k, v in sac["actor"].items()},
         "sim_params_release": d.get("sim_params_release"),
+        # None in checkpoints written before 0.62: a die_to_zone export without them is refused on the real arm
+        "sim_params_verified": d.get("sim_params_verified"),
+        "sim_params_sha256": d.get("sim_params_sha256"),
         "calibration_sha256": d.get("calibration_sha256"),
         "dr_stage": int(d.get("dr_stage", 0)),
         "env_step": int(d.get("env_step", 0)),
