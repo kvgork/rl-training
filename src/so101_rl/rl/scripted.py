@@ -44,6 +44,7 @@ chain constants are imported (like ``sim/batched_servo.py``).
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -99,7 +100,7 @@ class ScriptedDieConfig:
     # placed 12 mm off the zone centre in -x and in -y: the zone's tray-side corner (x >= 0.15, y >= -0.125) lies
     # in the placeholder tray rim's camera shadow (plan §10 2026-10-16); still 18 mm inside the zone edges on both axes
     place_offset_xy_m: tuple[float, float] = (-0.012, -0.012)
-    table_z_m: float = -0.0045
+    table_z_m: float | None = None  # None: the config's safe_state.table_z_m (the one table height)
     grasp_h: float = 0.0145  # jaw-box bottoms ~4 mm above the table; the die (16 mm) is held over 4..16 mm
     # the wrist_flex limit (2960) only lets the gripper point straight down with G up to ~50 mm over the table
     pregrasp_h: float = 0.040  # jaw bottoms ~30 mm up: above the 26 mm rim
@@ -225,7 +226,10 @@ class ScriptedDieController:
         """``cfg``: joint limits (already the intersection with the calibration range), ``max_delta_ticks``, the
         table height and the kinematics; ``drive_signs`` [6]: -1 for a calibration ``drive_mode`` joint, else +1
         (:meth:`from_calibration`, :meth:`for_env`)."""
-        self.p = p = params if params is not None else ScriptedDieConfig(table_z_m=float(cfg.safe_state.table_z_m))
+        p = params if params is not None else ScriptedDieConfig()
+        if p.table_z_m is None:
+            p = dataclasses.replace(p, table_z_m=float(cfg.safe_state.table_z_m))
+        self.p = p
         self.n, self.device = int(n), torch.device(device)
         dev, f64 = self.device, torch.float64
         chain = chain if chain is not None else KinematicChain.from_yaml(cfg.kinematics_path)
