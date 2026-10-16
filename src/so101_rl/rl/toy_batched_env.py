@@ -5,7 +5,9 @@ per step; the reward has the FS4 shape (``-dist/scale * (1 - success) - (1 - suc
 ``terminated`` on success, ``truncated`` at ``episode_steps``, auto-reset with ``final_*`` = pre-reset copies.
 
 ``ToyBatchedDieShapedEnv``: the same env with the die task's tensor widths (observation 26 = ``DIE_OBS.dim``, goal
-3), so the FS3 policy input is 29 wide as for ``die_to_zone`` (tests of the die plumbing on CPU).
+3), so the FS3 policy input is 29 wide as for ``die_to_zone`` (tests of the die plumbing on CPU). It also has the
+batched die env's start-stage setter (``set_start_stage`` / ``start_stage``, D2a); the stage is recorded only, the
+toy's dynamics do not change with it.
 """
 
 from __future__ import annotations
@@ -114,6 +116,15 @@ class ToyBatchedDieShapedEnv:
         self.act_dim, self.priv_dim = ToyBatchedReachEnv.act_dim, ToyBatchedReachEnv.priv_dim
         self.metadata: dict[str, object] = {}
         self.stats: dict[str, float] = {}
+        from so101_rl.env.tasks import DIE_TO_ZONE
+
+        self.well_stage = DIE_TO_ZONE.die_start.well_stage
+        self.start_stage = self.well_stage  # BatchedGoalEnv's default: the well
+
+    def set_start_stage(self, k: int) -> None:
+        if not 0 <= int(k) <= self.well_stage:
+            raise ValueError(f"start stage {k} outside 0..{self.well_stage}")
+        self.start_stage = int(k)
 
     @property
     def goal(self) -> torch.Tensor:

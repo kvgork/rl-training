@@ -37,6 +37,9 @@ world, fallback (0.20, 0, 0.15)), a goal within ``GOAL_MIN_START_FACTOR`` (2) su
 replaced by a second draw (no trivial episodes, L2 gate ``start_not_success`` / ``do_nothing``); the die task places the die at rest in the start well
 (``die_start``: xy ~ N(centre, sigma) clipped so the die footprint stays on the flat well floor for its yaw,
 yaw uniform, z = table + 8 mm, zero velocity; decision D-TRAY) and the goal is the zone centre at resting height.
+Die start curriculum (D2a, plan §10 2026-10-16): ``set_start_stage(k)`` makes the following resets draw from
+``die_start`` stage ``k`` instead (an open-table stage: a footprint rectangle by area, the centre uniform in it shrunk
+by the footprint half extent of the drawn yaw); the default is the well stage, i.e. the placement above, unchanged.
 The chain is resynced to the reset's present ticks (``resync_target`` semantics), the delay FIFO pre-filled with
 them, the tracker restarted and primed. ``phase_randomise`` starts every world at a random ``episode_step`` on the
 first full reset only (decorrelated auto-resets).
@@ -311,6 +314,7 @@ class BatchedGoalEnv:
         self._xyz = torch.zeros((n, 3), dtype=torch.float64, device=dev)
         self._xyz_obs = torch.zeros((n, 3), dtype=torch.float64, device=dev)
         self._first_reset = True
+        self._start_stage = task.die_start.well_stage if task.die_start is not None else 0
         self._steps = 0
         self._closed = False
         # stats (device counters)
@@ -441,17 +445,42 @@ class BatchedGoalEnv:
         q[:, arm] = torch.where(found[:, None], qa[:, : N_JOINTS - 1], q[:, arm])  # no valid draw: exact home
         return q
 
+    # ------------------------------------------------------------------ die start curriculum (D2a)
+    @property
+    def start_stage(self) -> int:
+        """The die start stage (``task.die_start``: 0..``well_stage``; the well by default); 0 for reach."""
+        return self._start_stage
+
+    def set_start_stage(self, k: int) -> None:
+        """Place the die from start stage ``k`` at the following resets (like ``randomizer.set_stage``)."""
+        ds = self.task.die_start
+        if ds is None:
+            raise ValueError(f"task {self.task.name!r} has no die start stages")
+        if not 0 <= int(k) <= ds.well_stage:
+            raise ValueError(f"start stage {k} outside 0..{ds.well_stage}")
+        self._start_stage = int(k)
+
     def _place_die(self, q: torch.Tensor) -> None:
         ds = self.task.die_start
         assert ds is not None
         n, g, dev = self.nworld, self._gen, self.device
         yaw = torch.rand(n, generator=g, device=dev) * (2 * math.pi)
         reach = DIE_HALF_EDGE_M * (torch.cos(yaw).abs() + torch.sin(yaw).abs())  # footprint half extent
-        slack = (_WELL_HALF_M - reach).clamp_min(0.0)[:, None]
-        xy = torch.randn((n, 2), generator=g, device=dev) * ds.sigma_xy_m
-        xy = torch.maximum(torch.minimum(xy, slack), -slack)
-        c = torch.tensor(ds.well_center_xy_m, dtype=torch.float32, device=dev)
-        q[:, self._die_q : self._die_q + 2] = c + xy
+        if self._start_stage == ds.well_stage:  # the well (also the draw order of the pre-curriculum env)
+            slack = (_WELL_HALF_M - reach).clamp_min(0.0)[:, None]
+            xy = torch.randn((n, 2), generator=g, device=dev) * ds.sigma_xy_m
+            xy = torch.maximum(torch.minimum(xy, slack), -slack)
+            xy = torch.tensor(ds.well_center_xy_m, dtype=torch.float32, device=dev) + xy
+        else:  # an open-table stage: a rectangle by area, the centre uniform in it shrunk by the footprint
+            reg = ds.table_stages[self._start_stage]
+            rects = torch.tensor(reg.rects_xy_m, dtype=torch.float32, device=dev)  # [R, 4]
+            cdf = torch.tensor(np.cumsum(reg.areas) / reg.areas.sum(), dtype=torch.float32, device=dev)
+            k = torch.searchsorted(cdf, torch.rand(n, generator=g, device=dev), right=True).clamp_max(len(cdf) - 1)
+            r = rects[k]
+            lo = torch.stack([r[:, 0], r[:, 2]], dim=1) + reach[:, None]
+            hi = torch.stack([r[:, 1], r[:, 3]], dim=1) - reach[:, None]
+            xy = lo + torch.rand((n, 2), generator=g, device=dev) * (hi - lo)
+        q[:, self._die_q : self._die_q + 2] = xy
         q[:, self._die_q + 2] = TABLE_Z_M + DIE_HALF_EDGE_M
         q[:, self._die_q + 3] = torch.cos(yaw / 2)
         q[:, self._die_q + 4 : self._die_q + 6] = 0.0

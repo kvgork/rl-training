@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from so101_rl.rl import eval_sim, train_sim_sac
-from so101_rl.rl.toy_batched_env import ToyBatchedReachEnv
+from so101_rl.rl.toy_batched_env import ToyBatchedDieShapedEnv, ToyBatchedReachEnv
 from so101_rl.rl.train_sim_sac import (
     SimSacConfig,
     ThermalGuard,
@@ -355,3 +355,163 @@ def test_die_trains_with_policy_input_29_and_gamma_098(monkeypatch, tmp_path):
     assert ck["task"] == "die_to_zone" and ck["policy_input_dim"] == 29
     meta = json.loads((tmp_path / "run_meta.json").read_text())
     assert meta["sac"]["gamma"] == 0.98 and meta["config"]["allow_unverified_sim_params"] is True
+
+
+# ------------------------------------------------------------------------------------------------ review triggers once
+def test_trigger_kind_strips_the_numbers():
+    k = train_sim_sac.trigger_kind
+    assert k("alpha 9.10e-05 < 1e-4") == k("alpha 3.00e-06 < 1e-4") == "alpha # < #"
+    assert k("die_to_zone success 0.00 < 0.1 after 4.02 GPU-h") == k("die_to_zone success 0.05 < 0.1 after 4.50 GPU-h")
+    assert k("critic loss rising over 3 evals") != k("no eval improvement over 3 evals")
+
+
+def test_each_review_trigger_fires_once_per_run_also_across_a_resume(toy, tmp_path, monkeypatch):
+    """Die run 1 wrote the low-success trigger on every log line once it held (its text carries the success and
+    the GPU-h); each trigger kind is now recorded once per run, also after a resume."""
+    import json
+
+    def trig(history, **_kw):
+        return [f"die_to_zone success 0.0{len(history) % 10} < 0.1 after {len(history) / 100:.2f} GPU-h",
+                "critic loss rising over 3 evals"]  # fmt: skip
+
+    monkeypatch.setattr(train_sim_sac, "review_triggers", trig)
+    first = run_training(_cfg(max_env_steps=32 * 60), tmp_path)
+    rows = _rows(first.metrics_csv)
+    assert len(rows) >= 3
+    review = json.loads((tmp_path / "review.json").read_text())["triggers"]
+    assert len(review) == 2 and {r["env_step"] for r in review} == {int(rows[0]["env_step"])}
+    run_training(_cfg(max_env_steps=32 * 100), tmp_path, resume=first.last_ckpt)
+    assert len(json.loads((tmp_path / "review.json").read_text())["triggers"]) == 2
+    assert {int(r["review_triggers"]) for r in _rows(tmp_path / "metrics.csv")} == {2}
+
+
+# ------------------------------------------------------------------------------------------------ start curriculum (D2a)
+def test_die_start_curriculum_config():
+    base = {"task": "die_to_zone", "nworld": 8, "budget_min": 1, "seed": 0}
+    assert load_sim_sac_config(base).die_start_curriculum is False  # off by default: the well, as in D1
+    assert load_sim_sac_config({**base, "die_start_curriculum": True}).die_start_curriculum is True
+    with pytest.raises(ValueError, match="die_start_curriculum"):
+        load_sim_sac_config({**base, "task": "reach", "die_start_curriculum": True})
+    with pytest.raises(TypeError):
+        load_sim_sac_config({**base, "die_start_curriculum": 1})
+    assert train_sim_sac.METRICS_FIELDS[-1] == "start_stage"
+
+
+class _StagedDieToy(ToyBatchedDieShapedEnv):
+    """The die-shaped toy env plus a DR randomizer stand-in (``stage`` / ``set_stage``); every start-stage and DR-stage
+    change is appended to ``log`` (shared by all envs of a run) and ``changes`` (this env's) as ``(kind, stage)``."""
+
+    def __init__(self, nworld, *, seed, stage, log):
+        import types
+
+        super().__init__(nworld, seed=seed)
+        self.log, self.changes = log, []
+        self.randomizer = types.SimpleNamespace(stage=stage)
+        self.randomizer.set_stage = lambda k: (setattr(self.randomizer, "stage", int(k)), self._record("dr", k))
+
+    def _record(self, kind, k):
+        self.log.append((kind, int(k)))
+        self.changes.append((kind, int(k)))
+
+    @property
+    def dr_stage(self):
+        return int(self.randomizer.stage)
+
+    def set_start_stage(self, k):
+        super().set_start_stage(k)
+        self._record("start", k)
+
+
+@pytest.fixture
+def staged_toy(monkeypatch):
+    """``(envs built, change log)``; envs[0] trains, envs[1] evaluates."""
+    envs, log = [], []
+
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
+        envs.append(_StagedDieToy(nworld, seed=seed, stage=stage, log=log))
+        return envs[-1]
+
+    monkeypatch.setattr(eval_sim, "build_env", build)
+    monkeypatch.setattr(train_sim_sac, "read_gpu_temp_c", lambda: 50.0)
+    monkeypatch.setattr(train_sim_sac, "THERMAL_POLL_S", 0.0)
+    return envs, log
+
+
+def _evals_at(monkeypatch, rate):
+    def fake(env, act, episodes):
+        return {"success_rate": rate, "successes": round(rate * episodes), "episodes": episodes,
+                "final_err_m": {"p50": 0.01, "p90": 0.02}}  # fmt: skip
+
+    monkeypatch.setattr(eval_sim, "run_episodes", fake)
+
+
+def _die_cfg(**kw):
+    base = {"task": "die_to_zone", "allow_unverified_sim_params": True, "die_start_curriculum": True,
+            "eval_every_steps": 32 * 10, "eval_max_fraction": 1.0}  # fmt: skip
+    return _cfg(**{**base, **kw})
+
+
+def test_start_curriculum_advances_before_the_dr_stages(staged_toy, tmp_path, monkeypatch):
+    """At >= 70 % eval success the START stage moves up first (S0 -> S1 -> S2 -> S3) with the DR stage held; only at
+    the well (S3) do the DR stages widen. Both are in metrics.csv and the checkpoint; evals run at the current stages."""
+    envs, log = staged_toy
+    _evals_at(monkeypatch, 0.8)
+    res = run_training(_die_cfg(dr_max_stage=2, max_env_steps=32 * 80), tmp_path)
+    assert res.status == "completed"
+    assert log[0] == ("start", 0)  # the train env starts at S0
+    assert envs[0].changes == [("start", 0), ("start", 1), ("start", 2), ("start", 3), ("dr", 1), ("dr", 2)]
+    rows = [r for r in _rows(res.metrics_csv) if r["eval_success_rate"]]
+    seen = [(int(r["start_stage"]), int(r["dr_stage"])) for r in rows]
+    assert seen[:6] == [(0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (3, 2)], seen
+    ck = torch.load(res.last_ckpt, weights_only=True)
+    assert ck["start_stage"] == 3 and ck["dr_stage"] == 2 and ck["last_eval"]["start_stage"] == 3
+    assert envs[1].start_stage == 3  # the eval env follows the train env's start stage
+    best = torch.load(tmp_path / "ckpt_best.pt", weights_only=True)
+    assert (best["start_stage"], best["dr_stage"]) == (3, 2)
+
+
+def test_start_curriculum_smoke_advances_s0_to_s1_on_the_toy(staged_toy, tmp_path):
+    """Short CPU smoke run with real (toy) learning and real evals: the curriculum advances S0 -> S1."""
+    res = run_training(_die_cfg(dr_max_stage=0, eval_every_steps=32 * 25, max_env_steps=32 * 400), tmp_path)
+    rows = [r for r in _rows(res.metrics_csv) if r["eval_success_rate"]]
+    assert int(rows[0]["start_stage"]) == 0
+    assert ("start", 1) in staged_toy[1], [(r["start_stage"], r["eval_success_rate"]) for r in rows]
+    assert any(int(r["start_stage"]) >= 1 for r in rows)
+
+
+def test_exit_gate_needs_the_well_start(staged_toy, tmp_path, monkeypatch):
+    """The numeric gate (1000 episodes, >= 0.95, Wilson >= 0.93, DR stage dr_max_stage) never ends the run before the
+    start stage is S3: with passing evals from S0 on, the run walks S0..S3 and stops at the first S3 eval."""
+    _evals_at(monkeypatch, 1.0)
+    res = run_training(_die_cfg(dr_max_stage=4, dr_start_stage=4, eval_episodes=1000, max_env_steps=32 * 200),
+                       tmp_path)  # fmt: skip
+    assert res.status == "completed" and "exit gate" in res.reason
+    rows = [r for r in _rows(res.metrics_csv) if r["eval_success_rate"]]
+    assert [int(r["start_stage"]) for r in rows] == [0, 1, 2, 3]
+
+
+def test_start_stage_resumes_from_the_checkpoint(staged_toy, tmp_path, monkeypatch):
+    _, log = staged_toy
+    _evals_at(monkeypatch, 0.8)
+    first = run_training(_die_cfg(dr_max_stage=0, max_env_steps=32 * 20), tmp_path)  # evals at 10, 20: S0->S1->S2
+    assert torch.load(first.last_ckpt, weights_only=True)["start_stage"] == 2
+    log.clear()
+    _evals_at(monkeypatch, 0.0)
+    run_training(_die_cfg(dr_max_stage=0, max_env_steps=32 * 40), tmp_path, resume=first.last_ckpt)
+    assert log[0] == ("start", 2)
+    assert {int(r["start_stage"]) for r in _rows(tmp_path / "metrics.csv") if int(r["env_step"]) > 32 * 20} == {2}
+
+
+def test_die_without_the_curriculum_starts_in_the_well(staged_toy, tmp_path, monkeypatch):
+    _, log = staged_toy
+    _evals_at(monkeypatch, 0.8)
+    res = run_training(_die_cfg(die_start_curriculum=False, dr_max_stage=0, max_env_steps=32 * 30), tmp_path)
+    assert not any(kind == "start" for kind, _ in log)  # the env keeps its default start (the well)
+    assert {r["start_stage"] for r in _rows(res.metrics_csv)} == {"3"}
+    assert torch.load(res.last_ckpt, weights_only=True)["start_stage"] == 3
+
+
+def test_reach_has_no_start_stage(toy, tmp_path):
+    res = run_training(_cfg(max_env_steps=32 * 30), tmp_path)
+    assert {r["start_stage"] for r in _rows(res.metrics_csv)} == {""}
+    assert torch.load(res.last_ckpt, weights_only=True)["start_stage"] is None

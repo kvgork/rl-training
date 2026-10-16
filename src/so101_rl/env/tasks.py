@@ -126,14 +126,78 @@ class ZoneSpec:
         return np.array([self.center_xy_m[0], self.center_xy_m[1], self.z_table_m + DIE_HALF_EDGE_M])
 
 
+Rect = tuple[float, float, float, float]  # (x_lo, x_hi, y_lo, y_hi), base frame, metres
+# the largest half extent of the die footprint over all yaws (16 mm die turned 45 deg)
+DIE_MAX_FOOTPRINT_HALF_M: Final[float] = DIE_HALF_EDGE_M * 2**0.5
+
+
+@dataclass(frozen=True)
+class DieStartRegion:
+    """One open-table stage of the die start curriculum (plan §10 2026-10-16 "Die start curriculum", D2a).
+
+    ``rects_xy_m`` bound the die FOOTPRINT, as the flat floor bounds it in the well: for a yaw ``psi`` the centre is
+    uniform in the rectangle shrunk by ``DIE_HALF_EDGE_M * (|cos psi| + |sin psi|)`` on every side; the rectangle is
+    picked with probability proportional to its area. Each side is at least two worst-case half extents long, so
+    every yaw fits."""
+
+    name: str
+    rects_xy_m: tuple[Rect, ...]
+
+    def __post_init__(self) -> None:
+        if not self.rects_xy_m:
+            raise ValueError(f"start region {self.name!r} has no rectangle")
+        for x0, x1, y0, y1 in self.rects_xy_m:
+            if min(x1 - x0, y1 - y0) < 2 * DIE_MAX_FOOTPRINT_HALF_M:
+                raise ValueError(f"start region {self.name!r}: rectangle {(x0, x1, y0, y1)} too small for every die yaw")
+
+    @property
+    def areas(self) -> np.ndarray:
+        return np.array([(x1 - x0) * (y1 - y0) for x0, x1, y0, y1 in self.rects_xy_m])
+
+
 @dataclass(frozen=True)
 class DieStartSpec:
-    """Die start distribution (the tray's start well). Placeholder until H9 measures the real tray."""
+    """Die start distribution: the tray's start well (placeholder until H9 measures the real tray) and, before it,
+    the open-table stages of the start curriculum (D2a).
+
+    Start stage ``k < len(table_stages)`` draws from ``table_stages[k]`` (:class:`DieStartRegion`); stage
+    :attr:`well_stage` (the last) is the well: xy ~ N(``well_center_xy_m``, ``sigma_xy_m``) clipped to the flat
+    floor for the yaw used. Without a curriculum the env uses the well stage (the task's target start)."""
 
     well_center_xy_m: tuple[float, float]
     sigma_xy_m: float
     yaw: Literal["uniform"] = "uniform"
     measured_on_hardware: bool = False
+    table_stages: tuple[DieStartRegion, ...] = ()
+
+    @property
+    def n_stages(self) -> int:
+        return len(self.table_stages) + 1
+
+    @property
+    def well_stage(self) -> int:
+        """Index of the well stage (the last one, S3 for ``DIE_TO_ZONE``): the default and the exit-gate stage."""
+        return len(self.table_stages)
+
+    def stage_name(self, k: int) -> str:
+        if not 0 <= int(k) < self.n_stages:
+            raise ValueError(f"start stage {k} outside 0..{self.well_stage}")
+        return "well" if int(k) == self.well_stage else self.table_stages[int(k)].name
+
+
+# The die start curriculum (plan §10 2026-10-16 "Die start curriculum (attempt 2, D2a)"): footprint rectangles on the
+# open table, clear of the tray (outer rim x 0.167..0.233, y -0.083..-0.017; >= 2 mm) and of the zone square
+# (x 0.19..0.25, y 0.07..0.13; >= 12 mm), inside the safety box and the radius band where the jaws reach a resting
+# die (0.12..0.26 m from the base, |bearing| <= 35 deg). Distances = die centre to the zone square
+# (tests/test_tasks.py checks all of it against the scene).
+DIE_START_TABLE_STAGES: Final[tuple[DieStartRegion, ...]] = (
+    # S0: straight in front of the zone (between the tray and the zone): push 2-6.2 cm in +y to the zone edge
+    DieStartRegion("table_near", ((0.185, 0.240, 0.000, 0.058),)),
+    # S1: the open table left of the tray (towards the base): 6.5-12.5 cm from the zone, a diagonal push
+    DieStartRegion("table_far", ((0.125, 0.155, -0.050, 0.030),)),
+    # S2: just outside the tray rim (2-32 mm off it) on its zone side and its base side: 6.3-15 cm (the well: 12 cm)
+    DieStartRegion("tray_rim", ((0.167, 0.233, -0.015, 0.015), (0.135, 0.165, -0.083, -0.017))),
+)
 
 
 @dataclass(frozen=True)
@@ -216,8 +280,9 @@ def task_from_config(name: str, tasks: TasksConfig, geometry: tuple[float, Works
             trip_penalty=tc.trip_penalty,
             goal_bounds=GoalBounds(box=box),
             zone=zone,
-            # NEEDS H9: placeholder start well
-            die_start=DieStartSpec(well_center_xy_m=(0.20, -0.05), sigma_xy_m=0.005, measured_on_hardware=False),
+            # NEEDS H9: placeholder start well (stage S3); S0..S2 = the start curriculum's open-table stages
+            die_start=DieStartSpec(well_center_xy_m=(0.20, -0.05), sigma_xy_m=0.005, measured_on_hardware=False,
+                                   table_stages=DIE_START_TABLE_STAGES),
             start_pose="home",
             reset_settle_steps=0,
         )
