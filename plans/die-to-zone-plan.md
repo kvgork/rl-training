@@ -49,3 +49,17 @@ Drafted 2026-10-15 after the reach skill reached its ceiling at 5 mm (plan §10 
 - No CPU-heavy jobs while the arm runs: SCHED_FIFO is unavailable on this host.
 - Keep run scripts in the repo or the run directory, not the session scratchpad.
 - Check the base policy's headroom before spending arm time on more collection.
+
+## Attempt 2 design (after attempt 1 failed, `plans/reviews/2026-10-16-s4-die-run.md`)
+
+Attempt 1 never produced a success: the die starts in a recessed well it cannot be pushed out of, and the critic
+settled on ending episodes with a STUCK trip (genuine trips: a link pressed into the table with a constant
+command). The user accepted the recommendation: C (STUCK check: done, trips genuine), then A + B.
+
+| # | Unit | What | Acceptance |
+|---|---|---|---|
+| D2a | **Start curriculum (A)** | `DieStartSpec` gains staged start sets: S0 the open table between the tray and the zone (push distance 2-6 cm to the zone edge), S1 farther (6-12 cm), S2 just outside the tray rim, S3 the well (the target). The curriculum advances like the DR stages (eval success >= the stage threshold) and is recorded in `metrics.csv`; the exit gate stays at the well start (S3) and DR stage 4. Gates (`start_not_success`, `do_nothing`) run per start stage. | `sim-gates --task die_to_zone` passes for every start stage; a short CPU smoke run advances S0 -> S1 on a toy; ARCHITECTURE row; plan §10 row (the start set is part of the task spec) |
+| D2b | **Scripted seeds (B)** | `rl/scripted.py`: a batched tick-space controller for the die (approach above the die, open, descend, close, lift over the rim, move above the zone, lower, open), using the existing FK/IK-free joint-delta action space (a damped least-squares IK step on `safety/fk.py` per policy step). Its success rate is measured in sim per start stage; RLPD-style mixing: a fixed share (e.g. 25 %) of each FastSAC batch from a demo replay filled with its episodes. | scripted success >= 30 % at the well start in sim (the plan's seed bar); mixing ratio a config key; tests on the toy env |
+| D2c | Attempt 2 run | D2a + D2b, `sim_params` v0 under the same waiver | as S4.6 |
+
+Order: D2a first (small, may already crack the push part), D2b next; D2c only with both.
