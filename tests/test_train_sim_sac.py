@@ -515,3 +515,117 @@ def test_reach_has_no_start_stage(toy, tmp_path):
     res = run_training(_cfg(max_env_steps=32 * 30), tmp_path)
     assert {r["start_stage"] for r in _rows(res.metrics_csv)} == {""}
     assert torch.load(res.last_ckpt, weights_only=True)["start_stage"] is None
+
+
+# ------------------------------------------------------------------------------------------------ demo mixing (D2b)
+class _ToyExpert:
+    """A scripted policy for the toy env (the demo source stand-in): straight to the goal at full speed."""
+
+    def __init__(self, env):
+        self.env = env
+
+    def reset(self, mask=None):
+        pass
+
+    def __call__(self, env):
+        e = env._env
+        return ((e.goal - e.pos) / e.speed).clamp(-1.0, 1.0)
+
+
+@pytest.fixture
+def toy_expert(monkeypatch):
+    from so101_rl.rl import scripted
+
+    monkeypatch.setattr(scripted, "demo_policy", _ToyExpert)
+
+
+@pytest.fixture
+def sample_spy(monkeypatch):
+    """Every ``GpuReplay.sample`` call as ``(replay capacity, rows)``; the demo replay is told apart by capacity."""
+    from so101_rl.rl.replay_gpu import GpuReplay
+
+    calls, orig = [], GpuReplay.sample
+
+    def spy(self, batch_size, *, generator=None):
+        calls.append((self.capacity, int(batch_size)))
+        return orig(self, batch_size, generator=generator)
+
+    monkeypatch.setattr(GpuReplay, "sample", spy)
+    return calls
+
+
+def test_demo_config_is_strict():
+    ok = _die_cfg(demo_ratio=0.25, demo_episodes=8)
+    assert (ok.demo_ratio, ok.demo_episodes) == (0.25, 8)
+    assert (_cfg().demo_ratio, _cfg().demo_episodes) == (0.0, 0)  # default: off
+    for bad in ({"demo_ratio": 0.25}, {"demo_episodes": 8}, {"demo_ratio": 1.0, "demo_episodes": 8},
+                {"demo_ratio": -0.1, "demo_episodes": 8}, {"demo_ratio": 0.2, "demo_episodes": -1}):  # fmt: skip
+        with pytest.raises(ValueError):
+            _die_cfg(**bad)
+    with pytest.raises(ValueError, match="scripted die controller"):
+        _cfg(demo_ratio=0.25, demo_episodes=8)  # reach has no scripted demos
+    with pytest.raises(TypeError):
+        _die_cfg(demo_ratio=0.25, demo_episodes=8.0)
+
+
+def test_demo_ratio_zero_collects_nothing_and_trains_bit_identically(staged_toy, tmp_path, monkeypatch, sample_spy):
+    """demo_ratio 0 (explicit or default): no demo policy, no collection, every update the plain online sample, and
+    the run is bit-identical to one without the keys."""
+    from so101_rl.rl import scripted
+
+    monkeypatch.setattr(scripted, "demo_policy", lambda env: pytest.fail("demo policy built"))
+    monkeypatch.setattr(scripted, "collect_demos", lambda *a, **k: pytest.fail("demos collected"))
+    _evals_at(monkeypatch, 0.0)
+    a = run_training(_die_cfg(dr_max_stage=0, max_env_steps=32 * 30), tmp_path / "a")
+    b = run_training(_die_cfg(dr_max_stage=0, max_env_steps=32 * 30, demo_ratio=0.0, demo_episodes=0), tmp_path / "b")
+    sa, sb = (torch.load(r.last_ckpt, weights_only=True)["sac"] for r in (a, b))
+    for part in ("actor", "critic"):
+        assert all(torch.equal(sa[part][k], sb[part][k]) for k in sa[part])
+    assert sample_spy and {cap for cap, _ in sample_spy} == {20_000} and {n for _, n in sample_spy} == {128}
+    import json
+
+    assert json.loads((tmp_path / "a" / "run_meta.json").read_text())["demos"] is None
+
+
+def test_demo_mixing_fills_a_demo_replay_and_honours_the_ratio(staged_toy, tmp_path, monkeypatch, toy_expert, sample_spy):
+    """demo_ratio 0.25: demos are collected per start stage (S0..S3 with the curriculum), the env goes back to its
+    start stage, and every update batch takes demo_count(128, 0.25) = 32 rows from the demo replay."""
+    import json
+
+    from so101_rl.rl.replay_gpu import demo_count
+
+    envs, _ = staged_toy
+    _evals_at(monkeypatch, 0.0)
+    res = run_training(_die_cfg(dr_max_stage=0, max_env_steps=32 * 30, demo_ratio=0.25, demo_episodes=40), tmp_path)
+    assert res.status == "completed"
+    meta = json.loads((tmp_path / "run_meta.json").read_text())["demos"]
+    assert meta["ratio"] == 0.25 and list(meta["per_stage"]) == ["table_near", "table_far", "tray_rim", "well"]
+    assert all(s["episodes"] >= 40 and s["kept"] == s["successes"] > 0 for s in meta["per_stage"].values())
+    assert meta["transitions"] == sum(s["transitions"] for s in meta["per_stage"].values())
+    # the training env: S0 (curriculum start), the four demo stages, then back to S0
+    assert envs[0].changes[:6] == [("start", 0), ("start", 0), ("start", 1), ("start", 2), ("start", 3), ("start", 0)]
+    k = demo_count(128, 0.25)
+    online = [n for cap, n in sample_spy if cap == 20_000]
+    demo = [n for cap, n in sample_spy if cap != 20_000]
+    assert online and len(online) == len(demo) and set(online) == {128 - k} and set(demo) == {k}
+
+
+def test_demo_mixing_without_the_curriculum_collects_at_the_well(staged_toy, tmp_path, monkeypatch, toy_expert):
+    import json
+
+    _evals_at(monkeypatch, 0.0)
+    run_training(_die_cfg(die_start_curriculum=False, dr_max_stage=0, max_env_steps=32 * 20, demo_ratio=0.5,
+                          demo_episodes=32), tmp_path)  # fmt: skip
+    assert list(json.loads((tmp_path / "run_meta.json").read_text())["demos"]["per_stage"]) == ["well"]
+
+
+def test_demo_mixing_refuses_an_empty_demo_replay(staged_toy, tmp_path, monkeypatch):
+    from so101_rl.rl import scripted
+
+    class _Idle(_ToyExpert):
+        def __call__(self, env):
+            return torch.zeros(env.nworld, env.act_dim)  # never reaches a goal: no successful demo
+
+    monkeypatch.setattr(scripted, "demo_policy", _Idle)
+    with pytest.raises(RuntimeError, match="no scripted demo"):
+        run_training(_die_cfg(dr_max_stage=0, max_env_steps=32 * 20, demo_ratio=0.25, demo_episodes=4), tmp_path)

@@ -26,6 +26,15 @@ thresholds. ``start_stage`` is a ``metrics.csv`` column (the well stage for die 
 reach) and a checkpoint field (resume continues from it); ``ckpt_best`` ranks ``(start_stage, dr_stage, success)``.
 Off by default: without it the die starts in the well exactly as before.
 
+Scripted demos (``demo_ratio`` > 0 with ``demo_episodes`` > 0, die_to_zone only; D2b, plan §10 2026-10-16): before
+training, ``rl/scripted.py``'s privileged pick-and-place controller runs ``demo_episodes`` episodes per start stage
+(S0..S3 with the curriculum, else the well) on the training env; the transitions of its SUCCESSFUL episodes go into a
+separate demo replay in the online replay's exact format (no HER here: the loop never relabels), and every update
+batch takes ``replay_gpu.demo_count(batch_size, demo_ratio)`` rows from it (RLPD-style mixing, ``sample_mixed``). The
+demo replay is never written again and is not checkpointed (a resume collects it anew); ``run_meta.json`` ``demos``
+records the per-stage scripted success and the transition count. Default 0: nothing is collected and every batch
+is the same ``replay.sample`` draw as before.
+
 Eval cost: an eval is also deferred until this segment's eval time is at most ``eval_max_fraction`` (10 %) of its
 training time (the next eval, assumed as long as the last one, waits until it fits); ``eval_frac`` in ``metrics.csv`` is the measured
 fraction (the first eval of a segment is never deferred). Only the last ``keep_ckpts`` (3) numbered checkpoints are kept, plus ``ckpt_last.pt`` and
@@ -79,7 +88,7 @@ import torch
 from so101_rl.env.tasks import DIE_TO_ZONE, REACH
 from so101_rl.rl import eval_sim
 from so101_rl.rl.fast_sac import FastSAC, SacConfig
-from so101_rl.rl.replay_gpu import GpuReplay
+from so101_rl.rl.replay_gpu import GpuReplay, sample_mixed
 
 __all__ = [
     "METRICS_FIELDS",
@@ -144,6 +153,8 @@ class SimSacConfig:
     success_radius_mm: float | None = None  # None = the task's (reach 15 mm); plan §10 2026-10-14; reach only
     allow_unverified_sim_params: bool = False  # die_to_zone only: the user's S4.6 waiver (module docstring)
     die_start_curriculum: bool = False  # die_to_zone only: start stages S0..S3 before the DR stages (D2a)
+    demo_ratio: float = 0.0  # die_to_zone only: share of each batch from the scripted demo replay (D2b); 0 = off
+    demo_episodes: int = 0  # scripted episodes run per start stage to fill the demo replay (successes are kept)
 
 
 _REQUIRED: Final[tuple[str, ...]] = ("task", "nworld", "budget_min", "seed")
@@ -157,6 +168,7 @@ _TYPES: Final[dict[str, tuple[type, bool]]] = {  # name -> (type, nullable)
     "thermal_max_pause_min": (float, False), "tensorboard": (bool, False), "eval_max_fraction": (float, False),
     "keep_ckpts": (int, False), "thermal_guard": (bool, False), "success_radius_mm": (float, True),
     "allow_unverified_sim_params": (bool, False), "die_start_curriculum": (bool, False),
+    "demo_ratio": (float, False), "demo_episodes": (int, False),
 }  # fmt: skip
 
 
@@ -235,6 +247,12 @@ def _check_ranges(c: SimSacConfig, where: str) -> None:
                   "square (env/tasks.py)")  # fmt: skip
     if c.task != "die_to_zone" and c.die_start_curriculum:
         raise bad(f"die_start_curriculum is a die_to_zone option; {c.task} has no die start stages")
+    if not 0.0 <= c.demo_ratio < 1.0 or c.demo_episodes < 0:
+        raise bad("demo_ratio must be in [0, 1) and demo_episodes >= 0")
+    if (c.demo_ratio > 0) != (c.demo_episodes > 0):
+        raise bad("demo mixing needs both demo_ratio > 0 and demo_episodes > 0 (or neither)")
+    if c.demo_ratio > 0 and c.task != "die_to_zone":
+        raise bad(f"demo mixing uses the scripted die controller (rl/scripted.py); {c.task} has none")
     if c.nworld < 1:
         raise bad("nworld must be >= 1")
     if not (math.isfinite(c.budget_min) and c.budget_min >= 0):
@@ -490,11 +508,18 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
     if cfg.die_start_curriculum:
         start_stage = int(ck["start_stage"]) if ck is not None and ck.get("start_stage") is not None else 0
         env.set_start_stage(start_stage)
+    # scripted demos (D2b, RLPD-style mixing): a separate replay, filled once (also after a resume), never with
+    # online transitions; demo_ratio 0 builds nothing and samples exactly as before
+    demo_replay, demo_stats = None, None
+    if cfg.demo_ratio > 0:
+        demo_replay, demo_stats = _collect_demo_replay(cfg, env, (obs_dim, priv_dim, act_dim), dev, gamma, well_stage,
+                                                       start_stage)  # fmt: skip
     gen = torch.Generator(device=dev)
     gen.manual_seed(cfg.seed + 12345)
     meta = {"config": dataclasses.asdict(cfg), "env": dict(getattr(env, "metadata", {})), "git_sha": eval_sim.git_sha(),
             "resumed_from_step": env_step if ck is not None else None, "sac": sac_cfg.to_dict(),
-            "start_stages": [die_start.stage_name(k) for k in range(die_start.n_stages)] if die_start else None}  # fmt: skip
+            "start_stages": [die_start.stage_name(k) for k in range(die_start.n_stages)] if die_start else None,
+            "demos": demo_stats}  # fmt: skip
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
     from so101_rl.viz.monitor import TrainingMonitor, VizConfig
@@ -683,7 +708,7 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
             env_step += n
             if replay.size >= cfg.batch_size and (vec_steps > cfg.warmup_steps or ck is not None):
                 for _ in range(cfg.grad_steps_per_env_step):
-                    out = sac.update(replay.sample(cfg.batch_size, generator=gen))
+                    out = sac.update(sample_mixed(replay, demo_replay, cfg.batch_size, cfg.demo_ratio, generator=gen))
                     for k, v in out.items():
                         acc[k] = acc[k] + v if k in acc else v.clone()
                     n_upd += 1
@@ -744,6 +769,33 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
     print(f"[train-sim-sac] {status}: {reason} (env_steps {env_step}, train {train_s / 60:.1f} min, "
           f"thermal pause {paused_s:.0f} s)", flush=True)  # fmt: skip
     return TrainResult(status, env_step, last_ckpt, csvw.path, reason)  # type: ignore[arg-type]
+
+
+def _collect_demo_replay(cfg: SimSacConfig, env: Any, dims: tuple[int, int, int], dev: torch.device, gamma: float,
+                         well_stage: int | None, start_stage: int | None) -> tuple[GpuReplay, dict[str, Any]]:  # fmt: skip
+    """Fill a demo replay with ``cfg.demo_episodes`` scripted episodes per start stage (every curriculum stage S0..S3
+    with ``die_start_curriculum``, else the well) on the training env, keeping the successful ones
+    (``scripted.collect_demos``); the env's start stage is restored. Raises when no demo succeeded (L12)."""
+    from so101_rl.rl import scripted
+
+    die_start = DIE_TO_ZONE.die_start
+    stages = list(range(die_start.n_stages)) if cfg.die_start_curriculum else [well_stage]
+    horizon = int(getattr(getattr(env, "task", None), "episode_steps", getattr(env, "episode_steps", 100)))
+    demo = GpuReplay(max(cfg.demo_episodes * len(stages) * horizon, int(env.nworld)), *dims, device=dev, gamma=gamma)
+    per_stage = {}
+    t0 = time.monotonic()
+    for k in stages:
+        env.set_start_stage(k)
+        st = scripted.collect_demos(env, demo, cfg.demo_episodes, policy=scripted.demo_policy(env))
+        per_stage[die_start.stage_name(k)] = st
+        print(f"[train-sim-sac] demos S{k} ({die_start.stage_name(k)}): {st['successes']}/{st['episodes']} scripted "
+              f"successes, {st['transitions']} transitions", flush=True)  # fmt: skip
+    env.set_start_stage(start_stage)
+    if demo.size == 0:
+        raise RuntimeError("demo_ratio > 0 but no scripted demo episode succeeded (rl/scripted.py); refusing to mix an "
+                           "empty demo replay")  # fmt: skip
+    return demo, {"ratio": cfg.demo_ratio, "episodes_per_stage": cfg.demo_episodes, "transitions": demo.size,
+                  "collect_s": round(time.monotonic() - t0, 1), "per_stage": per_stage}  # fmt: skip
 
 
 def _next_stage(stage: int, success: float, max_stage: int) -> int:

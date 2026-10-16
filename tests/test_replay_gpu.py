@@ -48,3 +48,46 @@ def test_sample_shapes_and_errors():
         GpuReplay(4, 1, 1, 1, device="cpu", n_step=3)
     with pytest.raises(ValueError):
         GpuReplay(0, 1, 1, 1, device="cpu")
+
+
+# ------------------------------------------------------------------------------------------------ demo mixing (D2b)
+def test_demo_count():
+    from so101_rl.rl.replay_gpu import demo_count
+
+    assert demo_count(4096, 0.0) == 0
+    assert demo_count(4096, 0.25) == 1024
+    assert demo_count(10, 0.01) == 1  # a positive ratio always draws a demo row
+    assert demo_count(4, 0.99) == 3  # the online replay always contributes
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError):
+            demo_count(8, bad)
+
+
+@pytest.mark.parametrize("ratio", [0.1, 0.25, 0.5])
+def test_sample_mixed_honours_the_ratio(ratio):
+    from so101_rl.rl.replay_gpu import demo_count, sample_mixed
+
+    online, demo = GpuReplay(64, 3, 2, 1, device="cpu"), GpuReplay(64, 3, 2, 1, device="cpu")
+    _add(online, 0, n=16)  # reward 0 marks online rows
+    _add(demo, 1, n=16)  # reward 1 marks demo rows
+    g = torch.Generator().manual_seed(0)
+    for _ in range(5):
+        b = sample_mixed(online, demo, 128, ratio, generator=g)
+        k = demo_count(128, ratio)
+        assert b.obs.shape == (128, 3) and b.n_step_discount.shape == (128,)
+        assert int((b.rew == 1.0).sum()) == k and torch.all(b.rew[128 - k :] == 1.0)
+        assert torch.all(b.obs[b.rew == 1.0] == 1.0) and torch.all(b.next_obs[b.rew == 0.0] == 0.5)
+
+
+def test_sample_mixed_without_demos_is_the_plain_sample():
+    """demo_ratio 0 (or no demo replay) draws exactly what replay.sample draws from the same generator state."""
+    from so101_rl.rl.replay_gpu import sample_mixed
+
+    online, demo = GpuReplay(64, 3, 2, 1, device="cpu"), GpuReplay(64, 3, 2, 1, device="cpu")
+    for k in range(5):
+        _add(online, k, n=8)
+    _add(demo, 9, n=8)
+    for d, ratio in ((demo, 0.0), (None, 0.0), (None, 0.25)):
+        a = sample_mixed(online, d, 32, ratio, generator=torch.Generator().manual_seed(7))
+        b = online.sample(32, generator=torch.Generator().manual_seed(7))
+        assert all(torch.equal(getattr(a, f), getattr(b, f)) for f in a.__dataclass_fields__)
