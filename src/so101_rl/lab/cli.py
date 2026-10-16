@@ -25,6 +25,13 @@ CHECKLIST = (
     "The training curves in TensorBoard look sane (no divergence, no collapse late in training).",
     "The eval ran at the final DR stage with >= 1000 episodes, and the exported policy file exists.",
 )
+DIE_CHECKLIST = (
+    "I watched the rendered eval rollouts (renders/) and the die ends at rest inside the zone (push or place; noted).",
+    "No predicate gaming: no die held under the 16 mm bound, no success while sliding, pushed or occluded.",
+    "The training curves in TensorBoard look sane (no divergence, no collapse late in training).",
+    "The eval ran at the final DR stage with >= 1000 episodes, and the exported policy file exists.",
+)
+CHECKLISTS = {"reach": CHECKLIST, "die_to_zone": DIE_CHECKLIST}
 
 
 def gate_sign(lab: Lab, run_id: str, *, input_fn: Callable[[str], str] = input,
@@ -48,8 +55,9 @@ def gate_sign(lab: Lab, run_id: str, *, input_fn: Callable[[str], str] = input,
              f"Wilson lower bound {result['wilson_lo']:.4f}, episodes {result['episodes']}")
     print_fn(f"Renders and eval.json: {eval_dir}")
     ticks = []
-    for i, item in enumerate(CHECKLIST, 1):
-        ans = input_fn(f"[{i}/{len(CHECKLIST)}] {item} [y/N] ").strip().lower()
+    checklist = CHECKLISTS.get(str(run.get("task")), CHECKLIST)
+    for i, item in enumerate(checklist, 1):
+        ans = input_fn(f"[{i}/{len(checklist)}] {item} [y/N] ").strip().lower()
         if ans not in ("y", "yes"):
             raise LabError("GATE_MISSING", "checklist item not confirmed; nothing recorded", details={"item": i})
         ticks.append(item)

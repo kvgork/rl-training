@@ -1,7 +1,13 @@
-"""Massively parallel SAC on the batched reach env (sim plan S4.3, MVP M4). FROZEN API for the connector.
+"""Massively parallel SAC on the batched env (sim plan S4.3 / S4.6, MVP M4). FROZEN API for the connector.
 
-``pixi run train-sim-sac --task reach --nworld 1024 --budget-min 60 [--seed S] [--dr-max-stage 4] [--out DIR]
-[--resume CKPT] [--config YAML]``
+``pixi run train-sim-sac --task {reach,die_to_zone} --nworld 1024 --budget-min 60 [--seed S] [--dr-max-stage 4]
+[--out DIR] [--resume CKPT] [--config YAML]``
+
+Tasks: ``eval_sim.TASKS``. ``gamma`` defaults to the task spec's (``TASK_GAMMA``: reach 0.97, die_to_zone 0.98); the
+policy input is the task's FS3 observation plus the goal (reach 24, die 29), taken from the env. ``die_to_zone``
+(plans/die-to-zone-plan.md D1) refuses ``success_radius_mm`` (reach only) and, per sim plan S4.6, refuses to train
+on unverified sim parameters (the v0 MJCF prior: gripper / die contact never identified) unless the config sets
+``allow_unverified_sim_params: true`` -- the user's recorded waiver (die-to-zone plan decision 1), never a default.
 
 Loop: warm-up random actions -> FastSAC acting on ``obs ++ goal`` (FS3 policy input) -> GPU replay (``next_obs`` =
 the pre-reset ``final_obs`` so truncation bootstraps) -> ``grad_steps_per_env_step`` updates per vector step. Every
@@ -61,6 +67,7 @@ from typing import Any, Final, Literal
 
 import torch
 
+from so101_rl.env.tasks import DIE_TO_ZONE, REACH
 from so101_rl.rl import eval_sim
 from so101_rl.rl.fast_sac import FastSAC, SacConfig
 from so101_rl.rl.replay_gpu import GpuReplay
@@ -82,7 +89,9 @@ THERMAL_PAUSE_C: Final[float] = 85.0
 THERMAL_RESUME_C: Final[float] = 75.0
 THERMAL_POLL_S: Final[float] = 2.0
 THERMAL_NEEDS_HUMAN_MISSING: Final[int] = 6
-TASK_GAMMA: Final[dict[str, float]] = {"reach": 0.97}
+TASK_GAMMA: Final[dict[str, float]] = {s.name: s.gamma for s in (REACH, DIE_TO_ZONE)}  # FS4 task specs
+# sim plan S4.5 / S4.6 review trigger "success < X after Y GPU-h" per task: (min eval success, after GPU-h)
+TASK_LOW_SUCCESS_TRIGGER: Final[dict[str, tuple[float, float]]] = {"reach": (0.5, 1.0), "die_to_zone": (0.1, 4.0)}
 
 METRICS_FIELDS: Final[tuple[str, ...]] = (
     "env_step", "wall_s", "train_s", "env_steps_per_s", "grads_per_s", "dr_stage", "train_success_rate",
@@ -123,7 +132,8 @@ class SimSacConfig:
     eval_max_fraction: float = 0.1  # defer an eval until evals are <= this fraction of the training time
     keep_ckpts: int = 3  # numbered checkpoints kept (plus ckpt_last.pt and ckpt_best.pt)
     thermal_guard: bool = True  # the trainer's own NVML pause; False under the lab (the job owns the guard)
-    success_radius_mm: float | None = None  # None = the task's (reach 15 mm); plan §10 2026-10-14
+    success_radius_mm: float | None = None  # None = the task's (reach 15 mm); plan §10 2026-10-14; reach only
+    allow_unverified_sim_params: bool = False  # die_to_zone only: the user's S4.6 waiver (module docstring)
 
 
 _REQUIRED: Final[tuple[str, ...]] = ("task", "nworld", "budget_min", "seed")
@@ -136,6 +146,7 @@ _TYPES: Final[dict[str, tuple[type, bool]]] = {  # name -> (type, nullable)
     "gamma": (float, True), "calibration": (str, True), "sim_params": (str, False), "vram_fraction": (float, False),
     "thermal_max_pause_min": (float, False), "tensorboard": (bool, False), "eval_max_fraction": (float, False),
     "keep_ckpts": (int, False), "thermal_guard": (bool, False), "success_radius_mm": (float, True),
+    "allow_unverified_sim_params": (bool, False),
 }  # fmt: skip
 
 
@@ -208,7 +219,10 @@ def _check_ranges(c: SimSacConfig, where: str) -> None:
         return ValueError(f"{where}: {msg}")
 
     if c.task not in eval_sim.TASKS:
-        raise bad(f"task {c.task!r} is not trainable in the MVP (only {list(eval_sim.TASKS)})")
+        raise bad(f"task {c.task!r} is not trainable (only {list(eval_sim.TASKS)})")
+    if c.task != "reach" and c.success_radius_mm is not None:
+        raise bad(f"success_radius_mm is a reach-only override (plan §10 2026-10-14); {c.task} success is the zone "
+                  "square (env/tasks.py)")  # fmt: skip
     if c.nworld < 1:
         raise bad("nworld must be >= 1")
     if not (math.isfinite(c.budget_min) and c.budget_min >= 0):
@@ -285,8 +299,10 @@ class ThermalGuard:
 
 
 # ------------------------------------------------------------------------------------------------ review triggers
-def review_triggers(history: list[dict[str, float]], *, train_h: float, n_updates_per_transition: float) -> list[str]:
-    """Plan S4.3 step 2 (reach subset). Recorded only; the method is never switched automatically (plan §5, P7)."""
+def review_triggers(history: list[dict[str, float]], *, train_h: float, n_updates_per_transition: float,
+                    task: str = "reach") -> list[str]:  # fmt: skip
+    """Plan S4.3 step 2 (reach subset; the low-success trigger per ``TASK_LOW_SUCCESS_TRIGGER``). Recorded only; the
+    method is never switched automatically (plan §5, P7)."""
     out: list[str] = []
     if not history:
         return out
@@ -308,8 +324,9 @@ def review_triggers(history: list[dict[str, float]], *, train_h: float, n_update
         best_before = max(x["eval_success_rate"] for x in evals[:-3])
         if max(x["eval_success_rate"] for x in evals[-3:]) <= best_before < eval_sim.GATE_MIN_SUCCESS:
             out.append("no eval improvement over 3 evals")
-    if train_h >= 1.0 and evals and evals[-1]["eval_success_rate"] < 0.5:
-        out.append(f"reach success {evals[-1]['eval_success_rate']:.2f} < 0.5 after {train_h:.2f} GPU-h")
+    min_ok, after_h = TASK_LOW_SUCCESS_TRIGGER[task]
+    if train_h >= after_h and evals and evals[-1]["eval_success_rate"] < min_ok:
+        out.append(f"{task} success {evals[-1]['eval_success_rate']:.2f} < {min_ok:g} after {train_h:.2f} GPU-h")
     return out
 
 
@@ -378,11 +395,29 @@ def _save(path: Path, obj: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def unverified_sim_params(path: str | Path) -> str | None:
+    """Why the ``sim_params`` file is not a fitted, verified release (None = release >= 1 and verified)."""
+    from so101_rl.sim.compare_real import MAX_RMS_PCT
+    from so101_rl.sim.sysid.params import read_sim_params_file
+
+    meta = read_sim_params_file(Path(path), allow_unverified=True).meta
+    if meta.version < 1:
+        return f"release {meta.version} is the MJCF prior"
+    problems = meta.verification_problems(MAX_RMS_PCT)
+    return f"release {meta.version} unverified: {'; '.join(problems)}" if problems else None
+
+
 def run_training(
     cfg: SimSacConfig, out_dir: Path, *, hooks: TrainHooks | None = None, resume: Path | None = None
 ) -> TrainResult:
     """Train until gate / budget / stop (module docstring). Always writes ``metrics.csv``; returns the outcome."""
     hooks = hooks or TrainHooks()
+    if cfg.task == "die_to_zone" and not cfg.allow_unverified_sim_params:
+        problem = unverified_sim_params(cfg.sim_params)
+        if problem:
+            raise ValueError(f"{cfg.sim_params}: {problem}. Sim plan S4.6: die_to_zone is not trained on unverified "
+                             "sim parameters (gripper / die contact never identified; needs HS3 v1). A waiver is the "
+                             "user's decision (plans/die-to-zone-plan.md decision 1): allow_unverified_sim_params")  # fmt: skip
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_csv = out_dir / "metrics.csv"
@@ -521,7 +556,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
         hist = {k: float(v) for k, v in row.items() if isinstance(v, int | float) and not isinstance(v, bool)}
         hist.update({"reward_abs_max": float(rew_abs_max), "gamma": gamma})
         history.append(hist)
-        trig = review_triggers(history, train_h=train_s / 3600.0, n_updates_per_transition=cfg.grad_steps_per_env_step / n)
+        trig = review_triggers(history, train_h=train_s / 3600.0, n_updates_per_transition=cfg.grad_steps_per_env_step / n,
+                               task=cfg.task)  # fmt: skip
         new = [t for t in trig if t not in {r["trigger"] for r in review}]
         for t in new:
             review.append({"env_step": env_step, "trigger": t})
@@ -711,7 +747,7 @@ def _artifacts_ok(res: TrainResult) -> tuple[bool, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="train-sim-sac", description="FastSAC on the batched reach env (MVP M4)")
+    ap = argparse.ArgumentParser(prog="train-sim-sac", description="FastSAC on the batched sim env (reach, die_to_zone)")
     ap.add_argument("--config", type=Path, default=None, help="yaml with SimSacConfig keys (CLI flags override)")
     ap.add_argument("--task", default=None)
     ap.add_argument("--nworld", type=int, default=None)
@@ -721,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dr-start-stage", type=int, default=None)
     ap.add_argument("--eval-every-steps", type=int, default=None)
     ap.add_argument("--eval-episodes", type=int, default=None)
-    ap.add_argument("--success-radius-mm", type=float, default=None, help="reach success radius (default the task's 15 mm)")
+    ap.add_argument("--success-radius-mm", type=float, default=None, help="reach only: success radius (default the task's 15 mm)")
     ap.add_argument("--calibration", default=None)
     ap.add_argument("--sim-params", default=None)
     ap.add_argument("--out", type=Path, default=None, help="default runs/sac-sim/<task>-<timestamp>/")

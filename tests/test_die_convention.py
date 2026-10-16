@@ -74,14 +74,10 @@ def test_the_tracker_edge_is_the_scene_die_edge():
     assert real.die_edge_m == pytest.approx(DIE_EDGE_M) == pytest.approx(2 * DIE_HALF_EDGE_M)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "sim/real parity gap found 2026-10-10: at the pose the scene is rendered at (home) the real tracker sees the die "
-    "in the start well as hidden but the sim occluders do not. Until then this passed only because the occluders were "
-    "computed at the old placeholder rest pose, whose gripper lay over the well. Die-to-zone is deferred (MVP: reach)."
-))
 def test_the_start_well_hides_the_die_from_the_oblique_camera(rendered):
-    """From the real (oblique) mount the start-well tray's rim hides part of a die in the well: the real tracker's
-    ring test reports it occluded, and the sim tracker's tray occluder agrees (camera parity C.3)."""
+    """From the real (oblique) mount a die in the start well fails the real tracker's ring test (the tray rim around
+    it is nearer than the die), and the sim tracker's ring rule over the tray occluder boxes agrees (camera parity
+    C.3; the 2026-10-10 gap, fixed 2026-10-16 by the sim ring rule)."""
     import torch as _t
 
     from so101_rl.sim.sim_tracker import Occluders
@@ -138,3 +134,14 @@ def test_centroid_helper_subtracts_half_an_edge_along_the_table_normal():
     np.testing.assert_allclose(p, [0.2, 0.0, 0.1 - 0.008])
     with pytest.raises(ValueError, match="die_edge_m"):
         die_centroid_base(np.zeros(3), T, 0.0)
+
+
+def test_sim_ring_constants_match_the_real_tracker():
+    from so101_rl.perception import die_tracker as dt
+    from so101_rl.sim import sim_tracker as st
+
+    assert st.RING_OCCLUDED_FRACTION == dt._OCCLUDED_RING_FRACTION
+    assert st.RING_PX == (dt._RING_KERNEL.shape[0] - 1) / 2
+    import inspect
+
+    assert st.RING_DEPTH_M == inspect.signature(HsvDepthDieTracker).parameters["depth_window_m"].default

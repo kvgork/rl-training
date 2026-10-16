@@ -60,6 +60,18 @@ def test_start_complete_and_list(lab):
     assert [x["run_id"] for x in rows] == [r["run_id"]] and rows[0]["state"] == "completed"
 
 
+def test_die_to_zone_runs_on_its_own_budget_key(lab):
+    """plans/die-to-zone-plan.md D1: die_to_zone is a lab task with its own ledger key; fastsac_sim refuses it on the
+    shipped v0 sim params (sim plan S4.6) before any run dir exists."""
+    r = lab.start_run("fake", "die_to_zone", {"steps": 5, "step_s": 0.0}, "d1")
+    assert r["ok"] and r["budget_key"] == "fake.die_to_zone"
+    assert lab.get_run(r["run_id"], wait_s=60)["status"]["state"] == "completed"
+    tasks = {t["name"]: t for t in lab.list_tasks()["tasks"]}
+    assert tasks["die_to_zone"]["budget"]["gpu_h_max"] == 30.0 and "fastsac_sim" in tasks["die_to_zone"]["trainers"]
+    assert _code(lab.start_run, "fastsac_sim", "die_to_zone", {}, "d2") == "GATE_MISSING"
+    assert len(runs.list_run_dirs(lab.root)) == 1
+
+
 def test_idempotent_start_returns_the_same_run(lab):
     a = lab.start_run("fake", "reach", {"steps": 5, "step_s": 0.0}, "same")
     b = lab.start_run("fake", "reach", {"steps": 5, "step_s": 0.0}, "same")
@@ -70,7 +82,7 @@ def test_idempotent_start_returns_the_same_run(lab):
 
 def test_refusals_are_structured(lab):
     assert _code(lab.start_run, "sb3", "reach", {}, "x") == "UNKNOWN_TRAINER"
-    assert _code(lab.start_run, "fake", "die_to_zone", {}, "x") == "UNKNOWN_TASK"
+    assert _code(lab.start_run, "fake", "pick_and_place", {}, "x") == "UNKNOWN_TASK"
     assert _code(lab.start_run, "fake", "reach", {"thermal_pause_c": 99}, "x") == "CONFIG_INVALID"
     assert _code(lab.start_run, "fake", "reach", {"steps": 0}, "x") == "CONFIG_INVALID"
     assert _code(lab.start_run, "fake", "reach", {"steps": True}, "x") == "CONFIG_INVALID"

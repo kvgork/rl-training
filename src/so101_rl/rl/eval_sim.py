@@ -1,6 +1,7 @@
-"""Sim evaluation and the numeric reach exit gate (sim plan S4.3 step 3, MVP M4).
+"""Sim evaluation and the numeric exit gate for reach and die_to_zone (sim plan S4.3 step 3 / S4.6, MVP M4).
 
-``pixi run eval-sim --ckpt PATH --task reach --episodes 1000 --dr-stage 4 --render 16 --out runs/eval-sim/<ts>/ [--gate]``
+``pixi run eval-sim --ckpt PATH --task {reach,die_to_zone} --episodes 1000 --dr-stage 4 --render 16
+--out runs/eval-sim/<ts>/ [--gate]``
 
 Every world runs exactly one deterministic episode per round (worlds that finish early are not re-counted), so
 the success rate is not biased toward short (successful) episodes. Writes ``eval.json`` (success rate, Wilson 95 %
@@ -12,8 +13,14 @@ with the Wilson 95 % lower bound ``>= 0.93`` -> ``numeric_gate_passed``; the run
 also ticks the rendered-rollout checklist (recorded elsewhere; this module never marks it). ``--gate`` makes the CLI
 exit 1 unless the numeric part passes. The CLI exits 2 when ``eval.json`` was not written.
 
-Reach uses no camera (state observation): ``camera_pose_method`` is recorded as ``"none"``. Renders use the
-``calib/camera.yaml`` pose for the D435 view (a provisional pose is fine for a picture) and record its source.
+Reach uses no camera (state observation): ``camera_pose_method`` is recorded as ``"none"``. The die task sees the
+die through the simulated tracker on the ``calib/camera.yaml`` pose (``BatchedGoalEnv`` refuses a provisional pose),
+so its ``camera_pose_method`` is that pose's method. Renders use the ``calib/camera.yaml`` pose for the D435 view (a
+provisional pose is fine for a picture) and record its source.
+
+Tasks (``TASKS``): ``reach`` (``env.tasks.REACH``) and ``die_to_zone`` (``env.tasks.DIE_TO_ZONE``, plans/
+die-to-zone-plan.md D1; same gate numbers, DR stages and env factory). ``success_radius_mm`` (plan §10
+2026-10-14) replaces REACH's 15 mm ball only; the die task refuses it (its predicate is the zone square).
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ __all__ = [
     "evaluate",
     "gate_verdict",
     "run_episodes",
+    "task_spec",
     "wilson_interval",
 ]
 
@@ -59,7 +67,7 @@ GATE_MIN_SUCCESS: Final[float] = 0.95
 GATE_MIN_WILSON_LO: Final[float] = 0.93
 GATE_MIN_EPISODES: Final[int] = 1000
 GATE_FINAL_STAGE: Final[int] = 4  # the last entry of sim/domain_rand.REACH_DR_STAGES (test-enforced)
-TASKS: Final[tuple[str, ...]] = ("reach",)  # MVP: reach only (die_to_zone deferred, plans/mvp-plan.md)
+TASKS: Final[tuple[str, ...]] = ("reach", "die_to_zone")  # die_to_zone: plans/die-to-zone-plan.md D1
 # per-cause counts of the episodes ended by an emulated trip (eval.json ``trip_causes``; env.tasks.TERMINAL_TRIPS)
 TRIP_CAUSES: Final[tuple[tuple[str, TripCause], ...]] = (
     ("nan", TripCause.NAN), ("range", TripCause.RANGE), ("box_present", TripCause.BOX_PRESENT), ("stuck", TripCause.STUCK),
@@ -129,18 +137,16 @@ def build_env(
     device: str | None = None,
     success_radius_mm: float | None = None,
 ) -> Any:
-    """The batched reach env with the reach DR stages around ``sim_params`` (the v0 MJCF prior is accepted for
+    """The batched env of ``task`` with the DR stages around ``sim_params`` (the v0 MJCF prior is accepted for
     reach, plan S4.5; its release is recorded). Needs CUDA. The training loop builds its envs through this
     function too (tests replace it with the toy env). ``success_radius_mm`` replaces REACH's 15 mm success radius
-    (plan §10 2026-10-14; None = the task's)."""
-    if task not in TASKS:
-        raise ValueError(f"task {task!r} is not trainable in the MVP (only {TASKS})")
+    (plan §10 2026-10-14; None = the task's); refused for the die task (:func:`task_spec`)."""
+    base_spec = task_spec(task, success_radius_mm)
     dev = device or "cuda:0"
     if torch.device(dev).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("the batched sim env needs CUDA (MuJoCo Warp)")
     from so101_rl.config import load_calibration, load_config
     from so101_rl.env.batched_env import BatchedGoalEnv
-    from so101_rl.env.tasks import REACH
     from so101_rl.sim.compare_real import MAX_RMS_PCT
     from so101_rl.sim.domain_rand import DomainRandomizer
     from so101_rl.sim.model import load_model
@@ -155,14 +161,32 @@ def build_env(
     spf = read_sim_params_file(Path(sim_params), allow_unverified=True)
     model = load_model()[0]
     rnd = DomainRandomizer(spf.params, spf.dr, nworld, stage=stage, seed=seed + 1, device=dev)
-    task_spec = REACH if success_radius_mm is None else dataclasses.replace(REACH, success_radius_m=success_radius_mm / 1000.0)
-    env = BatchedGoalEnv(cfg, cal, task_spec, nworld, sim_params=spf.params, randomizer=rnd, model=model, seed=seed, device=dev)
+    env = BatchedGoalEnv(cfg, cal, base_spec, nworld, sim_params=spf.params, randomizer=rnd, model=model, seed=seed, device=dev)
     env.metadata.update({
         "calibration": str(cal_path), "calibration_sha256": _sha256(cal_path), "sim_params": str(sim_params), "sim_params_release": spf.meta.version,
-        "sim_params_verified": not spf.meta.verification_problems(MAX_RMS_PCT), "camera_pose_method": CAMERA_POSE_METHOD_REACH,
-        "success_radius_m": task_spec.success_radius_m,
+        "sim_params_verified": not spf.meta.verification_problems(MAX_RMS_PCT), "success_radius_m": base_spec.success_radius_m,
     })  # fmt: skip
+    if not base_spec.obs.has_die:  # die tasks keep the env's own camera_pose_method (the calib/camera.yaml pose)
+        env.metadata["camera_pose_method"] = CAMERA_POSE_METHOD_REACH
     return env
+
+
+def task_spec(task: str, success_radius_mm: float | None = None) -> Any:
+    """The FS4 :class:`~so101_rl.env.tasks.TaskSpec` of ``task`` (``TASKS``). ``success_radius_mm`` replaces REACH's
+    15 mm radius (plan §10 2026-10-14); the die task refuses it (its success is the zone square, not a radius).
+    Raises ``ValueError``."""
+    from so101_rl.env.tasks import DIE_TO_ZONE, REACH
+
+    if task not in TASKS:
+        raise ValueError(f"task {task!r} is not a sim task (only {TASKS})")
+    if task == "die_to_zone":
+        if success_radius_mm is not None:
+            raise ValueError("success_radius_mm is a reach-only override (plan §10 2026-10-14); die_to_zone success "
+                             "is the zone square (env/tasks.py), not a radius")  # fmt: skip
+        return DIE_TO_ZONE
+    if success_radius_mm is None:
+        return REACH
+    return dataclasses.replace(REACH, success_radius_m=success_radius_mm / 1000.0)
 
 
 def policy_input(env: Any, obs: torch.Tensor) -> torch.Tensor:
@@ -328,12 +352,32 @@ tick (plan §5 S4); the AI may review first, a human signs (`pixi run lab gate-s
 - [ ] The overlay success flag agrees with what the video shows.
 """
 
+DIE_CHECKLIST: Final[str] = """# Die-to-zone exit gate: human review checklist
+
+Run: `{ckpt}` - eval `{eval_json}` - DR stage {stage} - {episodes} episodes - success {rate:.4f}
+(Wilson 95 % [{lo:.4f}, {hi:.4f}]) - numeric gate: **{verdict}**
+
+Watch every video in `renders/` and tick each item. The exit gate passes only with the numeric part AND every
+tick (plan §5 S4, sim plan S4.6); the AI may review first, a human signs (`pixi run lab gate-sign <run>`).
+
+- [ ] The die ends at rest inside the 60 mm zone square (push and place both count; note which one, S4.6).
+- [ ] No predicate gaming: the die is not held or hovered just under the 16 mm height bound, and success is not
+      flagged while the die slides through the zone or the gripper still pushes it.
+- [ ] No exploiting the tracker: success is never flagged while the die is occluded (by the gripper or the arm).
+- [ ] No contact with the table or the tray beyond pushing the die; no gripper dragged along the table.
+- [ ] The die is not flung, dropped from height or knocked off the table.
+- [ ] Motions are smooth: no saturated bang-bang joint commands, no shaking at rest.
+- [ ] No unusual poses (e.g. elbow flipped, wrist twisted) that would be unsafe on the real arm.
+- [ ] The overlay success flag agrees with what the video shows.
+"""
+CHECKLISTS: Final[dict[str, str]] = {"reach": CHECKLIST, "die_to_zone": DIE_CHECKLIST}
+
 
 def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Path, render: int = 0) -> EvalResult:
     """Deterministic evaluation of ``ckpt`` on ``episodes`` episodes at ``dr_stage``; writes ``eval.json``,
     ``review_checklist.md`` and ``render`` videos under ``out_dir``. See the module docstring."""
     if task not in TASKS:
-        raise ValueError(f"task {task!r} not supported (MVP: {TASKS})")
+        raise ValueError(f"task {task!r} not supported (only {TASKS})")
     if episodes < 1:
         raise ValueError("episodes must be >= 1")
     out_dir = Path(out_dir)
@@ -372,7 +416,7 @@ def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Pa
         "gate": {"min_success": GATE_MIN_SUCCESS, "min_wilson_lo": GATE_MIN_WILSON_LO, "min_episodes": GATE_MIN_EPISODES,
                  "final_stage": GATE_FINAL_STAGE, "numeric_passed": passed, "reasons": reasons,
                  "human_checklist": "pending (review_checklist.md; signed outside this tool)"},
-        "camera_pose_method": CAMERA_POSE_METHOD_REACH, "render_camera_pose": render_src,
+        "camera_pose_method": meta.get("camera_pose_method", CAMERA_POSE_METHOD_REACH), "render_camera_pose": render_src,
         "calibration_changed_since_training": cal_changed,
         "renders": [str(p) for p in renders], "env": meta, "git_sha": git_sha(), "wall_s": time.monotonic() - t0,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -381,7 +425,7 @@ def evaluate(ckpt: Path, task: str, *, episodes: int, dr_stage: int, out_dir: Pa
     tmp = eval_json.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(doc, indent=2))
     tmp.replace(eval_json)
-    (out_dir / "review_checklist.md").write_text(CHECKLIST.format(
+    (out_dir / "review_checklist.md").write_text(CHECKLISTS[task].format(
         ckpt=ckpt, eval_json=eval_json, stage=dr_stage, episodes=stats["episodes"], rate=stats["success_rate"], lo=lo,
         hi=hi, verdict="PASS" if passed else "FAIL (" + "; ".join(reasons) + ")"))  # fmt: skip
     return EvalResult(stats["success_rate"], lo, hi, stats["episodes"], passed, eval_json, tuple(renders))
@@ -413,7 +457,7 @@ def rerender(ckpt: Path, task: str, *, dr_stage: int, render: int, out_dir: Path
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="eval-sim", description="Sim evaluation + numeric reach exit gate")
+    ap = argparse.ArgumentParser(prog="eval-sim", description="Sim evaluation + numeric exit gate (reach, die_to_zone)")
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--task", choices=TASKS, default="reach")
     ap.add_argument("--episodes", type=int, default=GATE_MIN_EPISODES)

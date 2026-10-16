@@ -1,4 +1,4 @@
-"""Feasibility (L1) and predicate (L2) gates for reach, before any reward tuning (sim plan S4.2 reach part, MVP M3).
+"""Feasibility (L1) and predicate (L2) gates for reach and die_to_zone, before any reward tuning (sim plan S4.2, MVP M3).
 
 ``pixi run sim-gates --task reach [--out runs/gates/reach-<ts>.json]`` prints a PASS/FAIL table and exits 0 only
 when every row passes. The GPU rows (scripted controller, do-nothing, random policy) need CUDA; without it they FAIL
@@ -24,6 +24,26 @@ L2 (predicate):
 
 Each gate has a shown-to-fail twin in ``tests/test_gates.py`` (goal radius 0.40 m without the reachability filter
 fails ``fk_coverage``; a 30 mm predicate fails ``adversarial`` and ``independent_predicate``).
+
+``pixi run sim-gates --task die_to_zone [--nworld K]`` runs the die gates (plans/die-to-zone-plan.md D1). The die
+predicate (``env/tasks.py``): visible AND ``|dx|, |dy| <= zone.half_edge_m`` (a square, L-inf in xy) AND
+``z - z_goal <= zone.max_height_m``; termination needs ``success_debounce_steps`` consecutive predicate steps with
+the die settled (moved <= ``settle_m`` between them).
+
+- ``start_not_success`` (L1, CPU): no die start lies in the zone. Worst case over the whole start set (the batched
+  env clips the die centre to the flat floor of the start well, ``batched_env._WELL_HALF_M``: the well square's
+  point nearest the zone centre) plus 1e4 sampled starts (the env's draw: N(centre, sigma), clipped).
+- ``adversarial`` (L2, CPU): the die predicate table (zone centre, 0.1 mm inside / outside an edge, the inside
+  corner (a Euclidean predicate fails it), 0.1 mm under / over the height bound, held 20 mm up, invisible, NaN).
+- ``independent_predicate`` (L2, CPU): a separately written predicate agrees with ``tasks.success_np`` on 1e5
+  states (goals anywhere, as after HER relabelling; die within 1 mm of an edge or the height bound; 10 % invisible).
+- ``independent_settle`` (L2, CPU): a separately written debounce / settle loop agrees with ``tasks.debounce_np``
+  on random predicate / displacement sequences (moves straddling ``settle_m``).
+- ``do_nothing`` (L2, CPU): CPU MuJoCo, the arm holding its start pose (home +- start noise) for one episode with
+  the die placed as the env places it; the TRUE die position, read every policy step as an always-visible tracker
+  (more permissive than the sim tracker), never terminates as a success (``K`` worlds, default 16).
+- ``do_nothing_batched`` and ``random_policy`` (GPU): as the reach rows, on the batched die env with the simulated
+  tracker. Without CUDA they FAIL (not run), so the CLI exits 1, as for reach.
 """
 
 from __future__ import annotations
@@ -41,7 +61,18 @@ from typing import Any
 import numpy as np
 import torch
 
-__all__ = ["GateRow", "independent_reach_success", "main", "run_reach_gates"]
+__all__ = [
+    "GATE_TASKS",
+    "GateRow",
+    "independent_die_settle",
+    "independent_die_success",
+    "independent_reach_success",
+    "main",
+    "run_die_gates",
+    "run_reach_gates",
+]
+
+GATE_TASKS: tuple[str, ...] = ("reach", "die_to_zone")
 
 Predicate = Callable[..., np.ndarray]
 
@@ -319,17 +350,247 @@ def run_reach_gates(*, gpu: bool | None = None, calibration: str | None = None, 
     return rows
 
 
+# ------------------------------------------------------------------------------------------------ die_to_zone
+def independent_die_success(achieved: np.ndarray, desired: np.ndarray, visible: np.ndarray, half_edge: float,
+                            max_height: float) -> np.ndarray:  # fmt: skip
+    """Second, separately written die predicate (L2): per-axis comparisons, explicit NaN rejection, visible only."""
+    a = np.asarray(achieved, dtype=np.float64)
+    d = np.asarray(desired, dtype=np.float64)
+    finite = ~(np.isnan(a).any(axis=-1) | np.isnan(d).any(axis=-1))
+    in_x = np.abs(a[..., 0] - d[..., 0]) <= half_edge
+    in_y = np.abs(a[..., 1] - d[..., 1]) <= half_edge
+    low = (a[..., 2] - d[..., 2]) <= max_height
+    return finite & in_x & in_y & low & np.asarray(visible, dtype=bool)
+
+
+def independent_die_settle(pred: np.ndarray, moved: np.ndarray, need: int, settle_m: float) -> np.ndarray:
+    """Second, separately written debounce / settle rule (L2) for ONE sequence: ``pred[t]`` the step predicate,
+    ``moved[t]`` the tracker displacement since step ``t - 1``. A run of predicate steps continues only while each
+    step moved at most ``settle_m``; success from the ``need``-th step of a run on. Returns bool[T]."""
+    out = np.zeros(len(pred), dtype=bool)
+    run = 0
+    for t in range(len(pred)):
+        if not pred[t]:
+            run = 0
+        elif run > 0 and moved[t] <= settle_m:
+            run += 1
+        else:
+            run = 1
+        out[t] = run >= need
+    return out
+
+
+def _well_half_m() -> float:
+    from so101_rl.env.batched_env import _WELL_HALF_M  # the one value the env clips the die start with
+
+    return float(_WELL_HALF_M)
+
+
+def _die_starts(spec: Any, n: int, rng: np.random.Generator, well_half_m: float) -> np.ndarray:
+    """The batched env's die placement (``BatchedGoalEnv._place_die``) in numpy: die centre xyz [n, 3]."""
+    from so101_rl.env.tasks import DIE_HALF_EDGE_M
+
+    ds = spec.die_start
+    yaw = rng.uniform(0.0, 2 * math.pi, size=n)
+    reach = DIE_HALF_EDGE_M * (np.abs(np.cos(yaw)) + np.abs(np.sin(yaw)))  # footprint half extent
+    slack = np.clip(well_half_m - reach, 0.0, None)[:, None]
+    xy = np.clip(rng.normal(size=(n, 2)) * ds.sigma_xy_m, -slack, slack) + np.asarray(ds.well_center_xy_m)
+    return np.column_stack([xy, np.full(n, spec.zone.z_table_m + DIE_HALF_EDGE_M)])
+
+
+def l1_die_cpu(spec: Any, *, n: int = 10_000, seed: int = 0, well_half_m: float | None = None) -> list[GateRow]:
+    """``start_not_success``: the worst case over the start set, then sampled starts (see the module docstring)."""
+    from so101_rl.env.tasks import DIE_HALF_EDGE_M, success_np
+
+    zone, ds = spec.zone, spec.die_start
+    if zone is None or ds is None:
+        raise ValueError(f"task {spec.name!r} has no zone / die start")
+    wh = _well_half_m() if well_half_m is None else float(well_half_m)
+    goal = zone.goal_xyz()
+    c = np.asarray(ds.well_center_xy_m, np.float64)
+    nearest = np.append(np.clip(goal[:2], c - wh, c + wh), zone.z_table_m + DIE_HALF_EDGE_M)
+    starts = np.vstack([nearest[None], _die_starts(spec, n, np.random.default_rng(seed), wh)])
+    hit = success_np(starts, np.broadcast_to(goal, starts.shape), spec, visible=np.ones(len(starts), bool))
+    margin = float((np.abs(starts[:, :2] - goal[:2]).max(axis=1) - zone.half_edge_m).min())
+    return [GateRow("L1", "start_not_success", not bool(hit.any()),
+                    f"{int(hit.sum())} of {len(starts)} starts (worst case + {n} sampled) in the zone; nearest start "
+                    f"{margin * 1000:.1f} mm outside the zone edge", "0")]  # fmt: skip
+
+
+def l2_die_cpu(spec: Any, *, predicate: Predicate | None = None, debounce: Callable[..., Any] | None = None,
+               n: int = 100_000, seed: int = 0) -> list[GateRow]:  # fmt: skip
+    """``adversarial``, ``independent_predicate`` and ``independent_settle``. ``predicate(a, d, visible)`` and
+    ``debounce(pred, count, achieved, prev_achieved) -> (success, count)`` replace the task's (shown-to-fail twins)."""
+    from so101_rl.env.tasks import debounce_np, success_np
+
+    zone = spec.zone
+    if zone is None or spec.settle_m is None:
+        raise ValueError(f"task {spec.name!r} is not a die task")
+    pred = predicate or (lambda a, d, v: success_np(a, d, spec, visible=v))
+    h, mh, eps = zone.half_edge_m, zone.max_height_m, 1e-4
+    goal = zone.goal_xyz()
+    ex, ey, ez = np.eye(3)
+    table = [  # (case, achieved, visible, genuine success)
+        ("die on the zone centre", goal, True, True),
+        ("0.1 mm inside the +x edge", goal + ex * (h - eps), True, True),
+        ("0.1 mm outside the +x edge", goal + ex * (h + eps), True, False),
+        ("0.1 mm inside the -y edge", goal - ey * (h - eps), True, True),
+        ("0.1 mm outside the -y edge", goal - ey * (h + eps), True, False),
+        ("inside corner (L-inf, not Euclidean)", goal + (ex + ey) * (h - eps), True, True),
+        ("outside corner", goal + (ex + ey) * (h + eps), True, False),
+        ("0.1 mm under the height bound", goal + ez * (mh - eps), True, True),
+        ("0.1 mm over the height bound", goal + ez * (mh + eps), True, False),
+        ("held 20 mm up over the centre", goal + ez * 0.020, True, False),
+        ("on the centre but invisible", goal, False, False),
+        ("die NaN", np.full(3, np.nan), True, False),
+    ]
+    bad = []
+    with np.errstate(invalid="ignore"):
+        for case, ach, vis, want in table:
+            got = bool(np.asarray(pred(ach[None], goal[None], np.array([vis])))[0])
+            if got != want:
+                bad.append(f"{case}: got {got}")
+        if bool(np.asarray(pred(goal[None], np.full((1, 3), np.nan), np.array([True])))[0]):
+            bad.append("goal NaN: got True")
+    rows = [GateRow("L2", "adversarial", not bad, "; ".join(bad) or f"{len(table) + 1} cases as expected", "all cases")]
+
+    rng = np.random.default_rng(seed)
+    d = np.column_stack([rng.uniform(0.05, 0.35, n), rng.uniform(-0.2, 0.2, n), rng.uniform(-0.01, 0.1, n)])
+    a = d.copy()
+    a[:, :2] += rng.uniform(-2 * h, 2 * h, size=(n, 2))
+    a[:, 2] += rng.uniform(-0.01, 2 * mh, n)
+    q = n // 4  # a quarter each within 1 mm of the x edge, the y edge and the height bound
+    a[:q, 0] = d[:q, 0] + rng.choice([-1.0, 1.0], q) * rng.uniform(h - 1e-3, h + 1e-3, q)
+    a[q : 2 * q, 1] = d[q : 2 * q, 1] + rng.choice([-1.0, 1.0], q) * rng.uniform(h - 1e-3, h + 1e-3, q)
+    a[2 * q : 3 * q, 2] = d[2 * q : 3 * q, 2] + rng.uniform(mh - 1e-3, mh + 1e-3, q)
+    vis = rng.random(n) >= 0.1
+    agree = float((np.asarray(pred(a, d, vis)) == independent_die_success(a, d, vis, h, mh)).mean())
+    rows.append(GateRow("L2", "independent_predicate", agree == 1.0, f"agreement {agree * 100:.4f} % on {n} states",
+                        "100 %"))  # fmt: skip
+
+    deb = debounce or (lambda p, c, ach, prev: debounce_np(p, c, spec, achieved=ach, prev_achieved=prev))
+    n_seq, horizon, s = 2000, 30, spec.settle_m
+    p_seq = rng.random((n_seq, horizon)) < 0.7
+    step = rng.uniform(0.5 * s, 1.5 * s, (n_seq, horizon)) * (rng.random((n_seq, horizon)) < 0.5)  # 0 or ~settle_m
+    dirs = rng.normal(size=(n_seq, horizon, 3))
+    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
+    pos = np.cumsum(dirs * step[..., None], axis=1)
+    count = np.zeros(n_seq, dtype=np.int64)
+    got = np.zeros((n_seq, horizon), dtype=bool)
+    prev = pos[:, 0]
+    for t in range(horizon):
+        got[:, t], count = deb(p_seq[:, t], count, pos[:, t], prev)
+        prev = pos[:, t]
+    moved = np.linalg.norm(np.diff(pos, axis=1, prepend=pos[:, :1]), axis=-1)
+    want = np.stack([independent_die_settle(p_seq[i], moved[i], spec.success_debounce_steps, s) for i in range(n_seq)])
+    agree = float((got == want).mean())
+    rows.append(GateRow("L2", "independent_settle", agree == 1.0,
+                        f"agreement {agree * 100:.4f} % on {n_seq} x {horizon} steps", "100 %"))  # fmt: skip
+    return rows
+
+
+def l2_die_do_nothing_cpu(cfg: Any, cal: Any, spec: Any, *, nworld: int = 16, seed: int = 0,
+                          start_noise_ticks: int = 30, well_half_m: float | None = None) -> list[GateRow]:  # fmt: skip
+    """``do_nothing`` on CPU MuJoCo (see the module docstring): every world holds its start pose for one episode."""
+    import mujoco
+
+    from so101_rl.config import JOINT_NAMES, ticks_to_rad
+    from so101_rl.env.tasks import debounce_np, success_np
+    from so101_rl.sim.model import load_model
+
+    m = load_model()[0]
+    data = mujoco.MjData(m)
+    rng = np.random.default_rng(seed)
+    wh = _well_half_m() if well_half_m is None else float(well_half_m)
+    q_adr = [int(m.jnt_qposadr[m.joint(j).id]) for j in JOINT_NAMES]
+    act = [m.actuator(j).id for j in JOINT_NAMES]
+    die_q = int(m.jnt_qposadr[m.joint("die_free").id])
+    die_b = m.body("die").id
+    steps_per_tick = max(1, round((1.0 / cfg.rates.servo_hz) / m.opt.timestep))
+    home = _home_ticks(cal)
+    lo, hi = np.asarray(cfg.joints.min_ticks, np.int64), np.asarray(cfg.joints.max_ticks, np.int64)
+    goal = spec.zone.goal_xyz()
+    starts = _die_starts(spec, nworld, rng, wh)
+    wins, max_move = 0, 0.0
+    for w in range(nworld):
+        mujoco.mj_resetDataKeyframe(m, data, m.key("home").id)
+        off = rng.integers(-start_noise_ticks, start_noise_ticks + 1, size=6)
+        off[5] = 0
+        q_arm = ticks_to_rad(np.clip(home + off, lo, hi), cal)
+        for i in range(5):  # the arm joints; the gripper stays at the keyframe
+            data.qpos[q_adr[i]] = q_arm[i]
+            data.ctrl[act[i]] = q_arm[i]
+        yaw = rng.uniform(0.0, 2 * math.pi)
+        data.qpos[die_q : die_q + 3] = starts[w]
+        data.qpos[die_q + 3 : die_q + 7] = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(m, data)
+        start = data.xpos[die_b].copy()
+        prev, count, won = start, np.zeros(1, np.int64), False
+        for _ in range(spec.episode_steps):
+            mujoco.mj_step(m, data, nstep=3 * steps_per_tick)  # one 10 Hz policy step = three servo ticks
+            die = data.xpos[die_b].copy()
+            p = success_np(die[None], goal[None], spec, visible=np.ones(1, bool))
+            done, count = debounce_np(p, count, spec, achieved=die[None], prev_achieved=prev[None])
+            won |= bool(done[0])
+            prev = die
+        wins += int(won)
+        max_move = max(max_move, float(np.linalg.norm(data.xpos[die_b] - start)))
+    return [GateRow("L2", "do_nothing", wins == 0,
+                    f"{wins} of {nworld} CPU episodes succeed (perfect always-visible tracker); die moved at most "
+                    f"{max_move * 1000:.2f} mm", "0")]  # fmt: skip
+
+
+def l_die_gpu(nworld: int = 1024, *, seed: int = 0, calibration: str | None = None) -> list[GateRow]:
+    from so101_rl.rl.eval_sim import build_env
+
+    rows: list[GateRow] = []
+    env = build_env("die_to_zone", nworld, stage=0, seed=seed, calibration=calibration)
+    try:
+        rate0, _ = _episodes(env, lambda o: torch.zeros(o.shape[0], 6, device=o.device))
+        rows.append(GateRow("L2", "do_nothing_batched", rate0 == 0.0, f"{rate0 * 100:.3f} % episodes succeed", "0 %"))
+        gen = torch.Generator(device=env.device)
+        gen.manual_seed(seed)
+        _, step_rate = _episodes(env, lambda o: torch.rand(o.shape[0], 6, generator=gen, device=o.device) * 2 - 1)
+        rows.append(GateRow("L2", "random_policy", step_rate < 1e-3,
+                            f"{step_rate * 100:.4f} % of episode-steps succeed", "< 0.1 %"))  # fmt: skip
+    finally:
+        env.close()
+    return rows
+
+
+def run_die_gates(*, gpu: bool | None = None, calibration: str | None = None, seed: int = 0,
+                  nworld_cpu: int = 16) -> list[GateRow]:  # fmt: skip
+    from so101_rl.env.tasks import DIE_TO_ZONE
+
+    cfg, cal, _fk = _setup(calibration)
+    rows = l1_die_cpu(DIE_TO_ZONE, seed=seed)
+    rows += l2_die_cpu(DIE_TO_ZONE, seed=seed)
+    rows += l2_die_do_nothing_cpu(cfg, cal, DIE_TO_ZONE, nworld=nworld_cpu, seed=seed)
+    use_gpu = torch.cuda.is_available() if gpu is None else gpu
+    if use_gpu:
+        rows += l_die_gpu(seed=seed, calibration=calibration)
+    else:
+        rows += [GateRow("L2", name, False, "not run: CUDA unavailable", "needs the batched env")
+                 for name in ("do_nothing_batched", "random_policy")]  # fmt: skip
+    return rows
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="sim-gates", description="L1/L2 gates (reach) before any reward tuning")
+    ap = argparse.ArgumentParser(prog="sim-gates", description="L1/L2 gates (reach, die_to_zone) before any reward tuning")
     ap.add_argument("--task", default="reach")
     ap.add_argument("--calibration", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--nworld", type=int, default=16, help="die_to_zone: number of CPU do-nothing episodes")
     ap.add_argument("--out", type=Path, default=None, help="default runs/gates/<task>-<timestamp>.json")
     a = ap.parse_args(argv)
-    if a.task != "reach":
-        print(f"sim-gates: task {a.task!r} is deferred in the MVP (plans/mvp-plan.md); only 'reach'", file=sys.stderr)
+    if a.task not in GATE_TASKS:
+        print(f"sim-gates: unknown task {a.task!r} (known: {', '.join(GATE_TASKS)})", file=sys.stderr)
         return 2
-    rows = run_reach_gates(calibration=a.calibration, seed=a.seed)
+    if a.task == "reach":
+        rows = run_reach_gates(calibration=a.calibration, seed=a.seed)
+    else:
+        rows = run_die_gates(calibration=a.calibration, seed=a.seed, nworld_cpu=a.nworld)
     w = max(len(r.name) for r in rows)
     for r in rows:
         print(f"{r.level}  {r.name:<{w}}  {'PASS' if r.passed else 'FAIL'}  {r.value}  [{r.threshold}]")

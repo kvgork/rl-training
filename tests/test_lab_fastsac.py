@@ -72,6 +72,30 @@ def test_unknown_or_out_of_range_fastsac_config_is_refused():
     assert tr.validate({}, "reach")["max_env_steps"] is None
 
 
+def test_fastsac_die_to_zone_validation(monkeypatch):
+    """plans/die-to-zone-plan.md D1: die_to_zone is a fastsac_sim task with its own per-run cap (S4.6: 480 min)
+    and GPU-h budget (30 GPU-h, 3 attempts); success_radius_mm stays reach-only; the shipped v0 sim params are
+    refused for die training (S4.6) before anything starts."""
+    from so101_rl.lab import trainers
+    from so101_rl.lab.errors import LabError
+
+    tr = get_trainer("fastsac_sim")
+    assert "die_to_zone" in tr.capabilities.tasks and "die_to_zone" in trainers.TASKS
+    assert runs.BUDGETS["die_to_zone"] == runs.Budget(max_attempts=3, gpu_h_max=30.0)
+    assert runs.BUDGETS["reach"] == runs.Budget(max_attempts=3, gpu_h_max=6.0)
+    with pytest.raises(LabError) as e:
+        tr.validate({}, "die_to_zone")  # the shipped calib/sim_params.yaml is release 0
+    assert e.value.code == "GATE_MISSING" and e.value.details["sim_params_release"] == 0
+    monkeypatch.setattr(trainers, "sim_params_release", lambda: 1)
+    assert tr.validate({"budget_min": 480}, "die_to_zone")["success_radius_mm"] is None
+    for task, bad in (("die_to_zone", {"success_radius_mm": 5.0}), ("die_to_zone", {"budget_min": 481}),
+                      ("reach", {"budget_min": 361})):  # fmt: skip
+        with pytest.raises(LabError) as e:
+            tr.validate(bad, task)
+        assert e.value.code == "CONFIG_INVALID"
+    assert tr.validate({"budget_min": 360, "success_radius_mm": 5.0}, "reach")["budget_min"] == 360.0
+
+
 def test_fastsac_job_completes_with_metrics_heartbeat_and_checkpoint(toy, tmp_path):
     d = _run(tmp_path, TINY)
     assert Job(d, use_nvml=False).run_segment() == 0

@@ -22,7 +22,13 @@ from typing import Any, ClassVar, Protocol
 from so101_rl.lab.errors import LabError
 from so101_rl.lab.runs import REPO_ROOT
 
-TASKS: dict[str, str] = {"reach": "Move the gripper tip to a goal in the workspace box (FS4 REACH, 15 mm, 100 steps)."}
+TASKS: dict[str, str] = {
+    "reach": "Move the gripper tip to a goal in the workspace box (FS4 REACH, 15 mm, 100 steps).",
+    "die_to_zone": "Move the red 16 mm die into the 60 mm zone, push or place, settled and visible (FS4 DIE_TO_ZONE, "
+                   "100 steps). Training needs sim_params v1 (sim plan S4.6).",
+}  # fmt: skip
+# per-run budget_min cap per task (minutes); the task's GPU-h total is runs.BUDGETS (plan §10 P6, sim plan S4.6)
+BUDGET_MIN_MAX: dict[str, float] = {"reach": 360.0, "die_to_zone": 480.0}
 EXIT_GATE = {"success_min": 0.95, "wilson_lo_min": 0.93, "episodes_min": 1000}  # D-EXIT-GATE (numeric part)
 
 
@@ -150,7 +156,7 @@ class FakeTrainer:
     name = "fake"
     version = "1"
     capabilities = Capabilities(gpu=False, resumable=True, evaluates=True, exports=True, env_name="cpu",
-                                tasks=("reach",))
+                                tasks=("reach", "die_to_zone"))
     params: ClassVar[dict[str, Param]] = {
         "steps": Param(int, 200, 1, 10_000_000),
         "step_s": Param(float, 0.01, 0.0, 5.0),
@@ -235,17 +241,17 @@ class FastSacSimTrainer:
     name = "fastsac_sim"
     version = "1"
     capabilities = Capabilities(gpu=True, resumable=True, evaluates=True, exports=True, env_name="default",
-                                tasks=("reach",))
+                                tasks=("reach", "die_to_zone"))
     params: ClassVar[dict[str, Param]] = {
         "nworld": Param(int, 1024, 1, 65_536),  # 8 grads / 1024 worlds = UTD 0.0078 >= the 0.005 review trigger
-        "budget_min": Param(float, 60.0, 1.0, 360.0),
+        "budget_min": Param(float, 60.0, 1.0, max(BUDGET_MIN_MAX.values())),  # per task: BUDGET_MIN_MAX
         "seed": Param(int, 0, 0, 2**31 - 1),
         "dr_max_stage": Param(int, 4, 0, 4),
         "eval_every_steps": Param(int, 200_000, 1_000, 100_000_000),
         "eval_episodes": Param(int, 1000, 1, 10_000),
         "log_every_steps": Param(int, 50_000, 1_000, 100_000_000),
         "max_env_steps": Param(int, None, 1, 10_000_000_000),  # None: the time budget ends the run
-        "success_radius_mm": Param(float, None, 1.0, 15.0),  # None: the task's 15 mm (plan §10 2026-10-14)
+        "success_radius_mm": Param(float, None, 1.0, 15.0),  # reach only; None: the task's 15 mm (plan §10 2026-10-14)
     }
 
     def available(self) -> bool:
@@ -255,7 +261,24 @@ class FastSacSimTrainer:
         )
 
     def validate(self, config: dict[str, Any], task: str) -> dict[str, Any]:
-        return validate_params(self.params, config)
+        """Strict params, then per task: the ``budget_min`` cap (``BUDGET_MIN_MAX``); die_to_zone refuses
+        ``success_radius_mm`` (reach only) and, per sim plan S4.6, a sim_params release < 1 (the v0 MJCF prior)."""
+        cfg = validate_params(self.params, config)
+        cap = BUDGET_MIN_MAX.get(task, min(BUDGET_MIN_MAX.values()))
+        if cfg["budget_min"] > cap:
+            raise LabError("CONFIG_INVALID", "budget_min out of range for this task",
+                           details={"path": "/budget_min", "lo": self.params["budget_min"].lo, "hi": cap})  # fmt: skip
+        if task == "die_to_zone":
+            if cfg["success_radius_mm"] is not None:
+                raise LabError("CONFIG_INVALID", "success_radius_mm is reach only", details={"path": "/success_radius_mm"},
+                               hint="die_to_zone success is the zone square (env/tasks.py), not a radius")  # fmt: skip
+            release = sim_params_release()
+            if not isinstance(release, int) or release < 1:
+                raise LabError("GATE_MISSING", "die_to_zone is not trained on the sim_params v0 prior (sim plan S4.6)",
+                               details={"sim_params_release": release, "needs": ">= 1 (HS3)"},
+                               hint="needs HS1-HS3 (sim_params v1) or the user's waiver (plans/die-to-zone-plan.md "
+                                    "decision 1), recorded in plan §10")  # fmt: skip
+        return cfg
 
     def train(self, cfg: dict[str, Any], task: str, out_dir: Path, hooks: Hooks, resume: str | None) -> TrainOutcome:
         from so101_rl.rl import train_sim_sac as tss  # lazy: torch + warp live behind this import
@@ -287,6 +310,13 @@ class FastSacSimTrainer:
             policy = _s(policy_export.export_policy(Path(ckpt), out_dir / "policy.pt"))
         return EvalOutcome(float(r.success_rate), float(r.wilson_lo), float(r.wilson_hi), int(r.episodes),
                            bool(r.numeric_gate_passed), _s(r.eval_json), policy)
+
+
+def sim_params_release() -> Any:
+    """``meta.version`` of the shipped ``calib/sim_params.yaml`` (None when unreadable); no torch / sim import."""
+    from so101_rl.lab.runs import _yaml_get
+
+    return _yaml_get(REPO_ROOT / "calib" / "sim_params.yaml", ("meta", "version"))
 
 
 def _s(p: Any) -> str | None:

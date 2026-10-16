@@ -83,7 +83,7 @@ def test_start_get_list_through_mcp(lab):
     tasks, started = _call(("list_tasks", {}),
                            ("start_run", {"trainer": "fake", "task": "reach", "idempotency_key": "m1",
                                           "config": {"steps": 30, "step_s": 0.0}}))
-    assert tasks["ok"] and [t["name"] for t in tasks["tasks"]] == ["reach"]
+    assert tasks["ok"] and [t["name"] for t in tasks["tasks"]] == ["reach", "die_to_zone"]
     assert {t["name"] for t in tasks["trainers"]} == {"fake", "fastsac_sim"}
     assert started["ok"] and runs.RUN_ID_RE.match(started["run_id"])
     got, listed = _call(("get_run", {"run_id": started["run_id"], "wait_s": 30}), ("list_runs", {}))

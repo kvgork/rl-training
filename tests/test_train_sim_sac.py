@@ -79,8 +79,11 @@ def test_config_strict(tmp_path):
         load_sim_sac_config({"task": "reach", "nworld": True, "budget_min": 1, "seed": 0})
     with pytest.raises(TypeError):
         load_sim_sac_config({"task": "reach", "nworld": 8.0, "budget_min": 1, "seed": 0})
-    with pytest.raises(ValueError, match="MVP"):
-        load_sim_sac_config({"task": "die_to_zone", "nworld": 8, "budget_min": 1, "seed": 0})
+    with pytest.raises(ValueError, match="not trainable"):
+        load_sim_sac_config({"task": "pick", "nworld": 8, "budget_min": 1, "seed": 0})
+    assert load_sim_sac_config({"task": "die_to_zone", "nworld": 8, "budget_min": 1, "seed": 0}).task == "die_to_zone"
+    with pytest.raises(ValueError, match="reach-only"):  # plan §10 2026-10-14: the radius override is reach only
+        load_sim_sac_config({"task": "die_to_zone", "nworld": 8, "budget_min": 1, "seed": 0, "success_radius_mm": 5})
     for bad in ({"nworld": 0}, {"budget_min": -1}, {"budget_min": math.inf}, {"dr_max_stage": 5},
                 {"dr_start_stage": 3, "dr_max_stage": 2}, {"eval_episodes": 0}, {"vram_fraction": 1.5}):  # fmt: skip
         with pytest.raises(ValueError):
@@ -298,3 +301,57 @@ def test_thermal_guard_off_never_samples(toy, tmp_path, monkeypatch):
     """S3: ``thermal_guard`` False (the lab) = no NVML reads and no pause in the trainer."""
     monkeypatch.setattr(train_sim_sac, "read_gpu_temp_c", lambda: pytest.fail("sampled"))
     assert run_training(_cfg(thermal_guard=False), tmp_path).status == "completed"
+
+
+# ------------------------------------------------------------------------------------------------ die_to_zone (D1)
+def test_task_gamma_comes_from_the_task_specs():
+    from so101_rl.env.tasks import DIE_TO_ZONE, REACH
+
+    assert train_sim_sac.TASK_GAMMA == {"reach": REACH.gamma, "die_to_zone": DIE_TO_ZONE.gamma}
+    assert train_sim_sac.TASK_GAMMA == {"reach": 0.97, "die_to_zone": 0.98}  # reach unchanged
+
+
+def test_die_review_trigger_uses_the_die_budget():
+    """Sim plan budgets: die success < 10 % after 4 GPU-h (reach: < 50 % after 1 GPU-h, unchanged)."""
+    ev = [{"eval_success_rate": 0.3}]
+    assert not any("success" in x for x in review_triggers(ev, train_h=1.5, n_updates_per_transition=0.01,
+                                                           task="die_to_zone"))  # fmt: skip
+    assert any("reach success" in x for x in review_triggers(ev, train_h=1.5, n_updates_per_transition=0.01))
+    low = [{"eval_success_rate": 0.05}]
+    assert not any("success" in x for x in review_triggers(low, train_h=3.9, n_updates_per_transition=0.01,
+                                                           task="die_to_zone"))  # fmt: skip
+    t = review_triggers(low, train_h=4.5, n_updates_per_transition=0.01, task="die_to_zone")
+    assert any("die_to_zone success 0.05 < 0.1 after 4.50 GPU-h" in x for x in t)
+
+
+def test_die_refuses_unverified_sim_params_without_the_waiver(monkeypatch, tmp_path):
+    """Sim plan S4.6: no die training on the v0 MJCF prior (the shipped calib/sim_params.yaml) unless the user's
+    waiver is set; refused before any env is built."""
+    monkeypatch.setattr(eval_sim, "build_env", lambda *a, **k: pytest.fail("env built"))
+    assert "MJCF prior" in train_sim_sac.unverified_sim_params(ROOT / "calib/sim_params.yaml")
+    with pytest.raises(ValueError, match="S4.6"):
+        run_training(_cfg(task="die_to_zone", sim_params=str(ROOT / "calib/sim_params.yaml")), tmp_path)
+    assert not (tmp_path / "metrics.csv").exists()
+
+
+def test_die_trains_with_policy_input_29_and_gamma_098(monkeypatch, tmp_path):
+    """The die plumbing on the die-shaped toy env: policy input 29 (FS3: DIE_OBS 26 + goal 3), gamma 0.98 from the
+    task spec, task recorded in the checkpoint; reach-only radius never passed to the env."""
+    import json
+
+    from so101_rl.rl.toy_batched_env import ToyBatchedDieShapedEnv
+
+    seen = []
+
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
+        seen.append((task, success_radius_mm))
+        return ToyBatchedDieShapedEnv(nworld, seed=seed)
+
+    monkeypatch.setattr(eval_sim, "build_env", build)
+    monkeypatch.setattr(train_sim_sac, "read_gpu_temp_c", lambda: 50.0)
+    res = run_training(_cfg(task="die_to_zone", allow_unverified_sim_params=True, max_env_steps=32 * 50), tmp_path)
+    assert res.status == "completed" and set(seen) == {("die_to_zone", None)}
+    ck = torch.load(res.last_ckpt, weights_only=True)
+    assert ck["task"] == "die_to_zone" and ck["policy_input_dim"] == 29
+    meta = json.loads((tmp_path / "run_meta.json").read_text())
+    assert meta["sac"]["gamma"] == 0.98 and meta["config"]["allow_unverified_sim_params"] is True

@@ -180,3 +180,57 @@ def test_render_env_freezes_return_and_flags_after_end():
     assert [float(x[0]) for x in rets] == [-1, -2, -3, -3, -3, -3]  # constant after success
     assert [float(x[1]) for x in rets] == [-1, -2, -3, -4, -5, -5]  # constant after timeout
     assert bool(r._succ[0]) and not bool(r._succ[1]) and bool(r._trunc[1]) and not bool(r._trunc[0])
+
+
+# ------------------------------------------------------------------------------------------------ die_to_zone (D1)
+def test_task_spec_and_reach_only_radius():
+    """``die_to_zone`` is a sim task; the 2026-10-14 radius override stays reach-only (refused before any CUDA use)."""
+    import dataclasses
+
+    from so101_rl.env.tasks import DIE_TO_ZONE, REACH
+
+    assert eval_sim.TASKS == ("reach", "die_to_zone")
+    assert eval_sim.task_spec("reach") is REACH and eval_sim.task_spec("die_to_zone") is DIE_TO_ZONE
+    assert eval_sim.task_spec("reach", 5.0) == dataclasses.replace(REACH, success_radius_m=0.005)
+    with pytest.raises(ValueError, match="reach-only"):
+        eval_sim.task_spec("die_to_zone", 5.0)
+    with pytest.raises(ValueError, match="reach-only"):
+        eval_sim.build_env("die_to_zone", 4, stage=0, seed=0, success_radius_mm=5.0)
+    with pytest.raises(ValueError, match="not a sim task"):
+        eval_sim.build_env("pick", 4, stage=0, seed=0)
+
+
+@pytest.fixture
+def toy_die_ckpt(monkeypatch, tmp_path):
+    """A die_to_zone checkpoint trained on the die-shaped toy env (policy input 29) with the S4.6 waiver set."""
+    from so101_rl.rl.toy_batched_env import ToyBatchedDieShapedEnv
+
+    seen: list[tuple[str, float | None]] = []
+
+    def build(task, nworld, *, stage, seed, calibration=None, sim_params="", device=None, success_radius_mm=None):
+        seen.append((task, success_radius_mm))
+        env = ToyBatchedDieShapedEnv(nworld, seed=seed)
+        env.metadata = {"camera_pose_method": "arm-shape"}
+        return env
+
+    monkeypatch.setattr(eval_sim, "build_env", build)
+    monkeypatch.setattr(train_sim_sac, "read_gpu_temp_c", lambda: 50.0)
+    cfg = train_sim_sac.load_sim_sac_config({
+        "task": "die_to_zone", "nworld": 32, "budget_min": 5.0, "seed": 0, "dr_max_stage": 0,
+        "eval_every_steps": 32 * 30, "eval_episodes": 32, "log_every_steps": 32 * 10, "max_env_steps": 32 * 30,
+        "batch_size": 128, "grad_steps_per_env_step": 1, "warmup_steps": 5, "replay_capacity": 10_000,
+        "tensorboard": False, "allow_unverified_sim_params": True,
+    })  # fmt: skip
+    return train_sim_sac.run_training(cfg, tmp_path / "run").last_ckpt, seen
+
+
+def test_evaluate_die_writes_eval_json_and_die_checklist(toy_die_ckpt, tmp_path):
+    ckpt, seen = toy_die_ckpt
+    res = eval_sim.evaluate(ckpt, "die_to_zone", episodes=40, dr_stage=4, out_dir=tmp_path / "ev")
+    doc = json.loads(res.eval_json.read_text())
+    assert doc["task"] == "die_to_zone" and doc["episodes"] == 40 and doc["gate"]["numeric_passed"] is False
+    assert doc["camera_pose_method"] == "arm-shape"  # the die env's camera pose, not reach's "none"
+    assert (tmp_path / "ev" / "review_checklist.md").read_text().startswith("# Die-to-zone exit gate")
+    assert {t for t, _ in seen} == {"die_to_zone"} and {r for _, r in seen} == {None}
+    with pytest.raises(ValueError, match="checkpoint task"):
+        eval_sim.evaluate(ckpt, "reach", episodes=10, dr_stage=4, out_dir=tmp_path / "ev2")
