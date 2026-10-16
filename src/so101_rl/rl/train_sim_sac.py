@@ -573,6 +573,8 @@ def _train_with_env(cfg: SimSacConfig, out_dir: Path, hooks: TrainHooks, ck: dic
             "config": dataclasses.asdict(cfg),
             "obs_layout_version": _obs_layout_version(), "policy_input_dim": obs_dim, "act_dim": act_dim,
             "sim_params_release": meta["env"].get("sim_params_release"), "git_sha": meta["git_sha"],
+            "sim_params_verified": meta["env"].get("sim_params_verified"),
+            "sim_params_sha256": meta["env"].get("sim_params_sha256"),
             "calibration_sha256": meta["env"].get("calibration_sha256"),
             "last_eval": last_eval or {}, "camera_pose_method": meta["env"].get("camera_pose_method", "none"),
         }  # fmt: skip

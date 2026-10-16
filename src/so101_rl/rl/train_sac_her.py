@@ -7,6 +7,15 @@
   the task's 15 mm). HS5 stopped with the zero-shot actor at the 15 mm ceiling, so the next real-arm run uses 5 mm
   (plan §10 2026-10-14 "Reach success radius 5 mm, sim first"): the radius sets the success predicate, the reward's
   success term and episode termination (and HER's relabelled reward), never the eval goals.
+* **die_to_zone (0.62, minimal; ``plans/die-to-zone-plan.md`` D5):** ``--task die_to_zone`` (new run only, stored in
+  ``run.json``; default the export's ``task_name``, which must match) runs ``DIE_TO_ZONE`` (obs 26 + goal 3 = 29; no
+  ``--success-radius-mm``), the eval goals = the fixed zone goal. ``--backend shm`` reads the perception object
+  table (``--object-table``, as ``deploy-policy``: refused without a fresh writer and a fiducial OK); ``--backend sim``
+  takes one only when ``--object-table`` is given (without it the die is never visible: structural runs only). With an
+  object table, an episode whose tracker is UNKNOWN on > 50 % of its steps ends the session (``tracker_unknown``, as
+  HS6), and so does such an eval episode. On a REAL servo a die export recorded on ``sim_params`` v0 / unverified is
+  refused (plan §10 2026-10-16), and so is any die run while no tray exists (H9; this trainer has no manual reset).
+  The preferred real die fine-tune is the AWR route (plan §10 2026-10-14/15: frozen-actor collection, offline AWR).
 * **Model:** :class:`~so101_rl.rl.sb3_bridge.FinetuneSAC` on ``So101GoalEnv(task)``, the export's actor copied in
   (critics fresh), ``HerReplayBuffer`` (4 sampled goals, ``future``, the info dicts kept: the relabelled reward reads
   the trip bits), critic lr 1e-4, batch 256, ``gamma`` = the task's, ``tau`` 0.005, ``learning_starts`` 2000.
@@ -84,7 +93,7 @@ ARTIFACTS: Final[tuple[str, ...]] = ("model.zip", "replay_buffer.pkl", "baseline
 STALL_WARN_S: Final[float] = 0.3  # a send gap this long is printed (servo: HOLD after 0.15 s, SAFE_STOPPING ~0.5 s)
 RUN_KEYS: Final[tuple[str, ...]] = ("init_from", "seed", "eval_seed", "eval_episodes", "total_steps",
                                     "learning_starts", "baseline_eval_every", "backend",
-                                    "success_radius_mm")  # fmt: skip
+                                    "success_radius_mm", "task")  # fmt: skip
 RADIUS_MM_BEFORE: Final[float] = 15.0  # run.json without success_radius_mm (runs before 2026-10-14): REACH's
 # plan §10 2026-10-13 "Anchored fine-tuning"; stored in run.json, a flag given on --resume replaces the stored value
 RECIPE_DEFAULTS: Final[dict[str, Any]] = {"warmup_frozen_actor": 5000, "actor_lr": 1e-5, "anchor_weight": 0.4,
@@ -103,11 +112,13 @@ class HaltOnTrip(gymnasium.Wrapper):
     ``info["halted"]`` (the callback stops the loop on such a step, before SB3 stores it). The halting step itself is
     returned unchanged, so SB3 stores it."""
 
-    def __init__(self, env: gymnasium.Env) -> None:
+    def __init__(self, env: gymnasium.Env, *, unknown_halt: bool = False) -> None:
         super().__init__(env)
         self.halt_reason: str | None = None
         self.halt_detail: str | None = None
         self._last_obs: Any = None
+        self.unknown_halt = unknown_halt  # die with an object table: the HS6 tracker-UNKNOWN rule per episode
+        self._steps = self._unknown = 0
 
     @property
     def halted(self) -> bool:
@@ -128,6 +139,7 @@ class HaltOnTrip(gymnasium.Wrapper):
                           f"{type(exc).__name__}: {exc}")  # fmt: skip
             else:
                 self._last_obs = obs
+                self._steps = self._unknown = 0
                 return obs, info
         return self._dummy_obs(), {"halted": True}
 
@@ -141,6 +153,12 @@ class HaltOnTrip(gymnasium.Wrapper):
                               f"{int(info['sm_state'])})")  # fmt: skip
         elif info.get("servo_stalled"):
             self.halt("stall", "the servo state stalled")
+        elif self.unknown_halt:
+            self._steps += 1
+            self._unknown += int(not info.get("tracker_visible", False))
+            if (term or trunc) and _tracker_unknown(self._unknown, self._steps):
+                self.halt("tracker_unknown", f"the tracker reported the die UNKNOWN on {self._unknown}/"
+                                             f"{self._steps} steps of an episode (> 50 %): a human must look")  # fmt: skip
         return obs, r, term, trunc, info
 
     def _dummy_obs(self) -> Any:
@@ -149,26 +167,40 @@ class HaltOnTrip(gymnasium.Wrapper):
         return copy.deepcopy(self._last_obs)
 
 
+def _tracker_unknown(unknown: int, steps: int) -> bool:
+    from so101_rl.rl.deploy_policy import UNKNOWN_HALT_FRACTION
+
+    return unknown > UNKNOWN_HALT_FRACTION * steps
+
+
 def evaluate(env: Any, policy: Any, pairs: np.ndarray) -> dict[str, Any]:
     """Deterministic episodes of ``policy`` on the fixed goal ``pairs`` (``deploy-policy``'s episode loop); the env's
-    goal sampler is restored afterwards. Stops at the first tripped / stalled episode (``halted``). The caller must
-    reset the env before training continues."""
+    goal sampler is restored afterwards. Stops at the first tripped / stalled episode, or (die with an object table)
+    one whose tracker was UNKNOWN on > 50 % of its steps (``halted``). The caller must reset the env before training
+    continues."""
     from so101_rl.rl.deploy_policy import GoalList, _run_episode
 
     saved = env.goal_sampler
     env.goal_sampler = goals = GoalList(pairs)
     eps: list[dict[str, Any]] = []
+    unknown_rule = env.task.zone is not None and getattr(env, "object_table", None) is not None
+    unknown = False
     try:
         for i in range(len(pairs)):
             eps.append(_run_episode(env, policy, 1.0, goals=goals, index=i, infer_ms=[]))
             if eps[-1]["tripped"] or eps[-1]["servo_stalled"]:
                 break
+            if unknown_rule and _tracker_unknown(eps[-1]["unknown_steps"], eps[-1]["steps"]):
+                unknown = True
+                break
     finally:
         env.goal_sampler = saved
-    err = np.asarray([e["final_error_m"] for e in eps])
+    err = np.asarray([e["final_error_m"] for e in eps if e["final_error_m"] is not None], float)
     return {"n": len(eps), "success_rate": float(np.mean([e["success"] for e in eps])),
             "trips": int(sum(e["tripped"] for e in eps)), "stalls": int(sum(e["servo_stalled"] for e in eps)),
-            "halted": len(eps) < len(pairs), "final_error_m_p50": float(np.median(err))}  # fmt: skip
+            "halted": len(eps) < len(pairs) or unknown,
+            "final_error_m_p50": float(np.median(err)) if err.size else None,
+            **({"tracker_unknown": True} if unknown else {})}  # fmt: skip
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -188,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--max-rollbacks", type=int, default=None, help="per session; reaching it ends the session")
     ap.add_argument("--success-radius-mm", type=float, default=None,
                     help="new run only: reach success radius (default the task's 15 mm)")
+    ap.add_argument("--task", choices=("reach", "die_to_zone"), default=None,
+                    help="new run only: default the export's task_name (must match)")
+    ap.add_argument("--object-table", default=None, help="die_to_zone: the perception object table shm (shm backend: "
+                    "default the config's object_table_shm / so101_objects; sim backend: none unless given)")
     ap.add_argument("--reset-actor", action="store_true", help="--resume only: the export's actor back, frozen again")
     ap.add_argument("--learning-starts", type=int, default=2000)
     ap.add_argument("--baseline-eval-every", type=int, default=1000)
@@ -250,6 +286,9 @@ def _resolve_run(args: argparse.Namespace) -> tuple[dict[str, Any], Path, bool]:
     if args.success_radius_mm is not None:
         raise ValueError("--success-radius-mm is fixed for a run (new run only)")
     run.setdefault("success_radius_mm", RADIUS_MM_BEFORE)
+    run.setdefault("task", "reach")  # run.json before 0.62
+    if args.task is not None and args.task != run["task"]:
+        raise ValueError(f"--task is fixed for a run: the run's is {run['task']}")
     if args.backend is not None and args.backend != run["backend"]:
         raise ValueError(f"--resume: the run used --backend {run['backend']}, not {args.backend}")
     if args.total_steps is not None:
@@ -277,8 +316,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run, out, resuming = _resolve_run(args)
         init = load_policy(Path(run["init_from"]))
-        if init.meta.get("task_name") != "reach":
-            raise ValueError(f"the export's task is {init.meta.get('task_name')!r}, not 'reach'")
+        run["task"] = run.get("task") or init.meta.get("task_name") or "reach"
+        if run["task"] not in ("reach", "die_to_zone"):
+            raise ValueError(f"the export's task {run['task']!r} is not reach / die_to_zone")
+        if init.meta.get("task_name") != run["task"]:
+            raise ValueError(f"the export's task is {init.meta.get('task_name')!r}, not {run['task']!r}")
+        if run["task"] == "die_to_zone" and args.success_radius_mm is not None:
+            raise ValueError("--success-radius-mm is reach only (the die's success is the zone square)")
     except (ValueError, KeyError, RuntimeError, OSError) as exc:
         _log(f"refused: {exc}")
         return EXIT_REFUSED
@@ -295,7 +339,7 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
     from so101_rl.env.backend import ResetFailed, ServoNotRunning, ServoStateStale
     from so101_rl.env.goal_env import So101GoalEnv
     from so101_rl.env.goals import BoxGoalSampler
-    from so101_rl.env.tasks import REACH
+    from so101_rl.env.tasks import DIE_TO_ZONE, REACH
     from so101_rl.rl import deploy_policy as dp
     from so101_rl.rl.sb3_bridge import (
         FinetuneSAC,
@@ -313,6 +357,8 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
     evals: list[dict[str, Any]] = []
     best: dict[str, Any] | None = None
     keepalive = contextlib.ExitStack()
+    table: Any = None
+    die = run["task"] == "die_to_zone"
     session: dict[str, Any] = {"started": datetime.now().astimezone().isoformat(timespec="seconds"),
                                "backend": run["backend"]}  # fmt: skip
     def _on_term(_sig: int, _frame: Any) -> None:  # SIGTERM like Ctrl-C: the finally still sends HOLD and saves
@@ -332,6 +378,12 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
             if prev and bool(prev[0].get("servo", {}).get("real")) != rs.servo.is_real:
                 raise dp.Refused("--resume: the run's servo class (real / sim) differs from this servo's")
             cfg, calibration = rs.cfg, rs.calibration
+            if die:  # read-only refusals before the attach: the v0 waiver, no tray, no / stale perception
+                dp.check_die_on_servo(init.meta, DIE_TO_ZONE, rs.servo, manual_die_reset=False, log=_log,
+                                      no_tray_hint="train-reach-sac has no manual reset: wait for the tray")  # fmt: skip
+                table_name = args.object_table or dp.object_table_name(rs.config_path)
+                table = dp.open_object_table(table_name)
+                session["object_table"] = table_name
             session["servo"] = {"pid": rs.servo.pid, "backend": rs.servo.backend, "real": rs.servo.is_real,
                                 "mcu": rs.servo.mcu, "tick_log": None if rs.servo.tick_log is None
                                 else str(rs.servo.tick_log), "calibration_sha256": rs.calibration_sha256}  # fmt: skip
@@ -346,14 +398,23 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
             cfg = load_config(calibration=calibration)
             backend = SimBackend(cfg, calibration, seed=int(run["seed"]))
             session_s = float(args.session_s) if args.session_s is not None else float("inf")
+            if die and args.object_table is not None:  # structural: e.g. a test's fake perception writer
+                table = dp.open_object_table(args.object_table)
+                session["object_table"] = args.object_table
         session["session_s"] = session_s
         out.mkdir(parents=True, exist_ok=resuming)
-        task = dataclasses.replace(REACH, success_radius_m=float(run["success_radius_mm"]) / 1000.0)
-        genv = So101GoalEnv(backend, cfg, task)
+        if die:
+            task = DIE_TO_ZONE
+        else:
+            task = dataclasses.replace(REACH, success_radius_m=float(run["success_radius_mm"]) / 1000.0)
+        genv = So101GoalEnv(backend, cfg, task, object_table=table)
         env = HaltOnTrip(Monitor(genv, str(out / "monitor.csv"), override_existing=not resuming)
-                         if run["backend"] == "sim" else genv)  # fmt: skip
-        pairs = dp.draw_goal_pairs(BoxGoalSampler(task.goal_bounds, fk=genv._fk, limits=cfg.joints, seed=0),
-                                   int(run["eval_seed"]), int(run["eval_episodes"]))  # fmt: skip
+                         if run["backend"] == "sim" else genv, unknown_halt=table is not None)  # fmt: skip
+        if die:  # the fixed zone goal
+            pairs = np.broadcast_to(task.zone.goal_xyz(), (int(run["eval_episodes"]), 2, 3)).astype(np.float64)
+        else:
+            pairs = dp.draw_goal_pairs(BoxGoalSampler(task.goal_bounds, fk=genv._fk, limits=cfg.joints, seed=0),
+                                       int(run["eval_seed"]), int(run["eval_episodes"]))  # fmt: skip
         pending = run.pop("_pending_change", None)
         if not resuming:
             _write_json(out / "run.json", run)
@@ -404,7 +465,10 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
             _log(f"baseline: {baseline['success_rate']:.2f} success over {baseline['n']} episodes "
                  f"(radius {run['success_radius_mm']:g} mm)")
             if baseline["halted"]:
-                env.halt("eval_trip", "a baseline eval episode tripped or stalled")
+                if baseline.get("tracker_unknown"):
+                    env.halt("tracker_unknown", "a baseline eval episode had the die UNKNOWN on > 50 % of its steps")
+                else:
+                    env.halt("eval_trip", "a baseline eval episode tripped or stalled")
         session["start_step"] = int(model.num_timesteps)
 
         class Session(BaseCallback):
@@ -508,7 +572,9 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
                 except (ServoNotRunning, ServoStateStale, ResetFailed) as exc:
                     env.halt("eval_failed", f"{type(exc).__name__}: {exc}")
                     return
-                if r["halted"]:
+                if r.get("tracker_unknown"):
+                    env.halt("tracker_unknown", f"eval at step {r['step']}: the die UNKNOWN on > 50 % of an episode")
+                elif r["halted"]:
                     env.halt("eval_trip", f"eval at step {r['step']}: an episode tripped or stalled")
                 elif r["success_rate"] > best["success_rate"]:
                     best.update(success_rate=r["success_rate"], state=copy.deepcopy(model.policy.state_dict()),
@@ -550,6 +616,8 @@ def _session(args: argparse.Namespace, run: dict[str, Any], init: Any, out: Path
         with contextlib.suppress(Exception):
             if backend is not None:
                 backend.close()
+        if table is not None:
+            table.close()  # a reader: never unlinks the perception segment
         signal.signal(signal.SIGTERM, old_term)
     return _finish(out, run, baseline, evals, best, session, model)
 
