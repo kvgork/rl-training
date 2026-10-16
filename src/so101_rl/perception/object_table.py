@@ -95,6 +95,11 @@ class ObjectTableShm:
             raise PermissionError("only the creating (perception) process may write the object table")
         self._block.write(rec)
 
+    @property
+    def last_seq(self) -> int | None:
+        """Seqlock word of the last write (writer side; ``seq // 2`` = writes so far); None once closed."""
+        return None if self._block is None else self._block.last_seq
+
     def read(self, out: np.ndarray) -> bool:
         """False = torn or never written; ``out`` untouched."""
         return self._block.read(out)

@@ -65,6 +65,7 @@ class D435Camera:
         self._pipeline = None
         self._align = None
         self._intr: Intrinsics | None = None
+        self.device_serial: str | None = None  # read back from the opened device in start()
 
     def start(self) -> Intrinsics:
         try:
@@ -85,6 +86,7 @@ class D435Camera:
         pipeline = rs.pipeline()
         profile = pipeline.start(cfg)  # raises RuntimeError if the serial is not connected
         try:
+            self.device_serial = str(profile.get_device().get_info(rs.camera_info.serial_number))
             self._align = rs.align(rs.stream.color) if self.depth else None
             depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
             ci = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
