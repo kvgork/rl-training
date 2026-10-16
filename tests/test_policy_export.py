@@ -54,6 +54,30 @@ def test_refuses_bad_inputs(toy_ckpt, tmp_path):
         pol(np.full((pol.obs_dim,), np.nan, np.float32))
 
 
+def test_die_export_records_its_task_and_is_never_deployed_as_reach(monkeypatch, tmp_path):
+    """plans/die-to-zone-plan.md D1: a die_to_zone export says so (task_name, 29-wide input) and the deploy check
+    refuses it for reach."""
+    from so101_rl.env.tasks import DIE_TO_ZONE, REACH
+    from so101_rl.rl.deploy_policy import Refused, check_policy
+    from so101_rl.rl.toy_batched_env import ToyBatchedDieShapedEnv
+
+    monkeypatch.setattr(eval_sim, "build_env", lambda task, n, **kw: ToyBatchedDieShapedEnv(n, seed=kw["seed"]))
+    monkeypatch.setattr(train_sim_sac, "read_gpu_temp_c", lambda: 50.0)
+    cfg = train_sim_sac.load_sim_sac_config({
+        "task": "die_to_zone", "nworld": 16, "budget_min": 5.0, "seed": 0, "dr_max_stage": 0,
+        "eval_every_steps": 16 * 20, "eval_episodes": 16, "log_every_steps": 16 * 10, "max_env_steps": 16 * 20,
+        "batch_size": 64, "grad_steps_per_env_step": 1, "warmup_steps": 2, "replay_capacity": 1000,
+        "tensorboard": False, "allow_unverified_sim_params": True,
+    })  # fmt: skip
+    ckpt = train_sim_sac.run_training(cfg, tmp_path / "run").last_ckpt
+    pol = load_policy(export_policy(ckpt, tmp_path / "die.pt"))
+    assert pol.meta["task_name"] == "die_to_zone" and pol.obs_dim == 29 and pol.meta["success_radius_mm"] is None
+    with pytest.raises(Refused, match="task"):
+        check_policy(pol, REACH)
+    with pytest.raises(Refused, match="dims"):  # right task, but the toy actor has 2 actions, not 6
+        check_policy(pol, DIE_TO_ZONE)
+
+
 def test_cli(toy_ckpt, tmp_path):
     from so101_rl.rl.policy_export import main
 

@@ -3,15 +3,19 @@
 Used by the FastSAC / replay / training-loop unit tests. ``N`` worlds of a 2-D point moved by ``action * speed``
 per step; the reward has the FS4 shape (``-dist/scale * (1 - success) - (1 - success) - 0.05``, every step < 0),
 ``terminated`` on success, ``truncated`` at ``episode_steps``, auto-reset with ``final_*`` = pre-reset copies.
+
+``ToyBatchedDieShapedEnv``: the same env with the die task's tensor widths (observation 26 = ``DIE_OBS.dim``, goal
+3), so the FS3 policy input is 29 wide as for ``die_to_zone`` (tests of the die plumbing on CPU).
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import torch
 
-__all__ = ["ToyBatchedReachEnv", "ToyStep"]
+__all__ = ["ToyBatchedDieShapedEnv", "ToyBatchedReachEnv", "ToyStep"]
 
 
 @dataclass
@@ -87,6 +91,43 @@ class ToyBatchedReachEnv:
         return ToyStep(obs=obs, priv=priv, achieved=ach, desired=desired, reward=reward, terminated=terminated,
                        truncated=truncated, final_obs=final_obs, final_priv=final_priv, final_achieved=final_priv,
                        info=info)  # fmt: skip
+
+    def close(self) -> None:
+        pass
+
+
+def _pad(x: torch.Tensor, width: int) -> torch.Tensor:
+    return torch.cat([x, x.new_zeros(x.shape[0], width - x.shape[1])], dim=1)
+
+
+class ToyBatchedDieShapedEnv:
+    """:class:`ToyBatchedReachEnv` (same dynamics, reward and success) with zero-padded die-task widths: observation
+    26 (``DIE_OBS.dim``), goal / achieved 3. Policy input = 29, as for ``die_to_zone`` (FS3)."""
+
+    obs_dim = 26
+    randomizer = None
+    dr_stage = 0
+
+    def __init__(self, nworld: int, **kw: object) -> None:
+        self._env = ToyBatchedReachEnv(nworld, **kw)  # type: ignore[arg-type]
+        self.nworld, self.device, self.episode_steps = self._env.nworld, self._env.device, self._env.episode_steps
+        self.act_dim, self.priv_dim = ToyBatchedReachEnv.act_dim, ToyBatchedReachEnv.priv_dim
+        self.metadata: dict[str, object] = {}
+        self.stats: dict[str, float] = {}
+
+    @property
+    def goal(self) -> torch.Tensor:
+        return _pad(self._env.goal, 3)
+
+    def reset(self, mask: torch.Tensor | None = None, *, phase_randomise: bool = True):
+        obs, priv, ach, goal = self._env.reset(mask, phase_randomise=phase_randomise)
+        return _pad(obs, self.obs_dim), priv, _pad(ach, 3), _pad(goal, 3)
+
+    def step(self, action: torch.Tensor) -> ToyStep:
+        st = self._env.step(action)
+        return dataclasses.replace(st, obs=_pad(st.obs, self.obs_dim), final_obs=_pad(st.final_obs, self.obs_dim),
+                                   achieved=_pad(st.achieved, 3), desired=_pad(st.desired, 3),
+                                   final_achieved=_pad(st.final_achieved, 3))  # fmt: skip
 
     def close(self) -> None:
         pass

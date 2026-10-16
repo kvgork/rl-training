@@ -8,9 +8,10 @@ The export is a plain dict saved with ``torch.save`` (tensors, numbers, strings,
 sha, the checkpoint's last sim eval).
 
 :func:`load_policy` returns a callable ``obs -> action``: ``obs`` float ``[..., D]`` is the FS3 policy input, i.e.
-the task's observation (``env/obs.py``, reach: 21) with ``desired_goal`` (3) appended (``obs.policy_input_dim``);
-the action is deterministic ``tanh(mu)`` in [-1, 1], float32 ``[..., 6]``. It refuses a different export or obs
-layout version, and inputs of the wrong width.
+the task's observation (``env/obs.py``, reach: 21, die_to_zone: 26) with ``desired_goal`` (3) appended
+(``obs.policy_input_dim``: 24 / 29); the action is deterministic ``tanh(mu)`` in [-1, 1], float32 ``[..., 6]``. It
+refuses a different export or obs layout version, and inputs of the wrong width. ``task_name`` records the task, so
+a die_to_zone export is never deployed as reach (``deploy_policy.check_policy`` compares it with its task).
 """
 
 from __future__ import annotations

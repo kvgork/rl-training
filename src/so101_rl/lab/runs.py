@@ -53,7 +53,10 @@ class Budget:
     probe_gpu_h_max: float = 1.0
 
 
-BUDGETS: dict[str, Budget] = {"reach": Budget(max_attempts=3, gpu_h_max=6.0)}
+BUDGETS: dict[str, Budget] = {  # sim plan budgets table: reach <= 6 GPU-h, die-to-zone <= 30 GPU-h, <= 3 attempts each
+    "reach": Budget(max_attempts=3, gpu_h_max=6.0),
+    "die_to_zone": Budget(max_attempts=3, gpu_h_max=30.0),
+}
 
 
 def default_root() -> Path:
