@@ -23,7 +23,6 @@ other on scenes rendered from the calibrated camera.
 from __future__ import annotations
 
 from collections.abc import Callable
-
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +38,7 @@ DEFAULT_HSV_YAML = Path(__file__).with_name("hsv_red_die.yaml")
 _OPEN_KERNEL = np.ones((3, 3), np.uint8)
 _RING_KERNEL = np.ones((7, 7), np.uint8)
 _OCCLUDED_RING_FRACTION = 0.15  # share of the blob's surrounding ring that is nearer than the blob
+EXCLUDE_MAJORITY = 0.5  # detect(exclude=): a blob MORE than half excluded (the arm's) is skipped
 TABLE_NORMAL_BASE = np.array([0.0, 0.0, 1.0])  # the table is the base frame's horizontal plane (z = table_z_m)
 
 
@@ -89,6 +89,7 @@ class HsvDepthDieTracker:
         self.min_area_px = int(min_area_px)
         self.max_area_px = int(max_area_px)
         self.rejected = 0  # candidates rejected by detect()'s accept (diagnostics)
+        self.rejected_excluded = 0  # candidates skipped by detect()'s exclude mask (diagnostics)
         self.depth_window_m = float(depth_window_m)
         self.die_edge_m = float(die_edge_m)
         if not 0 < self.min_area_px < self.max_area_px:
@@ -132,26 +133,37 @@ class HsvDepthDieTracker:
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, _OPEN_KERNEL)
 
     def detect(
-        self, rgb: np.ndarray, depth_m: np.ndarray, accept: Callable[[Detection], bool] | None = None
+        self,
+        rgb: np.ndarray,
+        depth_m: np.ndarray,
+        accept: Callable[[Detection], bool] | None = None,
+        exclude: np.ndarray | None = None,
     ) -> Detection | None:
         """The die, or None. Candidates are the blobs in the area band, largest first. With ``accept`` (the
         perception process passes "the centroid lies on the table workspace", plan section 10 2026-10-17) a
         candidate that cannot be measured (cut by the image border, no usable depth) or that ``accept`` rejects is
         skipped and the next one is tried, so red / orange objects off the table (a book on a bed, a person) never
-        hide the die; the first accepted candidate is the answer, or None if its ring test says occluded. Without
-        ``accept`` only the largest candidate is considered (the original rule)."""
+        hide the die; the first accepted candidate is the answer, or None if its ring test says occluded. With
+        ``exclude`` (bool [h, w], the arm mask of ``perception/arm_mask.py``; plan section 10 2026-10-17
+        "Perception: arm mask") a candidate of which more than ``EXCLUDE_MAJORITY`` of the pixels is excluded is
+        skipped first (counted in ``rejected_excluded``), so the arm's own orange parts never hide the die. Without
+        either only the largest candidate is considered (the original rule)."""
         mask = self._mask(rgb)
         n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
         cands = sorted(
             (i for i in range(1, n) if self.min_area_px <= int(stats[i, cv2.CC_STAT_AREA]) <= self.max_area_px),
             key=lambda i: -int(stats[i, cv2.CC_STAT_AREA]),
         )
-        if accept is None:
+        search = accept is not None or exclude is not None
+        if not search:
             cands = cands[:1]
         for best in cands:
+            if exclude is not None and self._excluded_fraction(best, labels, stats, exclude) > EXCLUDE_MAJORITY:
+                self.rejected_excluded += 1
+                continue
             det = self._measure(best, mask.shape, labels, stats, cents, depth_m)
             if det is None:
-                if accept is None:
+                if not search:
                     return None
                 continue
             if accept is not None and not accept(det):
@@ -161,6 +173,14 @@ class HsvDepthDieTracker:
                 return None
             return det
         return None
+
+    @staticmethod
+    def _excluded_fraction(i: int, labels: np.ndarray, stats: np.ndarray, exclude: np.ndarray) -> float:
+        """Share of blob ``i``'s pixels that ``exclude`` covers (inside its bounding box: cheap)."""
+        x0, y0 = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+        x1, y1 = x0 + int(stats[i, cv2.CC_STAT_WIDTH]), y0 + int(stats[i, cv2.CC_STAT_HEIGHT])
+        blob = labels[y0:y1, x0:x1] == i
+        return float(np.count_nonzero(exclude[y0:y1, x0:x1][blob])) / float(stats[i, cv2.CC_STAT_AREA])
 
     def _measure(self, best: int, shape: tuple[int, ...], labels: np.ndarray, stats: np.ndarray,
                  cents: np.ndarray, depth_m: np.ndarray) -> Detection | None:  # fmt: skip

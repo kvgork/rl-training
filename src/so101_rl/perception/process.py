@@ -1,11 +1,12 @@
 """The perception process (plan F9; ``plans/die-to-zone-plan.md`` D3): D435 -> die tracker -> object table.
 
 ``pixi run perception [--backend d435|sim] [--shm-name so101_objects] [--rate-hz 30] [--max-frames N]
-[--duration-s S] [--summary PATH] [--allow-provisional] [--no-plane-check]``
+[--duration-s S] [--summary PATH] [--allow-provisional] [--no-plane-check] [--servo-shm so101_servo] [--no-arm-mask]``
 
 One OS process, the single writer of the object table (``perception/object_table.py``); the policy process
-(``So101GoalEnv(object_table=ObjectTableShm.attach(name))``) reads it. It never touches the serial bus or the servo
-shm, and it imports nothing from ``rl`` / ``wm`` / ``env`` / ``safety``.
+(``So101GoalEnv(object_table=ObjectTableShm.attach(name))``) reads it. It never touches the serial bus; the servo shm
+it only READS (the arm mask's joint ticks, ``perception/arm_mask.py`` ``ServoStateReader``: attach + ``read_state``,
+never a write). It imports nothing from ``rl`` / ``wm`` / ``env`` / ``safety``.
 
 **Start-up (refuses, nothing is created):** ``calib/camera.yaml`` must have a calibrated ``T_base_color``
 (``arm-shape`` / ``hand-eye``; a provisional pose only with ``--allow-provisional``) and a ``table_plane`` (unless
@@ -15,9 +16,11 @@ equal ``camera.yaml``'s and its colour intrinsics (resolution, fx, fy, cx, cy wi
 ones -> exit 3 otherwise. Only then is the shm segment created.
 
 **Per frame** (colour + depth aligned to colour; the D435 paces the loop at its 30 fps, ``--rate-hz`` below the
-camera rate skips frames): ``HsvDepthDieTracker.detect`` -> ``centroid_base(det, T_base_color)``, the die CENTROID
-in the base frame (ARCHITECTURE §5 Perception) -> a workspace sanity check (the centroid inside the tip box grown by
-5 cm, not below the table; outside = not visible, counted) -> one object-table write, slot 0, label ``die``:
+camera rate skips frames): the arm mask (below) -> ``HsvDepthDieTracker.detect(rgb, depth, accept=on the table,
+exclude=arm mask)`` -> ``centroid_base(det, T_base_color)``, the die CENTROID in the base frame (ARCHITECTURE §5
+Perception); candidate blobs are tried largest first, a blob more than half on the arm or whose centroid lies off the
+table workspace (the tip box grown by 5 cm, not below the table) is skipped and counted -> one object-table write,
+slot 0, label ``die``:
 
 - ``visible`` = the tracker's verdict for THIS frame (``detect`` not None and inside the workspace);
 - ``xyz_base`` / ``t_mono_ns`` / ``confidence`` always describe the same measurement: the last visible detection.
@@ -28,6 +31,14 @@ in the base frame (ARCHITECTURE §5 Perception) -> a workspace sanity check (the
   the record shows the process is alive even while the die is hidden; the frame count is ``seq // 2`` (one
   seqlock write per processed frame);
 - record ``fiducial_ok`` = the camera-moved verdict (below). The reader ANDs it into visibility.
+
+**Arm mask** (plan §10 2026-10-17 "Perception: arm mask"; ``perception/arm_mask.py``): the servo's present ticks
+(``--servo-shm``, default ``so101.yaml`` ``shm_name``) -> FK -> the arm's surface points projected into the colour
+frame, dilated 6 px, depth-gated (a surface 10 mm or more in front of the arm is not the arm) and open between the
+fingertips (a die held in the jaws stays visible). With no servo segment, a state older than 100 ms or a failed bus
+read the frame runs without the mask (as before) and is counted; the summary's ``arm_mask`` gives the active fraction,
+the reasons, the blobs rejected on the arm and the mask's cost. ``--no-arm-mask`` disables it (so does a motor
+calibration that cannot be loaded; the summary records why).
 
 A failed camera read writes nothing: the reader's freshness rule (detection age <= one policy period + 2 frames)
 turns a stalled table into "not visible". No good frame for ``--camera-timeout-s`` (3 s) ends the process (exit 1).
@@ -68,10 +79,10 @@ from typing import Any
 
 import numpy as np
 
+from so101_rl.perception.arm_mask import ARM_MAJORITY, ArmMaskSource
 from so101_rl.perception.camera import Camera
 from so101_rl.perception.camera_calib import CAMERA_YAML, CameraCalib, CameraNotCalibrated, load_camera_calib
 from so101_rl.perception.die_tracker import (
-    BELOW_TABLE_M,
     DEFAULT_HSV_YAML,
     TABLE_WORKSPACE_MARGIN_M,
     Detection,
@@ -264,6 +275,7 @@ class PerceptionStats:
     processed: int = 0
     detections: int = 0
     out_of_workspace: int = 0
+    on_arm: int = 0
     latency_ms: list[float] = field(default_factory=list)
     interval_ms: list[float] = field(default_factory=list)
 
@@ -284,11 +296,15 @@ class PerceptionLoop:
         workspace: tuple[np.ndarray, np.ndarray] | None = None,
         plane_every: int = PLANE_CHECK_EVERY,
         camera_timeout_s: float = CAMERA_TIMEOUT_S,
+        arm: ArmMaskSource | None = None,
+        arm_disabled_reason: str = "not configured",
     ) -> None:
         self.camera, self.calib, self.table = camera, calib, table
         self.T = np.asarray(calib.T_base_color, dtype=np.float64)
         self.tracker = tracker if tracker is not None else HsvDepthDieTracker.from_camera_calib(calib)
         self.gate = gate if gate is not None else CameraMovedGate(None)
+        self.arm = arm
+        self.arm_disabled_reason = arm_disabled_reason
         fps = float(calib.color.fps)
         self.rate_hz = fps if rate_hz is None else float(rate_hz)
         if not 0 < self.rate_hz:
@@ -339,9 +355,12 @@ class PerceptionLoop:
         s.processed += 1
 
         visible = False
-        before = self.tracker.rejected
-        det = self.tracker.detect(self._rgb, self._depth, accept=self._on_table)
-        s.out_of_workspace += self.tracker.rejected - before  # red / orange blobs off the table, skipped
+        tr = self.tracker
+        before, before_arm = tr.rejected, tr.rejected_excluded
+        exclude = self.arm.mask(self._depth) if self.arm is not None else None
+        det = tr.detect(self._rgb, self._depth, accept=self._on_table, exclude=exclude)
+        s.out_of_workspace += tr.rejected - before  # red / orange blobs off the table, skipped
+        s.on_arm += tr.rejected_excluded - before_arm  # red / orange blobs on the arm itself, skipped
         if det is not None:
             visible = True
             s.detections += 1
@@ -377,11 +396,35 @@ class PerceptionLoop:
             "detections": s.detections,
             "detection_rate": s.detections / s.processed if s.processed else None,
             "rejected_out_of_workspace": s.out_of_workspace,
+            "rejected_on_arm": s.on_arm,
+            "arm_mask": self.arm_report(),
             "latency_ms": _pct(s.latency_ms),
             "frame_interval_ms": _pct(s.interval_ms),
             "rate_hz": self.rate_hz,
             "table_seq": self.table.last_seq,
             "camera_check": self.gate.report(),
+        }
+
+    def arm_report(self) -> dict[str, Any]:
+        """The arm mask's share of the processed frames, why it was off, and its cost."""
+        a = self.arm
+        if a is None:
+            return {"enabled": False, "reason": self.arm_disabled_reason, "active_fraction": 0.0}
+        m = a.masker
+        n = a.active + sum(a.inactive.values())
+        age = getattr(a.joints, "max_age_ns", None)
+        return {
+            "enabled": True,
+            "servo_shm": getattr(a.joints, "name", None),
+            "active_frames": a.active,
+            "inactive_frames": dict(a.inactive),
+            "active_fraction": a.active / n if n else None,
+            "mask_ms": _pct(a.ms),
+            "dilate_px": m.dilate_px,
+            "depth_tol_mm": m.depth_tol_m * 1e3,
+            "grasp_margin_mm": m.grasp_margin_m * 1e3,
+            "majority": ARM_MAJORITY,
+            "max_state_age_ms": None if age is None else age / 1e6,
         }
 
 
@@ -407,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--allow-provisional", action="store_true", help="accept a provisional camera pose")
     ap.add_argument("--no-plane-check", action="store_true", help="disable the table-plane camera-moved check")
     ap.add_argument("--camera-timeout-s", type=float, default=CAMERA_TIMEOUT_S)
+    ap.add_argument("--servo-shm", default=None, help="servo state shm to read the arm mask's joint ticks from "
+                    "(read-only; default so101.yaml shm_name)")  # fmt: skip
+    ap.add_argument("--no-arm-mask", action="store_true", help="do not mask the arm's own pixels")
     ap.add_argument(
         "--sim-die", type=float, nargs="+", default=None, metavar="X Y [YAW]",
         help="--backend sim: die resting on the table at (x, y) with yaw (rad); default hidden",
@@ -460,14 +506,17 @@ def main(argv: list[str] | None = None, *, camera: Camera | None = None) -> int:
     old = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     table: ObjectTableShm | None = None
     cam: Camera | None = None
+    arm: ArmMaskSource | None = None
     code, reason = EXIT_FAILED, "not started"
     try:
         code, reason, cam = _open_camera(a, calib, camera)
         if cam is not None:
             doc["camera"] = {"type": type(cam).__name__, "device_serial": getattr(cam, "device_serial", None)}
             table = ObjectTableShm.create(a.shm_name)
+            arm, why = _arm_source(a, calib)
+            doc["arm_mask_source"] = why
             loop = PerceptionLoop(cam, calib, table, tracker=tracker, gate=gate, rate_hz=a.rate_hz,
-                                  camera_timeout_s=a.camera_timeout_s)  # fmt: skip
+                                  camera_timeout_s=a.camera_timeout_s, arm=arm, arm_disabled_reason=why)  # fmt: skip
             print(f"perception: writing object table {a.shm_name!r} at {loop.rate_hz:g} Hz", file=sys.stderr)
             reason = loop.run(lambda: bool(stop_signal), max_frames=a.max_frames, duration_s=a.duration_s)
             doc.update(loop.summary())
@@ -477,6 +526,8 @@ def main(argv: list[str] | None = None, *, camera: Camera | None = None) -> int:
     except Exception as e:  # noqa: BLE001 - recorded in the summary, the exit code says it failed
         code, reason = EXIT_FAILED, f"exception: {type(e).__name__}: {e}"
     finally:
+        if arm is not None:
+            arm.close()
         if cam is not None:
             try:
                 cam.stop()
@@ -489,6 +540,25 @@ def main(argv: list[str] | None = None, *, camera: Camera | None = None) -> int:
             signal.signal(s, h)
     doc["table_created_and_unlinked"] = table is not None
     return finish(code, reason)
+
+
+def _arm_source(a: argparse.Namespace, calib: CameraCalib) -> tuple[ArmMaskSource | None, str]:
+    """(the arm mask on the servo shm, a description) or (None, why not). Never refuses the process: without the
+    mask the tracker works as before."""
+    if a.no_arm_mask:
+        return None, "disabled (--no-arm-mask)"
+    from so101_rl.config import load_calibration, load_config
+    from so101_rl.perception.arm_mask import ArmMasker, ServoStateReader
+
+    try:
+        cfg = load_config()
+        calibration = load_calibration(cfg.calibration_path)
+        masker = ArmMasker(calib)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"perception: WARNING no arm mask: {e}", file=sys.stderr)
+        return None, f"disabled: {type(e).__name__}: {e}"
+    name = a.servo_shm if a.servo_shm is not None else cfg.shm_name
+    return ArmMaskSource(masker, ServoStateReader(name), calibration), f"servo shm {name!r} (read-only)"
 
 
 def _open_camera(a: argparse.Namespace, calib: CameraCalib, camera: Camera | None) -> tuple[int, str, Camera | None]:

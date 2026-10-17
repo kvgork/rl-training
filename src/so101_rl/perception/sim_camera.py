@@ -7,7 +7,8 @@ aligned to colour exactly as the real pipeline delivers it (the same rendering a
 It reports the calibration's serial and colour intrinsics unless told otherwise (``serial=`` / ``dT_color=`` let the
 tests fake a wrong camera or a camera that moved after the calibration).
 
-The scene is the ``home`` keyframe with the die placed by :meth:`set_die` (``None`` = parked far outside the view).
+The scene is the ``home`` keyframe with the die placed by :meth:`set_die` (``None`` = parked far outside the view) and
+the arm joints optionally set by :meth:`set_arm` (the arm-mask tests).
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ class SimRenderCamera:
         self.realtime = bool(realtime)
         self._dT = None if dT_color is None else np.asarray(dT_color, dtype=np.float64)
         self._die = die_xyz_yaw
+        self._arm: np.ndarray | None = None
         self._model = self._data = self._renderer = None
         self._next_ns = 0
         self.frames = 0
@@ -50,6 +52,12 @@ class SimRenderCamera:
     def set_die(self, die_xyz_yaw: tuple[float, float, float, float] | None) -> None:
         """Die centre (x, y, z) in the base frame and yaw (rad); ``None`` parks it outside the view."""
         self._die = die_xyz_yaw
+        if self._model is not None:
+            self._pose_scene()
+
+    def set_arm(self, q: np.ndarray | None) -> None:
+        """The six joint angles (rad, ``config.JOINT_NAMES`` order); ``None`` = the ``home`` keyframe."""
+        self._arm = None if q is None else np.asarray(q, dtype=np.float64).reshape(6).copy()
         if self._model is not None:
             self._pose_scene()
 
@@ -64,6 +72,11 @@ class SimRenderCamera:
 
         m, d = self._model, self._data
         mujoco.mj_resetDataKeyframe(m, d, m.key("home").id)
+        if self._arm is not None:
+            from so101_rl.config import JOINT_NAMES
+
+            for j, n in enumerate(JOINT_NAMES):
+                d.qpos[m.jnt_qposadr[m.joint(n).id]] = self._arm[j]
         dq = m.jnt_qposadr[m.joint("die_free").id]
         if self._die is None:
             x, y, z, yaw = (*_PARKED_XYZ, 0.0)
