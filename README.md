@@ -1,105 +1,140 @@
-# so101_rl
+# so101_rl — reinforcement learning for a real SO-101 arm
 
-Goal-conditioned RL stack for one SO-101 arm with a policy-independent safety layer. See
-`docs/ARCHITECTURE.md` (architecture), `so101-self-learning-rl-plan.md` (decisions) and
-`plans/phase0-implementation-plan.md` (frozen interfaces, tasks).
+Goal-conditioned reinforcement learning for one [SO-101](https://github.com/TheRobotStudio/SO-ARM100) arm (Feetech
+STS3215 servos, Intel RealSense D435 camera). Policies are trained in GPU simulation (MuJoCo Warp, FastSAC), then
+deployed zero-shot to the real arm and improved with real data where that helps. A safety layer that does not depend
+on the policy guards every real-arm motion.
 
-## Environment
+**Where it stands (October 2026)**
 
-Everything runs through pixi. The NVIDIA driver works on the dev host since H1 (2026-10-05: RTX 3080, driver
-610.57), so both `pixi run -e cpu <task>` (CPU torch, CI and hardware-free acceptance) and `pixi run <task>` (the
-`default` env, CUDA torch + MuJoCo Warp) are used. GPU tests: `pixi run test-gpu`.
+| Task | Simulation | Real arm |
+|---|---|---|
+| Reach, 3 mm success radius | exit gate 0.953 (Wilson LB 0.938) | **70/70 zero-shot**, error p50 2.6 mm |
+| Reach, 5 mm | gate passed | 69/70 after one offline AWR round (50/50 at full speed) |
+| Die-to-zone (pick the 16 mm die out of a tray, place it in a 60 mm zone) | **0.984** from the tray well (curriculum + scripted demos) | not yet: needs H8/H9 and calibrated sim parameters (see Next steps) |
 
-Solved versions (2026-10-05, S0.1 of `plans/sim-track-implementation-plan.md`; `pixi install -e cpu`, `-e default`,
-`-e robot`, linux-64):
+The decisions behind every number are in the plan's decision log (`so101-self-learning-rl-plan.md` §10).
 
-| Package | `default` | `cpu` | `robot` | Source |
-|---|---|---|---|---|
-| python | 3.12.13 | 3.12.14 | 3.12.14 | conda-forge |
-| numpy | 2.2.6 | 2.2.6 | 2.2.6 | conda-forge |
-| pytorch | 2.11.0 (`cuda129_mkl`, `pytorch-gpu`) | 2.11.0 (`cpu_mkl`, `pytorch-cpu`) | 2.11.0 (`cpu_mkl`) | conda-forge; no PyPI `torch` |
-| cuda-version | 12.9 | 12.9 (pulled by `warp-lang`; CPU torch) | — | conda-forge |
-| torchvision | 0.26.0 (cuda129) | 0.26.0 (cpu) | 0.26.0 (cpu) | conda-forge |
-| mujoco / `mujoco-python` | 3.14.0 | 3.14.0 | — | conda-forge |
-| mujoco-warp | 3.14.0 | 3.14.0 | — | conda-forge |
-| warp-lang | 1.17.0 (cuda129) | 1.17.0 (cuda129) | — | conda-forge |
-| torchrl / tensordict | 0.14.0 / 0.14.2 | 0.14.0 / 0.14.2 | — | PyPI |
-| stable-baselines3 | 2.9.0 | 2.9.0 | — | PyPI |
-| cma | 4.5.0 | 4.5.0 | — | PyPI |
-| lerobot | 0.6.1 (`feetech`, `grpcio-dep`) | 0.6.1 | 0.6.1 | PyPI |
-| gymnasium | 1.2.3 | 1.2.3 | 1.2.3 | conda-forge |
-| opencv | 4.13.0 | 4.13.0 | 4.13.0 | conda-forge |
+## How it fits together
 
-Pin rationale: **lerobot 0.6.1 needs torch < 2.12 and numpy < 2.3**, so every env pins `pytorch 2.11.*` and
-`numpy 2.2.*` (the MuJoCo Warp spike resolved torch 2.12 / numpy 2.5, which lerobot cannot use). `mujoco-python 3.14.*`,
-`mujoco-warp 3.14.*` and `warp-lang >=1.17,<2` sit in the `sim` feature so `cpu` and `default` simulate the same
-physics (until 2026-10-05 `cpu` had mujoco 3.13 / torch 2.11 and `default` 3.3.2 / torch 2.7.1). `cuda-version 12.9.*`
-matches the cuda129 `warp-lang` build (decision D-CUDA; the documented fallback is 12.8 / 12.6 if a future solve
-refuses 12.9 with torch 2.11 — not needed on 2026-10-05). Further pins so the conda solve does not fight lerobot
-0.6.1 (pixi pins PyPI packages to the conda-solved version): `setuptools<82`, `packaging<26`, `opencv<4.14`,
-`gymnasium<1.3`; plus `[tool.pixi.system-requirements] cuda = "12"` so the `default` environment also locks on a host
-without a driver. `tests/test_env_sanity.py` enforces one conda torch 2.11, numpy 2.2, mujoco 3.14 and an importable
-`mujoco_warp` / `warp`.
+```
+ GPU sim (MuJoCo Warp, 1024-2048 worlds)          real rig
+ ┌──────────────────────────────┐        ┌──────────────────────────────────────────┐
+ │ train-sim-sac  (FastSAC, DR) │ export │ deploy-policy / train-reach-sac (10 Hz)  │
+ │ eval-sim, sim-gates          │ ─────► │        │ joint deltas (shared memory)    │
+ └──────────────────────────────┘        │ servo process (30 Hz safety loop) ──► bus│
+                                         │        ▲ object table (shared memory)    │
+                                         │ perception process (D435 → die tracker)  │
+                                         └──────────────────────────────────────────┘
+```
 
-Environments: `default` (sim+perception+train+gpu; the GPU training env),
-`cpu` (same with the CPU torch build; used for acceptance) and `robot` (perception + CPU torch, for the
-servo host process; it needs the `cpu` feature because the default conda `pytorch` solve otherwise
-picks a CUDA build that requires `__cuda`).
+- **Servo process** (`src/so101_rl/servo/`, `safety/`): the only code that touches the serial bus. A 30 Hz loop with
+  joint and workspace-box clamps, tracking limits, a stuck-action monitor, a thermal monitor (median-filtered), the
+  firmware protection bits and a state machine. Policies only send joint deltas.
+- **Perception process** (`src/so101_rl/perception/`): D435 colour + depth → HSV/depth die tracker (on-table blobs only,
+  the arm's own pixels masked) → base-frame die position in a shared-memory object table, with a camera-moved check.
+- **Simulation and training** (`src/so101_rl/sim/`, `env/`, `rl/`): batched MuJoCo Warp env with domain randomisation,
+  FastSAC, sim gates, evaluation, policy export; offline AWR scripts for real-data fine-tuning.
+- **Lab** (`src/so101_rl/lab/`): an MCP server and CLI so an AI client can run sim training jobs.
 
-Spike verdict for TD-MPC2 (vendored at `nicklashansen/tdmpc2` `e9f5932`, patched by
-`scripts/vendor_tdmpc2.py`): the state smoke train runs on CPU with the versions above
-(`pixi run -e cpu smoke-tdmpc2 --steps 1000 --device cpu`, about 2 minutes). Two upstream assumptions
-break on torch 2.11 and are patched (see `src/so101_rl/_vendor/tdmpc2/PATCHES.md`): hard-coded
-`cuda:0` devices and moving the meta-device Q-function template with `Module.to()`.
+Full detail: `docs/ARCHITECTURE.md`.
 
-## Entry points
+## Repository layout
 
-- `pixi run -e cpu test` runs the suite without hardware or GPU; `pixi run -e cpu ci` adds lint. `pixi run test` runs the
-  same selection in the `default` env; `pixi run test-gpu` runs the `gpu`-marked tests (CUDA); `pixi run ci-gpu` = lint +
-  test + test-gpu.
-- `pixi run -e cpu fetch-assets` / `extract-kinematics` regenerate `assets/so101/upstream/` and
-  `src/so101_rl/config/so101_kinematics.yaml` (pinned commit in `assets/so101/UPSTREAM.json`).
-- `pixi run -e cpu smoke-tdmpc2` state-only TD-MPC2 smoke train on the toy env.
-- `pixi run -e cpu servo-fake --max-ticks 300` runs the servo process on the fake backend (a FakeMcu that boots
-  latched, a simulated button press, and a FakeBus powered through the MCU's relay, so the real-arm start order
-  runs: port without handshake, button + ARM, ping, re-energise). `pixi run servo --backend {feetech,fake,mujoco} ...` is the
-  general CLI (`--heartbeat-port`, `--require-rt`, `--tick-log`, `--summary`, ...; see `docs/ARCHITECTURE.md` §3).
-  The feetech backend drives the real arm: only attended, on the hardware track.
-- `pixi run -e cpu soak-fake --minutes 0.1` runs a fake-backend soak (servo child + random-policy client, with the
-  repository calibration, so it works on a clean host) and writes `runs/soak-<ts>/report.json`. `pixi run soak
-  --backend B --minutes M [--calibration PATH]` is the general form. The gate is strict only when the servo got
-  real-time scheduling (`rt_active`); a strict pass needs at least 30 minutes. A run with too few samples or policy
-  steps, or one cut short, fails on any host.
+| Path | What |
+|---|---|
+| `src/so101_rl/` | the package: `servo/`, `safety/`, `perception/`, `sim/`, `env/`, `rl/`, `lab/`, `config/` |
+| `assets/so101/` | MJCF scene (arm, table, die, tray, zone, fiducial) |
+| `calib/` | committed calibration: `camera.yaml`, `sim_params.yaml`, `distractors.yaml` (+ `fiducial.yaml`, `hand_eye.yaml` after H8) |
+| `scripts/` | generators and one-off tools (`point_tip.py`, `finetune_*.py`, `make_fiducial_print.py`, ...) |
+| `tests/` | the test suite (no hardware or GPU needed for the default selection) |
+| `docs/ARCHITECTURE.md` | architecture, interfaces, versions (changelog at the end) |
+| `docs/HARDWARE_CHECKLIST.md` | the hardware steps (H-series) and real-arm runs (HS-series) with their results |
+| `so101-self-learning-rl-plan.md` | the plan; §10 is the decision log and the source of truth |
+| `plans/` | implementation plans and run reviews (`plans/reviews/`) |
+| `runs/` | run outputs (not committed) |
 
-Sim-first track (`plans/sim-track-implementation-plan.md`; GPU tasks in the `default` env, never a serial device):
+## Setup
 
-- `pixi run bench-warp` MuJoCo Warp throughput / VRAM / overflow / parity, the S0 gate.
-- `pixi run sim-parity` the frozen three-layer servo-parity test of the batched env (`tests/test_batched_parity.py`:
-  Layer A on CPU, B and C need the GPU; 3 Layer B xfails are accepted, plan §10 2026-10-06).
-- `pixi run -e cpu tray-check --drops 100` the sim twin of H9: the start-well tray returns a dropped die (PASS at
-  >= 95 %, `runs/tray/<ts>.json`).
-- `pixi run -e cpu sysid-excite --backend sim --plan short --out runs/sysid/dry` an excitation dry run against a
-  `servo --backend mujoco` child (`--backend real --attended` is HS1, after H2/H3/H5/H7; `--backend synthetic` is the
-  ground-truth rig).
-- `pixi run sysid-fit --run runs/sysid/<ts> --backend {warp,cpu} --out calib/sim_params.yaml` the sysid fit (servo
-  ratio group + delay); writes the yaml only when the held-out RMS is <= 1 % per joint.
-- `pixi run viz-demo --nworld 256 --record 5 --out runs/viz-demo/` the visualisation demo (random walk on MuJoCo
-  Warp; headless EGL rollout videos, TensorBoard scalars; `--viewer` opens the live window on a display).
-- `pixi run viz-attach --run runs/<run>` attaches the live 3D viewer to a running training run (needs a display).
-- `pixi run dashboard [--logdir runs/]` TensorBoard on localhost:6006 over every `runs/<run>/tensorboard`.
-- MVP sim reach (`plans/mvp-plan.md`): `pixi run sim-gates --task reach` the L1/L2 gates (exit 0 only when every row
-  passes); `pixi run train-sim-sac --task reach --nworld 1024 --budget-min 60` FastSAC on the batched env;
-  `pixi run eval-sim --ckpt <ckpt> --task reach --episodes 1000 --dr-stage 4 [--gate]` the sim eval and numeric exit
-  gate; `pixi run export-policy --ckpt <ckpt> --out <file>` the deployable policy.
-- `pixi run -e cpu deploy-policy --policy <export> --protocol zero-shot [--attended] [--shm-name N]` (MVP M7) runs the
-  exported policy at 10 Hz against an ALREADY-RUNNING servo (it never starts one and never opens a serial port):
-  episodes end at success / 100 steps / a trip, speed ladder 0.5 → 0.75 → 1.0 (10, 10, 50 episodes), Wilson 95 % per
-  rung, the fine-tune verdict (lower bound ≥ 0.60 at full speed); `runs/deploy/<ts>/{episodes.jsonl,summary.json}`.
-  The real arm (the servo's `--backend feetech`) needs `--attended`; `--protocol single --episodes N --speed-scale S`
-  for a quick run. Start it BEFORE the servo reaches RUN (sim: start deploy-policy first; arm: start the servo, then
-  deploy-policy, then press the reset button).
-- `pixi run -e cpu lab-mcp` the stdio MCP server of the training lab (registered in `.mcp.json`; six sim-only tools; each
-  run is a transient `systemd --user` unit that outlives the client); `pixi run -e cpu lab status | stop <run> |
-  gate-sign <run>` the human CLI.
+Everything runs through [pixi](https://pixi.sh). Environments:
 
-`pixi task list` shows all tasks; tasks pointing at modules that later units create fail until then.
+- `default`: CUDA torch + MuJoCo Warp, for GPU training (`pixi run <task>`);
+- `cpu`: the same with CPU torch, for tests and hardware-free runs (`pixi run -e cpu <task>`);
+- `robot`: perception + CPU torch, for the servo host process (`pixi run -e robot <task>`).
+
+```bash
+pixi install            # default env
+pixi run -e cpu test    # the suite without hardware or GPU
+pixi run test-gpu       # GPU tests
+pixi task list          # every task
+```
+
+Version pins and their reasons (lerobot 0.6.1 needs torch < 2.12 and numpy < 2.3, etc.) are in
+`docs/ARCHITECTURE.md` §8.
+
+## Common workflows
+
+**Train and evaluate in simulation**
+
+```bash
+pixi run sim-gates --task reach                       # L1/L2 gates before any training
+pixi run train-sim-sac --task reach --nworld 1024 --success-radius-mm 3 --budget-min 90
+pixi run eval-sim --ckpt runs/sac-sim/<run>/ckpt_last.pt --task reach --episodes 1000 --dr-stage 4 --gate
+pixi run export-policy --ckpt runs/sac-sim/<run>/ckpt_last.pt --out runs/sac-sim/<run>/policy.pt
+```
+
+Die-to-zone uses `--task die_to_zone` with a config yaml (curriculum, demo mixing; see
+`runs/sac-sim/die-v0-attempt2.yaml` and `plans/die-to-zone-plan.md`).
+
+**Run a policy on the real arm** (attended; start the client first, then the servo)
+
+```bash
+pixi run -e cpu deploy-policy --policy <export> --protocol zero-shot --seed 7 --attended --accept-no-watchdog
+pixi run -e robot servo --backend feetech --no-mcu --tick-log runs/deploy/ticks-<ts>.bin
+```
+
+The speed ladder is 10 episodes at 0.5, 10 at 0.75, then 50 at full speed, with Wilson intervals and a fine-tune
+verdict. `--accept-no-watchdog` is the documented exception until the watchdog MCU (H3) exists.
+
+**Hardware-free checks**
+
+```bash
+pixi run -e cpu servo-fake --max-ticks 300            # servo process on the fake backend
+pixi run -e cpu soak-fake --minutes 0.1               # fake-backend soak (servo + random client)
+pixi run perception --backend sim --duration-s 5      # perception process on MuJoCo renders
+```
+
+**Real-rig tools**: `perception` (camera → object table), `scripts/point_tip.py` (hold the gripper tip over a
+point, e.g. to mark the zone), `fiducial-capture`, `hand-eye --execute`, `camera-moved-check` (H8), `calib-check`,
+`zero-adjust`, `camera-calibrate`. Procedures are in `docs/HARDWARE_CHECKLIST.md`.
+
+## Safety rules for the real arm
+
+- Only the servo process touches the bus; every policy goes through the 30 Hz safety loop.
+- Real runs are attended (hand on the servo power switch) until the e-stop and watchdog hardware (H2/H3) exist.
+- Do not run CPU-heavy jobs (the test suite, training threads, starting Python/torch processes) while the arm moves:
+  the host has no real-time scheduling, and a starved servo loop stops the arm.
+- Start perception and other clients before the servo / arm moves.
+- A die policy trained on unverified sim parameters is refused on the real arm by `deploy-policy`.
+- Fine-tune on real data with critic-free updates (offline AWR); a critic-gradient fine-tune collapsed twice
+  (plan §10 2026-10-14).
+
+## Next steps with the arm
+
+1. **H8: hand-eye calibration and table fiducial.** Software is ready (`docs/HARDWARE_CHECKLIST.md` H8).
+   - Print `runs/hw/fiducial/aruco_4x4_50_id0_50mm_A4.pdf` (`pixi run python scripts/make_fiducial_print.py`)
+     at 100 %; glue it centred at base (0.09, 0.05), measured from the base by hand.
+   - Put a 12–16 mm red sticker on the gripper tip; clear the table of red objects.
+   - Run `fiducial-capture` (arm at rest), then `hand-eye --execute --attended` (the arm visits ~12 points; it
+     writes `calib/hand_eye.yaml` only at residual ≤ 3 mm and compares with the arm-shape camera pose), then
+     `camera-moved-check --procedure` (nudge the camera ~2 mm: the check must fail; put it back). Remove the
+     sticker afterwards.
+2. **Phase 4 feasibility gate on the real arm.** The scripted grasp–lift–place controller (49–50/50 in sim) runs on
+   the real arm with the die placed by hand, to measure reach to the start area and the zone, the lowest graspable
+   height and a scripted success rate ≥ 30 %. Needs a real-arm runner (not built yet).
+3. **H9: the start-well tray** (≥ 19/20 returns), or `deploy-policy --manual-die-reset` for first tests.
+4. **H2/H3: e-stop and watchdog MCU.** They unlock attended-free runs and the sysid runs HS1–HS3, which produce
+   `calib/sim_params.yaml` v1.
+5. **Retrain die-to-zone on v1 sim parameters**, then **HS6**: the first real die evaluation (ladder 10/10/30).
+
+Progress on each step is recorded in `docs/HARDWARE_CHECKLIST.md` (results table) and the plan's decision log.
