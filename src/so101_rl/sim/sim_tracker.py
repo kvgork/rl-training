@@ -422,6 +422,11 @@ class SimDieTracker:
             self._Rcd = torch.as_tensor(T_cd[:3, :3], dtype=torch.float32, device=dev)
             self._tcd = torch.as_tensor(T_cd[:3, 3], dtype=torch.float32, device=dev)
         self._disc = _disc_points().to(dev)
+        from so101_rl.perception.die_tracker import table_workspace
+
+        ws_lo, ws_hi = table_workspace()
+        self._ws_lo = torch.tensor(ws_lo[:2], dtype=torch.float32, device=dev)
+        self._ws_hi = torch.tensor(ws_hi[:2], dtype=torch.float32, device=dev)
         self.max_latency = int(noise.latency_frames[1])
         K = self.max_latency + 1
         n = self.nworld
@@ -731,7 +736,11 @@ class SimDieTracker:
         area_die = torch.where(band_die, area_die, torch.zeros_like(area_die))
         if dm is not None and self._dist_xyz.shape[1]:
             a_d = self._dist_area
-            cand = self._dist_on & self._in_image(self._dist_xyz) & (a_d >= dm.min_area_px) & (a_d <= dm.max_area_px)
+            # only blobs on the table count, as in the real tracker (perception.die_tracker.table_workspace; the
+            # distractor xyz are table-ray points, so xy decides; plan section 10 2026-10-17)
+            on_table = ((self._dist_xyz[..., :2] >= self._ws_lo) & (self._dist_xyz[..., :2] <= self._ws_hi)).all(-1)
+            cand = (self._dist_on & on_table & self._in_image(self._dist_xyz) & (a_d >= dm.min_area_px)
+                    & (a_d <= dm.max_area_px))
             a_d = torch.where(cand, a_d, torch.zeros_like(a_d))
             best, k = a_d.max(dim=1)
             fp = best > area_die

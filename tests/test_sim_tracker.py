@@ -271,6 +271,27 @@ def test_a_larger_distractor_in_view_replaces_the_die():
         assert bool(tr.false_positive[0]) == fp
 
 
+def test_a_larger_distractor_off_the_table_is_ignored():
+    """Plan §10 2026-10-17: like the real tracker, only blobs on the table workspace count."""
+    from so101_rl.perception.die_tracker import table_workspace
+
+    lo, hi = table_workspace()
+    die = _die(0.22, 0.10)
+    tip, c, h = _away(1)
+    off = None
+    for x in np.arange(hi[0] + 0.01, hi[0] + 0.6, 0.02):  # beyond the table, still in the image
+        dm = DistractorModel(fixed_xyz=np.array([[x, 0.0, TABLE_Z_M + 0.01]]), fixed_area_px=np.array([3000.0]))
+        tr, out = _tracker(NO_NOISE, distractors=dm)
+        if bool(tr._in_image(torch.tensor([[x, 0.0, TABLE_Z_M + 0.01]], dtype=torch.float32))[0]):
+            off = x
+            break
+    assert off is not None, "no off-table point in view for this camera"
+    _start(tr, die)
+    tr.update(die, tip, c, h, 1, out)
+    assert bool(out.visible[0]) and not bool(tr.false_positive[0])
+    assert torch.allclose(out.xyz, die, atol=1e-6)
+
+
 def test_a_distractor_is_a_false_positive_while_the_die_is_hidden():
     dm = DistractorModel(fixed_xyz=np.array([[0.25, 0.0, TABLE_Z_M + 0.01]]), fixed_area_px=np.array([60.0]))
     tr, out = _tracker(NO_NOISE, distractors=dm)
