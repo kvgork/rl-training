@@ -70,7 +70,13 @@ import numpy as np
 
 from so101_rl.perception.camera import Camera
 from so101_rl.perception.camera_calib import CAMERA_YAML, CameraCalib, CameraNotCalibrated, load_camera_calib
-from so101_rl.perception.die_tracker import DEFAULT_HSV_YAML, HsvDepthDieTracker
+from so101_rl.perception.die_tracker import (
+    BELOW_TABLE_M,
+    DEFAULT_HSV_YAML,
+    TABLE_WORKSPACE_MARGIN_M,
+    Detection,
+    HsvDepthDieTracker,
+)
 from so101_rl.perception.object_table import ObjectTableShm, new_object_table, set_object
 
 DEFAULT_SHM_NAME = "so101_objects"
@@ -79,8 +85,7 @@ RUNS = Path("runs/perception")
 
 INTRINSICS_TOL_PX = 0.05
 CAMERA_TIMEOUT_S = 3.0
-WORKSPACE_MARGIN_M = 0.05
-BELOW_TABLE_M = 0.005
+WORKSPACE_MARGIN_M = TABLE_WORKSPACE_MARGIN_M  # the table workspace (die_tracker.table_workspace)
 
 PLANE_STRIDE_PX = 4
 PLANE_BANDS_M = (0.030, 0.015, 0.008, 0.008)  # refit schedule: first around the calibrated plane, then the refit
@@ -305,6 +310,10 @@ class PerceptionLoop:
         self.stats = PerceptionStats()
         self.last_visible = False
 
+    def _on_table(self, det: Detection) -> bool:
+        """``detect``'s candidate filter: the blob's die centroid lies on the table workspace."""
+        return self._in_workspace(self.tracker.centroid_base(det, self.T))
+
     def _in_workspace(self, p: np.ndarray) -> bool:
         lo, hi = self.workspace
         return bool(np.all(np.isfinite(p)) and np.all(p >= lo) and np.all(p <= hi))
@@ -330,15 +339,13 @@ class PerceptionLoop:
         s.processed += 1
 
         visible = False
-        det = self.tracker.detect(self._rgb, self._depth)
+        before = self.tracker.rejected
+        det = self.tracker.detect(self._rgb, self._depth, accept=self._on_table)
+        s.out_of_workspace += self.tracker.rejected - before  # red / orange blobs off the table, skipped
         if det is not None:
-            p = self.tracker.centroid_base(det, self.T)
-            if self._in_workspace(p):
-                visible = True
-                s.detections += 1
-                self._xyz, self._t_seen, self._conf = p, fr.t_mono_ns, float(det.confidence)
-            else:
-                s.out_of_workspace += 1
+            visible = True
+            s.detections += 1
+            self._xyz, self._t_seen, self._conf = self.tracker.centroid_base(det, self.T), fr.t_mono_ns, float(det.confidence)
         rec = self._rec
         set_object(rec, 0, DIE_LABEL, self._xyz, self._conf if visible else 0.0, visible, self._t_seen)
         rec["t_mono_ns"] = fr.t_mono_ns
@@ -379,14 +386,11 @@ class PerceptionLoop:
 
 
 def default_workspace() -> tuple[np.ndarray, np.ndarray]:
-    """(lo, hi) base-frame bounds of a plausible die centroid: the tip box grown by 5 cm, not below the table."""
-    from so101_rl.config.loader import load_geometry
+    """(lo, hi) base-frame bounds of a plausible die centroid: ``die_tracker.table_workspace`` (the tip box grown
+    by 5 cm, not below the table)."""
+    from so101_rl.perception.die_tracker import table_workspace
 
-    table_z, box = load_geometry()
-    m = WORKSPACE_MARGIN_M
-    lo = np.array([box.x[0] - m, box.y[0] - m, table_z - BELOW_TABLE_M])
-    hi = np.array([box.x[1] + m, box.y[1] + m, box.z[1] + m])
-    return lo, hi
+    return table_workspace()
 
 
 # ------------------------------------------------------------------------------------------------ CLI

@@ -113,3 +113,34 @@ def test_non_red_hues_rejected(hue):
 def test_invalid_constructor_args():
     with pytest.raises(ValueError):
         HsvDepthDieTracker(np.array([170, 120, 70]), np.array([10, 255, 255]), INTR, min_area_px=0)
+
+
+def test_accept_skips_a_larger_blob_off_the_table():
+    """Plan §10 2026-10-17: a larger red blob off the table (a book on the bed) must not hide the die."""
+    rgb, depth = _scene()
+    _square(rgb, depth, 100, 100, size=30)  # big, "off the table" (left half of the image here)
+    _square(rgb, depth, 400, 300, size=16)  # the die
+    tr = _tracker()
+    on_table = lambda det: det.u > 320  # noqa: E731 - the test's stand-in for the base-frame workspace check
+    det = tr.detect(rgb, depth, accept=on_table)
+    assert det is not None and det.area_px == 256
+    assert tr.rejected == 1
+    assert tr.detect(rgb, depth).area_px == 900  # without accept: the original largest-blob rule
+
+
+def test_accept_skips_unmeasurable_blobs_and_returns_none_when_nothing_is_accepted():
+    rgb, depth = _scene()
+    _square(rgb, depth, 0, 100, size=30)  # cut by the image border: skipped, not a stop
+    _square(rgb, depth, 400, 300, size=16)
+    det = _tracker().detect(rgb, depth, accept=lambda d: True)
+    assert det is not None and det.area_px == 256
+    assert _tracker().detect(rgb, depth, accept=lambda d: False) is None
+
+
+def test_table_workspace_contains_the_zone_and_the_well_but_not_the_bed():
+    from so101_rl.perception.die_tracker import table_workspace
+
+    lo, hi = table_workspace()
+    for p in ([0.15, -0.13, 0.0035], [0.20, -0.05, 0.0035], [0.174, 0.033, 0.001]):
+        assert np.all(np.asarray(p) >= lo) and np.all(np.asarray(p) <= hi), p
+    assert not np.all(np.asarray([0.36, 0.60, 0.3]) <= hi)

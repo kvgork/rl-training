@@ -22,6 +22,8 @@ other on scenes rendered from the calibrated camera.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,6 +88,7 @@ class HsvDepthDieTracker:
         self.intr = intr
         self.min_area_px = int(min_area_px)
         self.max_area_px = int(max_area_px)
+        self.rejected = 0  # candidates rejected by detect()'s accept (diagnostics)
         self.depth_window_m = float(depth_window_m)
         self.die_edge_m = float(die_edge_m)
         if not 0 < self.min_area_px < self.max_area_px:
@@ -128,20 +131,45 @@ class HsvDepthDieTracker:
             mask |= cv2.inRange(hsv, np.array([0, lo[1], lo[2]], np.uint8), hi)
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, _OPEN_KERNEL)
 
-    def detect(self, rgb: np.ndarray, depth_m: np.ndarray) -> Detection | None:
+    def detect(
+        self, rgb: np.ndarray, depth_m: np.ndarray, accept: Callable[[Detection], bool] | None = None
+    ) -> Detection | None:
+        """The die, or None. Candidates are the blobs in the area band, largest first. With ``accept`` (the
+        perception process passes "the centroid lies on the table workspace", plan section 10 2026-10-17) a
+        candidate that cannot be measured (cut by the image border, no usable depth) or that ``accept`` rejects is
+        skipped and the next one is tried, so red / orange objects off the table (a book on a bed, a person) never
+        hide the die; the first accepted candidate is the answer, or None if its ring test says occluded. Without
+        ``accept`` only the largest candidate is considered (the original rule)."""
         mask = self._mask(rgb)
         n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        best = -1
-        best_area = 0
-        for i in range(1, n):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            if self.min_area_px <= area <= self.max_area_px and area > best_area:
-                best, best_area = i, area
-        if best < 0:
-            return None
+        cands = sorted(
+            (i for i in range(1, n) if self.min_area_px <= int(stats[i, cv2.CC_STAT_AREA]) <= self.max_area_px),
+            key=lambda i: -int(stats[i, cv2.CC_STAT_AREA]),
+        )
+        if accept is None:
+            cands = cands[:1]
+        for best in cands:
+            det = self._measure(best, mask.shape, labels, stats, cents, depth_m)
+            if det is None:
+                if accept is None:
+                    return None
+                continue
+            if accept is not None and not accept(det):
+                self.rejected += 1
+                continue
+            if self._occluded(labels == best, depth_m, float(det.xyz_cam[2])):
+                return None
+            return det
+        return None
+
+    def _measure(self, best: int, shape: tuple[int, ...], labels: np.ndarray, stats: np.ndarray,
+                 cents: np.ndarray, depth_m: np.ndarray) -> Detection | None:  # fmt: skip
+        """Centre, depth and confidence of one blob; None when it is cut by the image border or has no usable
+        depth (the ring test is the caller's)."""
+        best_area = int(stats[best, cv2.CC_STAT_AREA])
         x0, y0 = int(stats[best, cv2.CC_STAT_LEFT]), int(stats[best, cv2.CC_STAT_TOP])
         x1, y1 = x0 + int(stats[best, cv2.CC_STAT_WIDTH]), y0 + int(stats[best, cv2.CC_STAT_HEIGHT])
-        if x0 == 0 or y0 == 0 or x1 >= mask.shape[1] or y1 >= mask.shape[0]:
+        if x0 == 0 or y0 == 0 or x1 >= shape[1] or y1 >= shape[0]:
             return None  # cut by the image border: its centre is not the die's (camera parity C.4; the sim
             # tracker calls a die whose centre leaves the image invisible)
         u, v = float(cents[best][0]), float(cents[best][1])
@@ -156,11 +184,6 @@ class HsvDepthDieTracker:
         if spread > self.depth_window_m:
             return None
         z = float(np.median(valid))
-
-        blob = labels == best
-        if self._occluded(blob, depth_m, z):
-            return None
-
         area_fit = min(1.0, best_area / (3.0 * self.min_area_px))
         consistency = 1.0 - spread / self.depth_window_m
         conf = float(np.clip(area_fit * consistency, 0.0, 1.0))
@@ -174,3 +197,20 @@ class HsvDepthDieTracker:
         if d.size == 0:
             return False
         return float(np.mean(d < z - self.depth_window_m)) > _OCCLUDED_RING_FRACTION
+
+
+TABLE_WORKSPACE_MARGIN_M = 0.05  # around the tip box
+BELOW_TABLE_M = 0.005
+
+
+def table_workspace() -> tuple[np.ndarray, np.ndarray]:
+    """(lo, hi) base-frame bounds of a plausible die centroid: the tip box grown by 5 cm, not more than 5 mm below
+    the table (the black table the arm works on). The perception process accepts only blobs inside it (plan
+    section 10 2026-10-17); the sim tracker restricts its distractors to the same xy region."""
+    from so101_rl.config.loader import load_geometry
+
+    table_z, box = load_geometry()
+    m = TABLE_WORKSPACE_MARGIN_M
+    lo = np.array([box.x[0] - m, box.y[0] - m, table_z - BELOW_TABLE_M])
+    hi = np.array([box.x[1] + m, box.y[1] + m, box.z[1] + m])
+    return lo, hi
