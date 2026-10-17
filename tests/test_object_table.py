@@ -123,4 +123,5 @@ def test_mode_is_required_and_execute_never_moves(capsys):
     with pytest.raises(SystemExit) as e:
         main([])
     assert e.value.code == 2
-    assert main(["--execute"]) == 3  # no backend yet: refuses, commands nothing
+    # --execute refuses before the camera or the servo is touched (tests/test_hand_eye_execute.py has the rest)
+    assert main(["--execute", "--policy", "/nonexistent/policy.pt", "--wait-servo-s", "0"]) == 2

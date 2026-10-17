@@ -312,13 +312,43 @@ Header (append one row per artifact; the H-track, not the software waves, writes
 
 ## H8 - Hand-eye calibration and table fiducial
 
-- **Parts:** red marker on the gripper tip; ArUco marker on the table in view of the camera.
-- **Needs:** D435 driver (5.4), loader/fiducial (5.3), servo (3.2).
-- **Procedure:** `pixi run hand-eye --execute` (>= 10 poses, attended). Place the ArUco marker, record
-  `expected_corners_px`. Nudge the camera by 2 mm: the gate must fail. Put it back.
-- **Artifacts:** `calib/hand_eye.yaml` (residual <= 3 mm, n >= 10) and `calib/fiducial.yaml` committed;
-  `runs/hw/camera-moved-<ts>.json {nudged_err_px > 2, restored_err_px <= 2}`.
+- **Parts:** the table fiducial: ArUco `DICT_4X4_50` id 0, **50 mm**, printed on A4 (plan §10 2026-10-17 "H8
+  software"); a red sticker or tape square of 12-16 mm on the gripper tip (the hand-eye marker, found by the red die
+  tracker); a ruler.
+- **Needs:** D435 driver (5.4), loader/fiducial (5.3), servo (3.2), the 3 mm reach policy
+  (`runs/sac-sim/reach-3mm-20261015-201549/policy.pt`), `calib/camera.yaml` with its arm-shape pose.
+- **Procedure** (in this order; start every command BEFORE the servo, plan §10 2026-10-17 "Perception order"):
+  1. **Print** `pixi run python scripts/make_fiducial_print.py` → `runs/hw/fiducial/aruco_4x4_50_id0_50mm_A4.pdf`
+     (the old `aruco_4x4_50_id0_30mm_A4.pdf` is obsolete: 30 mm is ~25 px in the image). Print at 100 %, check the
+     black square is 50.0 mm. Glue it flat with its centre at base **(0.09, 0.05)**, sides parallel to the base x / y
+     axes, the printed text side (TOP edge) towards +x, away from the base (measure from the base origin, the shoulder_pan
+     axis; x 0.09 lies outside the reach goal bounds, so `scripts/point_tip.py` cannot point at it). It must stay clear of the zone, the tray and the start
+     regions (it does at that spot).
+  2. **Fiducial** (arm at rest, nothing over the marker, no servo needed): `pixi run fiducial-capture` → 30 frames,
+     refused unless found in >= 90 % with <= 0.5 px rms corner jitter → `calib/fiducial.yaml`. A "rotated" note or a
+     prior error above 10 px means the marker is turned or misplaced: fix and repeat.
+  3. **Hand-eye** (attended, hand at the e-stop; remove the die and other red objects from the table; stick the red
+     marker on the gripper tip, facing up / towards the camera): start
+     `pixi run -e cpu hand-eye --execute --attended [--accept-no-watchdog]` first (it loads the policy and opens the
+     camera), then the servo, then press reset. It visits up to 24 targets in view (2 cm grid, z 0.04-0.15 m),
+     wants 12 (min 10) usable poses, holds each still 1.5 s with zero-delta RUN commands, then stops commanding (the
+     servo's stale-command stop returns the arm to rest). If the sticker does not sit at the FK tip point, pass its
+     centre with `--marker-offset-m X Y Z` (gripper body frame, metres). Outputs `runs/hw/hand-eye-<ts>/`
+     (`poses.json`, `hand_eye.yaml`, `report.json`) and, only at residual <= 3 mm and n >= 10, `calib/hand_eye.yaml`.
+     Read the printed RECOMMENDATION (camera-parity plan C.6): AGREE = keep the lower residual (folding a hand-eye
+     pose into `calib/camera.yaml` is a separate, reviewed step: the tool never writes it); DISAGREE = investigate
+     before training any die task.
+  4. **Camera moved** (no servo): `pixi run camera-moved-check --procedure`: baseline (must pass) → at the prompt
+     nudge the camera by about 2 mm (a light push on the mount), Enter → nudged (the gate must FAIL) → put it back
+     exactly, Enter → restored (must pass) → `runs/hw/camera-moved-<ts>.json`. If the restored check fails, the
+     camera did not go back: redo steps 2-4 (the fiducial records the camera where it is; the hand-eye too).
+- **Artifacts:** `calib/fiducial.yaml` and `calib/hand_eye.yaml` (residual <= 3 mm, n >= 10) committed with
+  `runs/hw/hand-eye-<ts>/report.json`; `runs/hw/camera-moved-<ts>.json {nudged_err_px > 2, restored_err_px <= 2,
+  pass}`.
 - **Pass:** as listed. **Shown-to-fail:** the 2 mm nudge.
+- **Sim twin** (no hardware): `servo --backend mujoco` + `pixi run -e cpu hand-eye --execute --camera-backend sim
+  --marker-offset-m 0 0.012 -0.01 --shm-name <servo shm>` (`tests/test_hand_eye_execute.py`: 10/10 poses, residual
+  0.13 mm, 0.011 deg / 0.20 mm from the calibrated pose).
 
 ## H9 - Gravity-return tray for the 16 mm die
 

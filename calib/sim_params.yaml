@@ -7,7 +7,7 @@ meta:
   version: 0
   date: '2026-10-07'
   git_sha: bf7346b2abb29f2a8469d6178381eb359b169d95
-  mjcf_sha256: 60871de6479bd8a8748a1196eaf418a6bc9351114f9895d6199a696bce3aa223
+  mjcf_sha256: 91c4e34ca851582542b8f682d1f000884a13bf638a4bb75e1bb1410baef7a24f
   excitation_run: none (MJCF prior)
   fit_rms_pct: {}
   heldout_rms_pct: null

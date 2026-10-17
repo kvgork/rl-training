@@ -58,8 +58,11 @@ distractors:
 
 ## `hand_eye.yaml`
 
-Written by `python -m so101_rl.perception.calibrate_hand_eye --execute`, read by
-`so101_rl.perception.frames.load_hand_eye`.
+Written by `pixi run -e cpu hand-eye --execute --attended` (`perception/calibrate_hand_eye.py`, H8), read by
+`so101_rl.perception.frames.load_hand_eye`. The run always writes `runs/hw/hand-eye-<ts>/` (`hand_eye.yaml`,
+`poses.json` per pose, `report.json` with the fit, the per-pose residuals and the comparison with `camera.yaml`'s
+pose); it writes `calib/hand_eye.yaml` only when residual <= 3 mm and n >= 10. It never writes `camera.yaml`:
+folding an agreeing, lower-residual hand-eye pose into it (method `hand-eye`) is a manual, reviewed step.
 
 ```yaml
 T_base_cam:            # 4x4, camera frame -> robot base frame, metres; proper rotation, last row [0, 0, 0, 1]
@@ -78,18 +81,30 @@ finite rigid transform.
 
 ## `fiducial.yaml`
 
-Read by `so101_rl.perception.fiducial.FiducialCheck.from_yaml`. The marker is fixed to the table inside the
-camera's view. `expected_corners_px` is what the detector reports right after the hand-eye calibration.
+Written by `pixi run fiducial-capture` (`perception/fiducial.py`, H8: arm at rest or out of view, no servo), read by
+`so101_rl.perception.fiducial.FiducialCheck.from_yaml` (the perception process's camera-moved gate when the file
+exists, and `pixi run camera-moved-check`). The marker: ArUco `DICT_4X4_50` id 0, a 50 mm black square printed from
+`scripts/make_fiducial_print.py`, glued flat with its centre at base (0.09, 0.05), sides along the base x / y axes,
+top edge towards +x (plan §10 2026-10-17 "H8 software"; the MJCF `fiducial` site is the same square).
 
 ```yaml
-marker_id: 7
 dictionary: DICT_4X4_50        # name of an attribute of cv2.aruco
-tol_px: 2.0                    # mean corner distance above this (or marker not found) = camera moved, halt training
-expected_corners_px:           # TL, TR, BR, BL as returned by cv2.aruco.ArucoDetector
-  - [200.0, 150.0]
-  - [320.0, 150.0]
-  - [320.0, 270.0]
-  - [200.0, 270.0]
+marker_id: 0
+tol_px: 2.0                    # mean corner distance above this = camera (or marker) moved; not found = no evidence
+size_mm: 50.0
+xy_base: [0.09, 0.05]          # marker centre, base frame (informational: the gate compares pixels)
+expected_corners_px:           # TL, TR, BR, BL as returned by cv2.aruco.ArucoDetector, mean over the capture frames
+  - [487.1, 462.0]
+  - [451.3, 416.6]
+  - [505.8, 398.4]
+  - [545.4, 440.9]
+date: "2026-10-17"
+camera_serial: "819312071240"  # the perception process refuses a fiducial recorded with another camera
+camera_yaml_sha256: "..."      # calib/camera.yaml at capture time (informational)
+frames: 30                     # capture statistics: frames read, frames with the marker,
+found_frames: 30
+jitter_px: 0.05                # worst corner's rms distance from its mean (capture refused above 0.5 px)
+prior_err_px: 1.2              # mean distance to the corners camera.yaml's pose predicts for this marker (informational)
 ```
 
 ## `sim_params.yaml`

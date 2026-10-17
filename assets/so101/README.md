@@ -4,7 +4,8 @@
   sha256 of every file is test-enforced). Never edit it; regenerate with `pixi run fetch-assets`.
 - `so101_rl_scene.xml` is our override: it `<include>`s `upstream/so101_new_calib.xml` and adds
   - the table (plane at `TABLE_Z_M = -0.02`, see `src/so101_rl/sim/model.py`),
-  - a 16 mm die (4 g, free joint), a 60 x 60 mm target `zone` site, a 30 mm `fiducial` site (ArUco-sized),
+  - a 16 mm die (4 g, free joint), a 60 x 60 mm target `zone` site, the 50 mm `fiducial` site at (0.09, 0.05) (the
+    H8 ArUco marker, `perception/fiducial.py`),
   - the `base` site (world origin) and the `rest` / `home` keyframes,
   - default classes `jaw_col` (primitive jaw collision geoms), `die` and `tray`,
   - the `overhead` camera: the nominal D435 pose of `sim/sim_tracker.py` `CameraModel` (0.614 m above the table at
