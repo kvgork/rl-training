@@ -9,12 +9,19 @@ tests fake a wrong camera or a camera that moved after the calibration).
 
 The scene is the ``home`` keyframe with the die placed by :meth:`set_die` (``None`` = parked far outside the view) and
 the arm joints optionally set by :meth:`set_arm` (the arm-mask tests).
+
+H8 fakes (``calibrate_hand_eye --execute --camera-backend sim``, ``tests/test_hand_eye_execute.py``):
+``tip_marker_radius_m`` adds a red sphere (the hand-eye tip sticker) to the gripper body at the FK tip point
+(``gripperframe``) plus ``tip_marker_offset_m`` (gripper body frame), and ``follow=(joint_source, calibration)`` poses
+the arm from the servo's present ticks before every render (``arm_mask.ServoStateReader``: read-only), so the camera
+sees the arm that ``servo --backend mujoco`` is driving.
 """
 
 from __future__ import annotations
 
 import os
 import time
+from typing import Any
 
 import numpy as np
 
@@ -36,6 +43,9 @@ class SimRenderCamera:
         serial: str | None = None,
         dT_color: np.ndarray | None = None,
         realtime: bool = False,
+        tip_marker_radius_m: float | None = None,
+        tip_marker_offset_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        follow: tuple[Any, Any] | None = None,
     ) -> None:
         self.calib = calib if calib is not None else load_camera_calib()
         self.serial = self.calib.serial if serial is None else str(serial)
@@ -47,6 +57,9 @@ class SimRenderCamera:
         self._model = self._data = self._renderer = None
         self._next_ns = 0
         self.frames = 0
+        self.tip_marker_radius_m = tip_marker_radius_m
+        self.tip_marker_offset_m = tuple(float(v) for v in tip_marker_offset_m)
+        self.follow = follow
 
     # ------------------------------------------------------------------ scene
     def set_die(self, die_xyz_yaw: tuple[float, float, float, float] | None) -> None:
@@ -99,6 +112,16 @@ class SimRenderCamera:
         spec = build_spec(camera=self.calib)
         spec.visual.global_.offwidth = c.width
         spec.visual.global_.offheight = c.height
+        if self.tip_marker_radius_m is not None:
+            frame = spec.site("gripperframe")
+            pos = np.asarray(frame.pos, dtype=np.float64) + np.asarray(self.tip_marker_offset_m)
+            # emissive: evenly red to its silhouette (a shaded sphere loses its dark side to the HSV threshold and
+            # biases the blob centroid towards the light)
+            spec.add_material(name="tip_marker_mat", rgba=[0.8, 0.04, 0.04, 1.0], emission=1.0, specular=0.0)
+            spec.body("gripper").add_geom(
+                name="tip_marker", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[float(self.tip_marker_radius_m), 0, 0],
+                pos=pos.tolist(), material="tip_marker_mat", contype=0, conaffinity=0, mass=1e-6,
+            )  # fmt: skip
         self._model = spec.compile()
         self._data = mujoco.MjData(self._model)
         if self._dT is not None:
@@ -121,6 +144,13 @@ class SimRenderCamera:
                 time.sleep(delay / 1e9)
             else:
                 self._next_ns = time.monotonic_ns()
+        if self.follow is not None:
+            from so101_rl.perception.arm_mask import joint_angles
+
+            joints, calibration = self.follow
+            ticks = joints.read()
+            if ticks is not None:
+                self.set_arm(joint_angles(ticks, calibration))
         r = self._renderer
         r.update_scene(self._data, camera=COLOR_CAM)
         rgb_out[:] = r.render()

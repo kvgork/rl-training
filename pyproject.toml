@@ -117,7 +117,9 @@ servo-fake = "python -m so101_rl.servo.main --backend fake --calibration tests/d
 soak = "python -m so101_rl.servo.soak"
 soak-fake = "python -m so101_rl.servo.soak --backend fake --calibration tests/data/so101_follower.calib.json"
 calib-check = "python -m so101_rl.safety.calib_check"
-hand-eye = "python -m so101_rl.perception.calibrate_hand_eye"
+hand-eye = { cmd = "python -m so101_rl.perception.calibrate_hand_eye", env = { MUJOCO_GL = "egl" } }   # --dry-run | --execute --attended (H8; --camera-backend sim renders)
+fiducial-capture = "python -m so101_rl.perception.fiducial"   # H8: calib/fiducial.yaml from the D435 (arm at rest, no servo)
+camera-moved-check = "python -m so101_rl.perception.camera_moved"   # H8: fiducial + table plane verdict; --procedure = baseline / nudged / restored
 compare-real = "python -m so101_rl.sim.compare_real"
 # Sim-first track (plans/sim-track-implementation-plan.md).
 test-gpu = 'pytest -m "gpu and not hardware"'

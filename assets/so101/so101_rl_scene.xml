@@ -55,8 +55,9 @@
     <site name="base" pos="0 0 0" size="0.003" group="3"/>
     <!-- Target zone, 60 x 60 mm, flat on the table -->
     <site name="zone" type="box" pos="0.15 -0.13 -0.0195" size="0.03 0.03 0.0005" rgba="0.1 0.7 0.2 0.5" group="1"/>
-    <!-- ArUco-sized fiducial (30 mm) for hand-eye calibration -->
-    <site name="fiducial" type="box" pos="0.10 -0.16 -0.0195" size="0.015 0.015 0.0005" rgba="0 0 0 1" group="1"/>
+    <!-- ArUco camera-moved fiducial (H8): DICT_4X4_50 id 0, 50 mm, centre (0.09, 0.05), sides along x / y
+         (perception/fiducial.py XY_BASE / SIZE_MM; plan §10 2026-10-17 "H8 software") -->
+    <site name="fiducial" type="box" pos="0.09 0.05 -0.0195" size="0.025 0.025 0.0005" rgba="0 0 0 1" group="1"/>
     <!-- No camera here: the D435 cameras d435_color / d435_depth are added by sim/model.py build_spec from
          calib/camera.yaml (the single source of the real camera's intrinsics and pose; sim/d435.py). -->
     <!-- Start-well tray around die_start (0.20, -0.05) (tasks.DIE_TO_ZONE placeholder): a flat 23 x 23 mm well on

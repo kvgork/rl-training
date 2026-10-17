@@ -206,7 +206,7 @@ def test_camera_moved_plane_check(calib):
             loop.step()
         assert loop.gate.tripped
         rep = loop.summary()["camera_check"]
-        assert rep["table_plane"]["tripped"] and rep["fiducial"] == pp.FIDUCIAL_STATUS
+        assert rep["table_plane"]["tripped"] and rep["fiducial"] == {"enabled": False, "reason": pp.FIDUCIAL_STATUS}
     finally:
         t.close()
         pitched.stop()
@@ -328,7 +328,7 @@ def test_process_sigterm_unlinks_and_writes_the_summary(tmp_path):
     x, y, yaw = SCENES[0]
     p = subprocess.Popen(
         [sys.executable, "-m", "so101_rl.perception.process", "--backend", "sim", "--sim-die", str(x), str(y), str(yaw),
-         "--shm-name", name, "--summary", str(summary)],
+         "--shm-name", name, "--summary", str(summary), "--fiducial-yaml", str(tmp_path / "none.yaml")],
         cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )  # fmt: skip
     try:
@@ -365,4 +365,83 @@ def test_process_sigterm_unlinks_and_writes_the_summary(tmp_path):
     assert doc["exit_reason"] == "signal SIGTERM" and doc["table_created_and_unlinked"]
     assert doc["frames"]["processed"] >= 5 and doc["detection_rate"] == pytest.approx(1.0)
     assert doc["latency_ms"]["p50"] is not None and doc["calib"]["camera_pose_method"] == "arm-shape"
-    assert doc["camera_check"]["fiducial"] == pp.FIDUCIAL_STATUS
+    assert doc["camera_check"]["fiducial"]["enabled"] is False and "none.yaml" in doc["camera_check"]["fiducial"]["reason"]
+
+
+# ------------------------------------------------------------------------------------------------ H8 fiducial gate
+# (plan §10 2026-10-17 "H8 software"): found and off = failure, not found = no evidence, fiducial_ok = plane AND fiducial
+
+
+@pytest.fixture(scope="module")
+def fid_frames(calib):
+    from fiducial_synth import marker_frame, plane_depth, predicted_corners
+
+    from so101_rl.perception.fiducial import FiducialCheck
+
+    expected = FiducialCheck(0, predicted_corners(calib)).detect_corners(marker_frame(calib))
+    return {
+        "check": lambda: FiducialCheck(0, expected, tol_px=2.0),
+        "on": marker_frame(calib),
+        "shifted": marker_frame(calib, shift_px=(3.0, 2.0)),
+        "gone": marker_frame(calib, present=False),
+        "depth": plane_depth(calib),
+    }
+
+
+def test_fiducial_gate_pass_fail_latch_and_no_evidence(calib, fid_frames):
+    f = fid_frames
+    gate = pp.CameraMovedGate(pp.TablePlaneCheck(calib), f["check"]())
+    assert gate.update(f["depth"], f["on"]) and gate.ok
+    assert gate.update(f["depth"], f["gone"])  # occluded: no evidence, the last pass stands
+    assert not gate.update(f["depth"], f["shifted"])  # found and off: fails at once
+    assert not gate.update(f["depth"], f["gone"])  # no evidence: the failure stands
+    assert gate.update(f["depth"], f["on"])  # a pass clears it (not latched yet)
+    for _ in range(pp.PLANE_TRIP_AFTER):
+        gate.update(f["depth"], f["shifted"])
+        gate.update(f["depth"], f["gone"])  # no evidence does not break the run of failures
+    assert gate.fid.tripped and not gate.ok
+    assert not gate.update(f["depth"], f["on"])  # latched until restart
+    rep = gate.report()["fiducial"]
+    assert rep["enabled"] and rep["tripped"] and rep["fails"] == 1 + pp.PLANE_TRIP_AFTER
+    assert rep["not_found"] == 2 + pp.PLANE_TRIP_AFTER and rep["passes"] == 3 and rep["worst_passing_err_px"] < 0.5
+    assert gate.report()["table_plane"]["fails"] == 0  # the plane alone never saw the 2D shift
+
+
+def test_fiducial_ok_is_plane_and_fiducial(calib, fid_frames):
+    f = fid_frames
+    gate = pp.CameraMovedGate(pp.TablePlaneCheck(calib), f["check"]())
+    assert gate.update(f["depth"], f["gone"])  # no fiducial evidence yet: the plane decides
+    assert not gate.update(f["depth"] + 0.02, f["on"])  # the plane fails (camera lifted), the fiducial passes
+    only_fid = pp.CameraMovedGate(None, f["check"]())
+    assert only_fid.update(f["depth"], f["on"]) and not only_fid.update(f["depth"], f["shifted"])
+    assert pp.CameraMovedGate(pp.TablePlaneCheck(calib)).report()["fiducial"]["enabled"] is False
+
+
+def test_loop_writes_the_fiducial_verdict(calib, fid_frames, table):
+    from fiducial_synth import SequenceCamera
+
+    f = fid_frames
+    img = [f["on"]]
+    cam = SequenceCamera(calib, lambda: (img[0], f["depth"]))
+    cam.start()
+    gate = pp.CameraMovedGate(pp.TablePlaneCheck(calib), f["check"]())
+    loop = pp.PerceptionLoop(cam, calib, table, gate=gate, plane_every=1)
+    loop.step()
+    assert int(_read(table._shm.name.lstrip("/"))["fiducial_ok"]) == 1
+    img[0] = f["shifted"]
+    loop.step()
+    assert int(_read(table._shm.name.lstrip("/"))["fiducial_ok"]) == 0
+    rep = loop.summary()["camera_check"]
+    assert rep["fiducial"]["fails"] == 1 and rep["ok"] is False
+
+
+def test_fiducial_of_another_camera_is_refused(tmp_path):
+    import yaml
+
+    p = tmp_path / "fiducial.yaml"
+    p.write_text(yaml.safe_dump({"dictionary": "DICT_4X4_50", "marker_id": 0, "tol_px": 2.0, "camera_serial": "1",
+                                 "expected_corners_px": [[0, 0], [1, 0], [1, 1], [0, 1]]}))  # fmt: skip
+    summary = tmp_path / "s.json"
+    code = pp.main(["--backend", "sim", "--fiducial-yaml", str(p), "--shm-name", _name(), "--summary", str(summary),
+                    "--max-frames", "1"])  # fmt: skip
+    assert code == pp.EXIT_CALIB and "recorded with camera 1" in json.loads(summary.read_text())["exit_reason"]
