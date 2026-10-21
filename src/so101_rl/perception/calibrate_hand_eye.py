@@ -391,7 +391,9 @@ class ArmCameraRig:
         fk_mean = fk.mean(axis=0)
         fk_spread = float(np.linalg.norm(fk - fk_mean, axis=1).max() * 1000)
         rec.update(fk_marker=[round(float(v), 5) for v in fk_mean], fk_spread_mm=round(fk_spread, 3),
-                   frames=win.frames, detected=len(win.xyz))  # fmt: skip
+                   frames=win.frames, detected=len(win.xyz),
+                   # the hold's mean joint ticks: lets the marker offset be refitted offline (no new arm run)
+                   present_ticks_mean=[round(float(v), 2) for v in np.mean(ticks, axis=0)] if ticks else None)  # fmt: skip
         why = None
         if self.grabber.error is not None:
             why = f"camera error: {self.grabber.error}"
