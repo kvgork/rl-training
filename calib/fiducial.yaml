@@ -1,0 +1,25 @@
+# ArUco camera-moved fiducial (H8; schema calib/README.md). Written by `pixi run fiducial-capture`.
+dictionary: DICT_4X4_50
+marker_id: 0
+tol_px: 2.0
+size_mm: 50.0
+# measured from the detected corners and calib/camera.yaml on 2026-10-21 (planned spot (0.09, 0.05))
+xy_base:
+- 0.102
+- 0.041
+expected_corners_px:
+- - 459.444
+  - 455.117
+- - 435.25
+  - 409.137
+- - 492.664
+  - 397.798
+- - 521.661
+  - 441.51
+date: '2026-10-21'
+camera_serial: '819312071240'
+camera_yaml_sha256: 77365c25b16c1169cc4f30d841cda0ac06e8520ed74776479768ab304a5c23ac
+frames: 30
+found_frames: 30
+jitter_px: 0.1393
+prior_err_px: 20.47
