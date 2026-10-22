@@ -60,6 +60,7 @@ from so101_rl.safety.fk import N_ARM_JOINTS, KinematicChain
 
 __all__ = [
     "GRASP_POINT_GRIPPER",
+    "JAW_MIDPOINT_GRIPPER",
     "Phase",
     "ScriptedDieConfig",
     "ScriptedDieController",
@@ -78,6 +79,11 @@ GRIPPER: Final[int] = N_JOINTS - 1
 # half x 5 mm -> inner face at x = -0.008; a 16 mm die pressed against it is centred at x = 0): 4 mm off the fixed
 # jaw so the open jaws come down around the die without landing on it, the moving jaw then slides it over.
 GRASP_POINT_GRIPPER: Final[tuple[float, float, float]] = (0.004, 0.0, -0.094)
+# Midway between the jaw tips with the gripper open (fixed jaw inner face x = -0.008, the moving one ~32 mm away at
+# ``gripper_open_above_closed``): the most clearance on BOTH sides (16 mm each) when the die's yaw is unknown (a 16 mm
+# cube at 45 deg is 22.6 mm across; 4.7 mm clearance per side). The real-arm feasibility gate (rl/feasibility.py)
+# uses it: the HSV tracker reports no yaw.
+JAW_MIDPOINT_GRIPPER: Final[tuple[float, float, float]] = (0.008, 0.0, -0.094)
 
 
 class Phase(IntEnum):
@@ -127,6 +133,9 @@ class ScriptedDieConfig:
     w_axis: float = 0.02  # residual weights (metres per unit): gripper z axis vs world +z, jaw yaw (rad)
     w_yaw: float = 0.03
     fd_eps_rad: float = 1e-4
+    # G in the gripper body frame (default: 4 mm off the fixed jaw, the sim demos; JAW_MIDPOINT_GRIPPER for an
+    # unknown die yaw)
+    grasp_point_gripper: tuple[float, float, float] = GRASP_POINT_GRIPPER
 
 
 def gripper_fk(chain_T: tuple[torch.Tensor, torch.Tensor], q: torch.Tensor) -> torch.Tensor:
@@ -249,7 +258,7 @@ class ScriptedDieController:
         qa = self._ticks_to_rad(torch.stack([self.tick_lo, self.tick_hi])[:, :N_ARM_JOINTS])
         self._q_lo, self._q_hi = torch.minimum(qa[0], qa[1]), torch.maximum(qa[0], qa[1])
         self.max_delta = torch.as_tensor(np.asarray(cfg.action.max_delta_ticks, np.float64), dtype=f64, device=dev)
-        self._g_local = torch.tensor(GRASP_POINT_GRIPPER, dtype=f64, device=dev)
+        self._g_local = torch.tensor(p.grasp_point_gripper, dtype=f64, device=dev)
         self._retreat = torch.tensor(p.retreat_ticks, dtype=torch.int64, device=dev)
         z = p.table_z_m
         self._place_xy = torch.tensor([p.zone_xy_m[0] + p.place_offset_xy_m[0], p.zone_xy_m[1] + p.place_offset_xy_m[1]],

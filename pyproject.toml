@@ -149,6 +149,7 @@ eval-sim = { cmd = "python -m so101_rl.rl.eval_sim", env = { MUJOCO_GL = "egl" }
 export-policy = "python -m so101_rl.rl.policy_export"
 deploy-policy = "python -m so101_rl.rl.deploy_policy"   # M7: attaches to a RUNNING servo; --attended on the real arm
 train-reach-sac = "python -m so101_rl.rl.train_sac_her"   # S5.2: SB3 SAC + HER fine-tune from a policy export (--backend sim)
+feasibility-gate = "python -m so101_rl.rl.feasibility"   # Phase 4 feasibility gate (reach / grasp height / scripted >= 30 %); attended, a RUNNING servo + perception
 lab-mcp = "python -m so101_rl.lab.mcp_server"   # stdio MCP server (.mcp.json); jobs run as transient user units
 lab = "python -m so101_rl.lab.cli"   # status | stop <run> | gate-sign <run>
 # Planned tasks: each is added in the same commit that creates its module, so `pixi task list` never advertises a
