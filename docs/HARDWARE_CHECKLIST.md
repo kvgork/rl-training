@@ -564,6 +564,61 @@ arm torque-off for the user.
   unfreeze the actor on the arm. Resume a rolled-back run from `best_policy.pt`, not `model.zip`'s actor.
 - **Shown-to-fail:** step 1 without `--attended` against the feetech servo must refuse (exit 2) with no motion.
 
+## Phase 4 feasibility gate (D4; `feasibility-gate`, software ready)
+
+Added 2026-10-21 (plan Phase 4 "[v2] Feasibility gate"; plan §10 2026-10-21 "Phase 4 feasibility-gate runner";
+ARCHITECTURE 0.66; `plans/die-to-zone-plan.md` D4). Attended (Tier 0: your hand on the e-stop or the servo power switch).
+The gate the plan sets before any die training on the real arm: the reach to the start regions and the zone, the
+minimum graspable height, and scripted IK seeds at >= 30 % success on the real arm (otherwise they are not used).
+
+- **Parts:** the arm on its clamp, the 16 mm red die, the taped 60 mm zone at (0.15, -0.13), the 50 mm fiducial, the
+  calibrated D435, foam under the reach space, a clear black table (no other red / orange objects on it).
+- **Needs:** HS4 (reach policy on the real arm: the 3 mm policy, 70/70), the perception process on the real D435 (D3,
+  with the arm mask) and `calib/fiducial.yaml` (H8 fiducial). H8 hand-eye did NOT pass; the arm-shape camera pose is
+  kept (plan §10 2026-10-21), so perception may be off by ~1-2 cm in places (see the risk below). No tray (H9): the
+  die is placed by hand before every trial.
+- **Dry run first (sim twin, no hardware):** terminal 1 `pixi run -e cpu python scripts/feasibility_sim_servo.py
+  --object-table so101_objects_sim --control runs/feasibility-sim/ctl --auto-operator runs/feasibility-sim
+  so101_rl.servo.main --backend mujoco --shm-name so101_sim`; terminal 2 at once `pixi run -e cpu feasibility-gate
+  --shm-name so101_sim --object-table so101_objects_sim --out-root runs/feasibility-sim --trials 6`. The twin's
+  operator places the die at each printed target (random yaw) and confirms; expect exit 0 and PASS.
+- **Procedure (no-watchdog variant; with the MCU: start the servo with `--heartbeat-port`, press the button after
+  step 3):**
+  1. Terminal 1, arm at rest, BEFORE anything else (plan §10 2026-10-17 "Perception order"): `pixi run -e cpu
+     perception`. Wait until it writes (the die visible on the table, fiducial OK).
+  2. Terminal 2: `pixi run -e cpu feasibility-gate --attended --accept-no-watchdog` (all three protocols; or one at a
+     time with `--protocol reach`, `--protocol grasp-height`, `--protocol scripted`, each with a fresh servo). It
+     prints `looking for the servo`.
+  3. Terminal 3, within 120 s: `pixi run -e robot servo --backend feetech --no-mcu --tick-log
+     runs/feasibility/ticks-<ts>.bin --summary runs/feasibility/servo-<ts>.json`. The arm ramps home.
+  4. **reach** (no die needed): the tip goes 4 cm above the zone centre, the place point, the S2, S1 and S0 centres in
+     turn and holds 1 s at each. Watch S0 (nearest the base).
+  5. **grasp-height:** for each height (22, 18, 14.5, 12 mm) the arm goes home and the tool prints `place the die at
+     x = ..., y = ...` (the S0 centre). Put the die there (any yaw, roughly: perception measures it), take your hand
+     out of the camera view, press Enter in terminal 2 (or `touch <run dir>/die_ready`). The arm grasps, lifts, puts
+     the die back and retreats. Cut power at once if a jaw presses into the table.
+  6. **scripted:** 20 trials, S0 / S1 / S2 in turn; place the die at each printed target the same way. Do not touch
+     the die during a trial, even when it is pushed off.
+  7. When it ends (or halts), Ctrl-C the servo (normal shutdown to rest), then perception.
+- **Halts (exit 1; a human must look, then start a new run):** any trip or stalled servo, perception stale (> 1 s) or
+  the fiducial not OK, the die invisible on > 50 % of a trial's steps, the die not seen steadily before a grasp, a
+  failed reset. There is no `--resume`: rerun the protocol that halted.
+- **Artifact:** `runs/feasibility/<ts>/{trials.jsonl, summary.json}` + the servo tick log.
+- **Pass:** `summary.json` `reach.successes` = all points (reach error within the 3 mm policy's radius) and every
+  `ik.grasp` residual < 1 mm; `grasp_height.lowest_lifted_grasp_h_m` reported (the minimum graspable height: the
+  lowest height that lifted the die without a trip); `scripted.status` **PASS** = all 20 trials ran without a halt
+  and >= 6 / 20 succeeded (the plan's 30 %; `wilson95` is reported beside it). Fill the results table. A FAIL means
+  the scripted seeds are not used on the real arm (plan Phase 4).
+- **Risk (read first):** the jaw opening is ~32 mm and the die 16 mm: with the jaw midpoint on the die there is 8 mm
+  of clearance per side square-on and 4.7 mm at the worst yaw (45 deg). The camera may be off 1-2 cm (H8 not
+  passed), more than that clearance: a jaw can land on the die (`knocked`, a retry after 45 deg, or a STUCK trip).
+  In sim (twin, fake perception with a fixed camera-like bias, 9 trials S0/S1/S2, random yaw): no bias 9/9;
+  +10 mm x 8/8, -10 mm x 7/9, +10 mm y 4/9, -10 mm y 6/9, 7 mm / 7 mm 5/9, +15 mm x 7/9, +20 mm x 0/4 and a
+  STUCK trip (plan §10 2026-10-21). If the scripted gate fails with most failures `knocked` /
+  `attempts_exhausted` on one side, the joint camera + joint-zero calibration (plan §10 2026-10-21 H8 row) is the fix.
+- **Shown-to-fail:** step 2 without `--attended` against the feetech servo must refuse (exit 2) with no motion;
+  `--grasp-heights 0.009` must refuse (exit 2).
+
 ## HS6 - Zero-shot die-to-zone eval on the real arm (software ready, not runnable yet)
 
 Added 2026-10-16 (plan §10 "Die support in deploy-policy (D5)"; ARCHITECTURE 0.62; sim plan HS6). Attended.
