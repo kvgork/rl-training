@@ -569,6 +569,11 @@ def _write_summary(path: Path, doc: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None, *, camera: Camera | None = None) -> int:
     a = build_parser().parse_args(argv)
+    # one OpenCV thread: its default pool spun ~14 of 16 cores and starved the servo loop (no SCHED_FIFO on the
+    # host; the servo state went stale on the real arm, 2026-10-23). The pixi task also caps the BLAS / OpenMP pools.
+    import cv2
+
+    cv2.setNumThreads(1)
     started = _dt.datetime.now().astimezone()
     summary_path = a.summary if a.summary is not None else RUNS / f"{started:%Y%m%d-%H%M%S}.json"
     doc: dict[str, Any] = {"started": started.isoformat(timespec="seconds"), "shm_name": a.shm_name, "backend": a.backend}

@@ -770,6 +770,43 @@ def wait_for_run(backend: Any, timeout_s: float, log: Any = None, period_s: floa
 
 
 @contextlib.contextmanager
+def zero_delta_keepalive(backend: Any, period_s: float = 0.1) -> Iterator[None]:
+    """A zero-delta RUN command every ``period_s`` from a helper thread while the arm must stay still IN RUN (an
+    operator wait between episodes). Not HOLD: inside RUN a HOLD keeps the servo alive but its stuck monitor keeps
+    seeing the last policy / reset delta with the arm still and trips STUCK after 3 s (the 2026-10-16 point_tip hold
+    and the 2026-10-23 feasibility manual-reset wait). A zero delta moves nothing and resets the stuck count."""
+    from so101_rl.config import N_JOINTS
+    from so101_rl.servo.shm import new_state
+
+    stop = threading.Event()
+    zero = np.zeros(N_JOINTS, dtype=np.float32)
+
+    def _run() -> None:
+        st = new_state()
+        warned = False
+        t_next = time.monotonic()
+        while not stop.is_set():
+            try:
+                seq = int(st["seq"][0]) if backend.read_state(st) else 0
+                backend.send_delta(zero, seq, int(getattr(backend, "episode", 0)))
+            except Exception:  # noqa: BLE001 - the servo's stale-command stop handles the arm if this fails
+                if not warned:
+                    print("deploy-policy: zero-delta keep-alive could not write the shm command", file=sys.stderr,
+                          flush=True)  # fmt: skip
+                    warned = True
+            t_next += period_s
+            stop.wait(max(0.0, t_next - time.monotonic()))
+
+    t = threading.Thread(target=_run, name="zero-delta-keepalive", daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join()
+
+
+@contextlib.contextmanager
 def hold_keepalive(backend: Any, period_s: float = 0.1, *, on_late: Callable[[float], None] | None = None,
                    late_s: float = 0.15) -> Iterator[None]:
     """A HOLD command every ``period_s`` from a helper thread while the caller does slow set-up after the attach
@@ -1169,7 +1206,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
                 try:
                     if gate is not None:  # arm home and held, then the operator places the die (attended)
                         backend.reset(np.asarray(cfg.safe_state.home_ticks))
-                        with hold_keepalive(backend):
+                        with zero_delta_keepalive(backend):  # not HOLD: STUCK after 3 s in RUN
                             gate.wait(i)
                     if die:
                         check_object_table(table, str(table_name))
