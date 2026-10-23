@@ -475,3 +475,60 @@ def test_main_no_arm_mask_flag(scene, tmp_path):
 
     doc = json.loads(out.read_text())
     assert rc == 0 and doc["arm_mask"]["enabled"] is False and "--no-arm-mask" in doc["arm_mask"]["reason"]
+
+
+# ------------------------------------------------------------------------------------------------ the plane check
+# (plan §10 2026-10-23): the camera-moved table-plane refit leaves the arm mask's pixels out. On the real rig the arm
+# low over the table corrupted the refit (a false 2.25 deg / 12.6 mm from 1741 points latched fiducial_ok off). A
+# clean MuJoCo depth render does not reproduce the D435's mixed pixels, so they are put in: inside the arm's
+# silhouette the depth reads as a surface tilted about the table, within the refit's bands.
+def _mixed_pixels(calib, depth: np.ndarray, mask: np.ndarray, k: float = 0.03) -> np.ndarray:
+    c = calib.color
+    v, u = np.mgrid[0 : c.height, 0 : c.width]
+    rays = np.stack([(u - c.cx) / c.fx, (v - c.cy) / c.fy, np.ones_like(u, dtype=np.float64)], axis=-1)
+    z_table = -calib.table_plane.height_m / (rays @ np.asarray(calib.table_plane.normal_color))
+    out = depth.copy()
+    vc = v[mask].mean()
+    out[mask] = (z_table * (1.0 - k * (v - vc) / 100.0))[mask]
+    return out
+
+
+@pytest.fixture(scope="module")
+def arm_over_table(scene, masker):
+    q = scene.ik_down(np.array([0.20, 0.0, 0.03]), 0.8)  # the jaws 3 cm over the table, the forearm across it
+    scene.pose(q)
+    rgb, depth = scene.render()
+    m = masker.mask(q, depth)
+    return q, rgb, depth, _mixed_pixels(scene.calib, depth, m), m
+
+
+def test_plane_check_leaves_the_arm_out(scene, arm_over_table):
+    _q, _rgb, depth, bad, m = arm_over_table
+    chk = pp.TablePlaneCheck(scene.calib)
+    assert m.sum() > 20_000 and chk.check(depth).ok  # the clean render passes with or without the mask
+    plain = chk.check(bad)
+    assert not plain.ok  # the arm's mixed pixels drag the refit off: a false "camera moved"
+    masked = chk.check(bad, m)
+    assert masked.ok and masked.angle_deg < 0.5 and abs(masked.dh_m) < 0.001 and masked.n_points >= pp.PLANE_MIN_POINTS
+
+
+def test_loop_feeds_the_arm_mask_to_the_plane_check(scene, arm_over_table, table, calibration):
+    """Through ``PerceptionLoop``: with fresh joint state the arm mask goes into the plane check and fiducial_ok stays
+    set over PLANE_TRIP_AFTER checks; without it the same frames latch the gate off (the session's false trip)."""
+    from fiducial_synth import SequenceCamera
+
+    q, rgb, _depth, bad, _m = arm_over_table
+    for masked in (True, False):
+        cam = SequenceCamera(scene.calib, lambda: (rgb, bad))
+        cam.start()
+        arm = ArmMaskSource(ArmMasker(scene.calib), _Joints(_ticks(q, calibration) if masked else None, "stale"),
+                            calibration)  # fmt: skip
+        gate = pp.CameraMovedGate(pp.TablePlaneCheck(scene.calib))
+        loop = pp.PerceptionLoop(cam, scene.calib, table, gate=gate, plane_every=1, arm=arm)
+        for _ in range(pp.PLANE_TRIP_AFTER):
+            loop.step()
+        rep = loop.summary()["camera_check"]["table_plane"]
+        if masked:
+            assert gate.ok and rep["arm_masked_checks"] == pp.PLANE_TRIP_AFTER and rep["fails"] == 0
+        else:
+            assert not gate.ok and rep["tripped"] and rep["arm_masked_checks"] == 0

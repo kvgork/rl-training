@@ -46,7 +46,14 @@ class MujocoBus(Bus):
         *,
         action_delay_ticks: int = 0,
         seed: int = 0,
+        deadband_ticks: Sequence[int] | None = None,
     ) -> None:
+        """``deadband_ticks`` [6] (default None = none): the servo deadband as D-BACKLASH target hysteresis
+        (``sim/sysid/params.py`` ``apply_deadband``, the sysid replay's rule): the goal the actuator holds moves only
+        when the written goal leaves ``±band`` around it, and then follows it to the band edge; it starts at the
+        present position on the first write after construction, a keyframe reset or a torque enable. Applied after
+        the position-limit clamp, before the delay FIFO. The feasibility twin turns it on with the measured values
+        (``scripts/feasibility_sim_servo.py``, plan §10 2026-10-23); everything else runs without it."""
         if action_delay_ticks < 0:
             raise ValueError("action_delay_ticks must be >= 0")
         self.model = model
@@ -55,6 +62,11 @@ class MujocoBus(Bus):
         self.cfg = cfg
         self.action_delay_ticks = action_delay_ticks
         self.rng = np.random.default_rng(seed)
+        band = np.zeros(N_JOINTS, np.int64) if deadband_ticks is None else np.asarray(deadband_ticks, np.int64)
+        if band.shape != (N_JOINTS,) or (band < 0).any():
+            raise ValueError(f"deadband_ticks must be {N_JOINTS} values >= 0, got {deadband_ticks}")
+        self.deadband_ticks = band
+        self._held: np.ndarray | None = None  # the deadband's held goal (raw ticks); None = start from present
 
         self._jnt = [model.joint(n) for n in JOINT_NAMES]
         self.qpos_adr = np.array([j.qposadr[0] for j in self._jnt], dtype=np.intp)
@@ -153,6 +165,13 @@ class MujocoBus(Bus):
         lo_t = np.array([self._regs[("Min_Position_Limit", i)] for i in self._ids], dtype=np.int32)
         hi_t = np.array([self._regs[("Max_Position_Limit", i)] for i in self._ids], dtype=np.int32)
         goal = np.clip(raw, lo_t, hi_t)
+        if self.deadband_ticks.any():
+            b = self.deadband_ticks
+            g64 = goal.astype(np.int64)
+            held = self.q_to_ticks(self.data.qpos[self.qpos_adr]).astype(np.int64) if self._held is None else self._held
+            held = np.where(g64 > held + b, g64 - b, np.where(g64 < held - b, g64 + b, held))
+            self._held = held
+            goal = held.astype(np.int32)
         if self.action_delay_ticks:
             if not self._delay:  # first write: until the first goal arrives the arm holds where it is
                 hold = self.q_to_ticks(self.data.qpos[self.qpos_adr])
@@ -172,6 +191,7 @@ class MujocoBus(Bus):
         for i in idx:
             a = self.act_ids[i]
             if enabled:
+                self._held = None  # re-energised: the deadband starts again from the present position
                 self.model.actuator_gainprm[a] = self._saved_gain[i]
                 self.model.actuator_biasprm[a] = self._saved_bias[i]
             else:
@@ -241,6 +261,7 @@ class MujocoBus(Bus):
         self._delay.clear()
         self.written_goals.clear()
         self._goal = None
+        self._held = None
 
     def _restore_gains(self) -> None:
         self.model.actuator_gainprm[self.act_ids] = self._saved_gain

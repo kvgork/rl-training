@@ -3,6 +3,7 @@ by the SIM die pose, plus "hand placement" of the die.
 
     pixi run -e cpu python scripts/feasibility_sim_servo.py --object-table so101_objects --control /tmp/feas \\
         [--auto-operator runs/feasibility] [--bias-xy 0.01 0] [--hide-lifted] [--seed 0] \\
+        [--deadband-ticks 32 14 16 12 9 9 | --no-deadband] \\
         so101_rl.servo.main --backend mujoco --shm-name so101
 
 Everything after ``so101_rl.servo.main`` is the servo's own command line, unchanged: ``feasibility-gate`` (like
@@ -13,6 +14,11 @@ two hooks run in the servo thread between physics steps (never during one):
 * **fake perception:** about every 33 ms the object table (``--object-table``, created here, single writer) gets the
   die's TRUE centroid from the MuJoCo state (``--bias-xy`` adds a fixed camera-like error), visible (``--hide-lifted``:
   not visible while the die is > 8 mm off the table, as if the gripper hid it), fiducial OK, timestamped now.
+* **servo deadband** (plan §10 2026-10-23): the sim servo holds its goal with the STS3215 deadband as target
+  hysteresis (``MujocoBus(deadband_ticks=...)``, the sysid replay's D-BACKLASH rule), default the measured
+  [32, 14, 16, 12, 9, 9] ticks (plan §10 2026-10-11, ``MEASURED_DEADBAND_TICKS``): the twin then settles short of a
+  resting command like the real arm (the first real session's ``open_above_timeout``). ``--no-deadband`` (or
+  ``--deadband-ticks 0 0 0 0 0 0``) gives the ideal servo of the earlier twin.
 * **placement:** a ``<control>/place.json`` ``{"x", "y", "yaw"}`` puts the die there at rest (the operator's hand) and
   writes ``<control>/placed.json``.
 
@@ -94,6 +100,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bias-xy", type=float, nargs=2, default=(0.0, 0.0))
     ap.add_argument("--hide-lifted", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--deadband-ticks", type=int, nargs=6, default=None,
+                    help="sim servo deadband per joint (default: the measured MEASURED_DEADBAND_TICKS)")
+    ap.add_argument("--no-deadband", action="store_true", help="an ideal servo (no deadband)")
     args = ap.parse_args(argv[:i])
     servo_argv = argv[i + 1 :]
     if "--backend" not in servo_argv or servo_argv[servo_argv.index("--backend") + 1] != "mujoco":
@@ -104,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import so101_rl.servo.main as sm
     import so101_rl.sim.model as simmodel
+    import so101_rl.sim.mujoco_bus as simbus
     from so101_rl.env.tasks import DIE_HALF_EDGE_M
     from so101_rl.perception.object_table import ObjectTableShm, new_object_table, set_object
 
@@ -120,6 +130,18 @@ def main(argv: list[str] | None = None) -> int:
         return model, data
 
     simmodel.load_model = load_model
+    from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS
+
+    band = (0,) * 6 if args.no_deadband else tuple(args.deadband_ticks or MEASURED_DEADBAND_TICKS)
+    base_bus = simbus.MujocoBus
+
+    class DeadbandMujocoBus(base_bus):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **k):
+            k.setdefault("deadband_ticks", band)
+            super().__init__(*a, **k)
+
+    simbus.MujocoBus = DeadbandMujocoBus
+    print(f"feasibility_sim_servo: servo deadband {list(band)} ticks", file=sys.stderr, flush=True)
     rec = new_object_table()
     bias = np.asarray(args.bias_xy, float)
     z_rest = simmodel.TABLE_Z_M + DIE_HALF_EDGE_M

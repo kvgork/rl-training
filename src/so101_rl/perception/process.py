@@ -2,7 +2,7 @@
 
 ``pixi run perception [--backend d435|sim] [--shm-name so101_objects] [--rate-hz 30] [--max-frames N]
 [--duration-s S] [--summary PATH] [--allow-provisional] [--no-plane-check] [--fiducial-yaml calib/fiducial.yaml]
-[--no-fiducial-check] [--servo-shm so101_servo] [--no-arm-mask]``
+[--no-fiducial-check] [--plane-defers-to-fiducial] [--servo-shm so101_servo] [--no-arm-mask]``
 
 One OS process, the single writer of the object table (``perception/object_table.py``); the policy process
 (``So101GoalEnv(object_table=ObjectTableShm.attach(name))``) reads it. It never touches the serial bus; the servo shm
@@ -49,7 +49,12 @@ turns a stalled table into "not visible". No good frame for ``--camera-timeout-s
 - :class:`TablePlaneCheck`: the depth pixels (every 4th row / column) within 30 mm of ``camera.yaml``'s
   ``table_plane`` are refitted (SVD), then those within 15, 8 and 8 mm of each refit; the last refit must agree with
   the calibrated plane to <= 1 deg and <= 5 mm, from >= 500 points (sim: a 1.5 deg pitch or a 5 mm lift fails, the
-  calibrated scene reads 0.23 deg / 0.0 mm). It sees the camera's height, roll and pitch only (3 of 6 DOF).
+  calibrated scene reads 0.23 deg / 0.0 mm). It sees the camera's height, roll and pitch only (3 of 6 DOF). When
+  the arm mask is active for the frame, the depth pixels inside it are left out of the fit (plan §10 2026-10-23: the
+  arm low over the table corrupted the refit on the real rig, a false 2.25 deg / 12.6 mm from 1741 points latched
+  ``fiducial_ok`` off); the summary counts the masked checks. ``--plane-defers-to-fiducial`` (off by default: a 5 mm
+  lift moves the marker's corners < 1 px, which only the plane sees) skips the plane check whenever the fiducial
+  check of the same update found the marker and passed (counted as ``deferred``; a latched plane stays latched).
 - the ArUco fiducial (H8; ``perception/fiducial.py`` ``FiducialCheck``, plan §5 camera-moved gate, plan §10
   2026-10-17 "H8 software"), when ``--fiducial-yaml`` (default ``calib/fiducial.yaml``, written by
   ``pixi run fiducial-capture``) exists: marker found and mean corner error <= ``tol_px`` (2) = pass; found and off =
@@ -157,9 +162,12 @@ class TablePlaneCheck:
         self._sl = (slice(0, c.height, stride_px), slice(0, c.width, stride_px))
         self._rays = np.stack([(u - c.cx) / c.fx, (v - c.cy) / c.fy, np.ones_like(u, dtype=np.float64)], axis=-1)
 
-    def check(self, depth_m: np.ndarray) -> PlaneReport:
+    def check(self, depth_m: np.ndarray, exclude: np.ndarray | None = None) -> PlaneReport:
+        """``exclude`` bool [h, w] (the arm mask): those pixels are left out of the fit."""
         z = np.asarray(depth_m[self._sl], dtype=np.float64)
         ok = np.isfinite(z) & (z > 0.1) & (z < 2.0)
+        if exclude is not None:
+            ok &= ~np.asarray(exclude[self._sl], dtype=bool)
         pts = self._rays[ok] * z[ok, None]
         n, h = self.n0, self.h0
         sel = np.zeros(0, bool)
@@ -243,17 +251,23 @@ class CameraMovedGate:
     is no evidence: it changes nothing; before any evidence the fiducial does not block). ``trip_after`` consecutive
     failures of either check latch the gate (until the process restarts); for the fiducial, checks without evidence
     neither reset nor extend the run of failures. ``plane is None`` (``--no-plane-check``) and ``fiducial is None``
-    (no ``calib/fiducial.yaml`` / ``--no-fiducial-check``) = that half always ok, recorded as disabled."""
+    (no ``calib/fiducial.yaml`` / ``--no-fiducial-check``) = that half always ok, recorded as disabled. ``exclude``
+    (the arm mask of the frame) is left out of the plane fit. ``plane_defers_to_fiducial``: a fiducial check of the
+    same update that found the marker and passed stands in for the plane check (module docstring)."""
 
     plane: TablePlaneCheck | None
     fiducial: FiducialCheck | None = None
     trip_after: int = PLANE_TRIP_AFTER
     fiducial_disabled_reason: str = FIDUCIAL_STATUS
+    plane_defers_to_fiducial: bool = False
     checks: int = 0
+    masked_checks: int = 0
+    deferred: int = 0
     fails: int = 0
     consecutive: int = 0
     tripped: bool = False
     last: PlaneReport | None = None
+    last_deferred: bool = False
     worst_angle_deg: float = 0.0
     worst_dh_m: float = 0.0
     fid: FiducialGateState | None = field(default=None, init=False)
@@ -265,18 +279,18 @@ class CameraMovedGate:
     def plane_ok(self) -> bool:
         if self.plane is None:
             return True
-        return not self.tripped and self.last is not None and self.last.ok
+        return not self.tripped and (self.last_deferred or (self.last is not None and self.last.ok))
 
     @property
     def ok(self) -> bool:
         return self.plane_ok and (self.fid is None or self.fid.ok)
 
-    def update(self, depth_m: np.ndarray, rgb: np.ndarray | None = None) -> bool:
-        if self.plane is not None:
-            self._update_plane(depth_m)
+    def update(self, depth_m: np.ndarray, rgb: np.ndarray | None = None, exclude: np.ndarray | None = None) -> bool:
+        fid_pass = False
         if self.fid is not None and rgb is not None:
             f = self.fid
             r = f.update(rgb)
+            fid_pass = bool(r.found and r.ok and not f.tripped)
             if r.found and not r.ok and f.consecutive >= self.trip_after and not f.tripped:
                 f.tripped = True
                 print(
@@ -284,13 +298,22 @@ class CameraMovedGate:
                     f"{f.consecutive} checks in a row): fiducial_ok latched off; recalibrate (H8) and restart",
                     file=sys.stderr,
                 )
+        if self.plane is not None:
+            if self.plane_defers_to_fiducial and fid_pass:
+                self.deferred += 1
+                self.last_deferred = True
+                self.consecutive = 0
+            else:
+                self.last_deferred = False
+                self._update_plane(depth_m, exclude)
         return self.ok
 
-    def _update_plane(self, depth_m: np.ndarray) -> None:
+    def _update_plane(self, depth_m: np.ndarray, exclude: np.ndarray | None = None) -> None:
         assert self.plane is not None
-        r = self.plane.check(depth_m)
+        r = self.plane.check(depth_m, exclude)
         self.last = r
         self.checks += 1
+        self.masked_checks += int(exclude is not None)
         if r.ok:
             self.consecutive = 0
             self.worst_angle_deg = max(self.worst_angle_deg, r.angle_deg)
@@ -315,6 +338,9 @@ class CameraMovedGate:
                 "checks": self.checks,
                 "fails": self.fails,
                 "tripped": self.tripped,
+                "arm_masked_checks": self.masked_checks,
+                "defers_to_fiducial": self.plane_defers_to_fiducial,
+                "deferred": self.deferred,
                 "last_ok": None if last is None else last.ok,
                 "last_angle_deg": None if last is None or not math.isfinite(last.angle_deg) else last.angle_deg,
                 "last_dh_mm": None if last is None or not math.isfinite(last.dh_m) else last.dh_m * 1e3,
@@ -447,14 +473,14 @@ class PerceptionLoop:
         if self._last_t is not None:
             s.interval_ms.append((fr.t_mono_ns - self._last_t) / 1e6)
         self._last_t = fr.t_mono_ns
+        exclude = self.arm.mask(self._depth) if self.arm is not None else None
         if s.processed % self.plane_every == 0:
-            self.gate.update(self._depth, self._rgb)
+            self.gate.update(self._depth, self._rgb, exclude)  # the arm's pixels stay out of the plane fit
         s.processed += 1
 
         visible = False
         tr = self.tracker
         before, before_arm = tr.rejected, tr.rejected_excluded
-        exclude = self.arm.mask(self._depth) if self.arm is not None else None
         det = tr.detect(self._rgb, self._depth, accept=self._on_table, exclude=exclude)
         s.out_of_workspace += tr.rejected - before  # red / orange blobs off the table, skipped
         s.on_arm += tr.rejected_excluded - before_arm  # red / orange blobs on the arm itself, skipped
@@ -549,6 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fiducial-yaml", type=Path, default=FIDUCIAL_YAML,
                     help="the ArUco camera-moved fiducial (checked when the file exists; H8 fiducial-capture)")
     ap.add_argument("--no-fiducial-check", action="store_true", help="disable the fiducial camera-moved check")
+    ap.add_argument("--plane-defers-to-fiducial", action="store_true", help="skip the table-plane check while the "
+                    "fiducial check of the same update finds the marker and passes")  # fmt: skip
     ap.add_argument("--camera-timeout-s", type=float, default=CAMERA_TIMEOUT_S)
     ap.add_argument("--servo-shm", default=None, help="servo state shm to read the arm mask's joint ticks from "
                     "(read-only; default so101.yaml shm_name)")  # fmt: skip
@@ -590,7 +618,8 @@ def main(argv: list[str] | None = None, *, camera: Camera | None = None) -> int:
         pose = calib.require_pose(calibrated=not a.allow_provisional)
         fiducial, fid_reason = load_fiducial(a, calib)
         gate = CameraMovedGate(None if a.no_plane_check else TablePlaneCheck(calib), fiducial,
-                               fiducial_disabled_reason=fid_reason)  # fmt: skip
+                               fiducial_disabled_reason=fid_reason,
+                               plane_defers_to_fiducial=a.plane_defers_to_fiducial)  # fmt: skip
         tracker = HsvDepthDieTracker.from_camera_calib(calib, a.hsv_yaml)
     except (CameraNotCalibrated, FileNotFoundError, ValueError, TypeError, KeyError, AttributeError) as e:
         return finish(EXIT_CALIB, f"calibration refused: {e}")

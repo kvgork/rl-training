@@ -208,6 +208,149 @@ def test_sample_die_drops_a_stray_read():
     assert not s.ok() and s.inliers < s.visible / 2
 
 
+# ------------------------------------------------------------------------------------------------ deadband + near base
+# (plan §10 2026-10-23 "Scripted grasp: deadband compensation; twin deadband; near-base refusal"): run_die_trial on an
+# in-process sim twin (SimBackend: ServoCore + MujocoBus in simulated time) with an object table fed by the sim die
+# pose, the servo deadband switched on the bus
+
+
+PAN_XY = (0.0388, 0.0)  # the shoulder_pan axis in the base frame (so101_kinematics.yaml)
+S2_ZONE_SIDE = (0.2105, -0.099)  # the centre of S2's zone-side strip (the default grasp stage), 0.20 m from the pan axis
+NEAR_ZONE = (0.212, -0.101)  # an S2 table point by the zone
+
+
+class _SimTable:
+    """The object table of the in-process twin: the TRUE die pose, visible, fiducial OK, stamped with the sim clock."""
+
+    def __init__(self, backend) -> None:
+        from so101_rl.sim import model as simmodel
+
+        j = backend.model.joint(simmodel.DIE_JOINT)
+        self.be, self.q, self.v = backend, int(j.qposadr[0]), int(j.dofadr[0])
+        self.rec = new_object_table()
+
+    def read(self, out) -> bool:
+        from so101_rl.perception.object_table import set_object
+
+        now = self.be.clock.monotonic_ns()
+        self.rec["n"][0] = 0
+        set_object(self.rec, 0, "die", self.be.data.qpos[self.q : self.q + 3].copy(), 0.9, True, now)
+        self.rec["t_mono_ns"][0], self.rec["fiducial_ok"][0] = now, 1
+        out[:] = self.rec
+        return True
+
+    def place(self, x: float, y: float, yaw: float) -> None:
+        import mujoco
+
+        from so101_rl.env.tasks import DIE_HALF_EDGE_M
+        from so101_rl.sim.model import TABLE_Z_M
+
+        d = self.be.data
+        d.qpos[self.q : self.q + 3] = (x, y, TABLE_Z_M + DIE_HALF_EDGE_M)
+        d.qpos[self.q + 3 : self.q + 7] = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+        d.qvel[self.v : self.v + 6] = 0.0
+        mujoco.mj_forward(self.be.model, d)
+
+
+def _sim_trial(cfg, calibration, xy, *, deadband: bool, comp: bool, grasp_h=None, yaw=0.4, max_steps=200):
+    """One die trial (run_die_trial) at ``xy`` on the in-process twin; the die is put there after the home reset."""
+    import dataclasses
+
+    from so101_rl.env.backend import SimBackend
+    from so101_rl.env.goal_env import So101GoalEnv
+    from so101_rl.env.tasks import DIE_HALF_EDGE_M
+    from so101_rl.rl.scripted import ScriptedDieController
+    from so101_rl.sim.model import TABLE_Z_M
+    from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS
+
+    be = SimBackend(cfg, calibration)
+    be.bus.deadband_ticks = np.asarray(MEASURED_DEADBAND_TICKS if deadband else (0,) * 6, np.int64)
+    tab = _SimTable(be)
+    task = dataclasses.replace(DIE_TO_ZONE, episode_steps=max_steps,
+                               trip_penalty=DIE_TO_ZONE.trip_penalty * max(1.0, max_steps / DIE_TO_ZONE.episode_steps))
+    env = So101GoalEnv(be, cfg, task, object_table=tab)
+    reset = env.reset
+
+    def reset_and_place(*a, **k):
+        out = reset(*a, **k)
+        tab.place(xy[0], xy[1], yaw)  # the operator's hand, after the arm is home
+        return out
+
+    env.reset = reset_and_place
+    params = fz.controller_params(deadband_comp=comp, grasp_h=grasp_h, place_xy=xy if grasp_h is not None else None)
+    ctl = ScriptedDieController.from_calibration(cfg, calibration, 1, params=params)
+    st = fz.TrialSettings(max_steps=max_steps)
+    return fz.run_die_trial(env, ctl, [xy[0], xy[1], TABLE_Z_M + DIE_HALF_EDGE_M], st, zone_success=grasp_h is None)
+
+
+@pytest.fixture()
+def _torch_threads():
+    n = torch.get_num_threads()
+    torch.set_num_threads(2)
+    yield
+    torch.set_num_threads(n)
+
+
+def test_twin_deadband_reproduces_the_open_above_timeout_and_the_compensation_grasps(cfg, calibration, _torch_threads):
+    """The first real session in the twin: with the measured servo deadband the uncompensated controller never lines
+    up over a die 0.20 m out (``open_above_timeout``, as every real grasp-height trial); the compensated one lifts the
+    die at every default grasp height, and on an ideal servo both lift it."""
+    off = _sim_trial(cfg, calibration, S2_ZONE_SIDE, deadband=True, comp=False, grasp_h=0.0145)
+    assert off["end_reason"] == "open_above_timeout" and off["end_phase"] == "OPEN_ABOVE" and not off["grasp_success"]
+    for h in fz.DEFAULT_GRASP_HEIGHTS_M:
+        on = _sim_trial(cfg, calibration, S2_ZONE_SIDE, deadband=True, comp=True, grasp_h=h, yaw=0.7)
+        assert on["grasp_success"] and on["die_rise_while_held_m"] > 0.015, (h, on["end_reason"])
+        assert not on["tripped"] and on["end_phase"] == "DONE" and on["attempts"] == 1
+    ideal = [_sim_trial(cfg, calibration, S2_ZONE_SIDE, deadband=False, comp=c, grasp_h=0.012) for c in (False, True)]
+    assert all(t["grasp_success"] and not t["tripped"] for t in ideal)
+
+
+@pytest.mark.parametrize("xy", [S2_ZONE_SIDE, NEAR_ZONE, (0.20, 0.0)])
+def test_twin_scripted_trial_with_the_deadband(cfg, calibration, _torch_threads, xy):
+    """Scripted pick-and-place at S2 (zone side, by the zone, the far strip) with the deadband: fails without the
+    compensation, succeeds (grasped, in the zone, no trip) with it."""
+    off = _sim_trial(cfg, calibration, xy, deadband=True, comp=False)
+    assert not off["success"] and off["end_reason"] in ("open_above_timeout", "max_steps")
+    on = _sim_trial(cfg, calibration, xy, deadband=True, comp=True, yaw=1.1)
+    assert on["success"] and on["grasp_success"] and not on["pushed"] and not on["tripped"]
+    assert on["zone_error_m"] < 0.03
+
+
+def test_too_close_to_base_ends_the_trial_without_motion(cfg, calibration, _torch_threads):
+    """A die perceived inside the near-base blind spot (S0's centre, 0.11 m from the pan axis) is refused at once."""
+    s0 = tuple(fz.stage_centre(DIE_TO_ZONE, 0))
+    assert fz.pan_radius(s0, PAN_XY) < fz.MIN_PAN_RADIUS_M
+    t = _sim_trial(cfg, calibration, s0, deadband=True, comp=True)
+    assert t["end_reason"] == fz.TOO_CLOSE and t["steps"] == 0 and t["epilogue_steps"] == 0 and not t["success"]
+    assert t["die_pan_radius_m"] < fz.MIN_PAN_RADIUS_M and fz.trial_halt({**t, "trial": 0}) is None
+    s = fz.summarize_scripted([{**t, "stage": "S0"}], 1, halted=False)
+    assert s["too_close_to_base"] == 1 and s["successes"] == 0
+
+
+def test_default_positions_avoid_the_near_base_band(cfg, calibration):
+    from so101_rl.rl.scripted import ScriptedDieController
+
+    ctl = ScriptedDieController.from_calibration(cfg, calibration, 1, params=fz.controller_params())
+    np.testing.assert_allclose(ctl.pan_axis_xy(), PAN_XY, atol=1e-4)
+    args = fz.build_parser().parse_args([])
+    assert args.starts == "S2" and args.grasp_stage == "S2" and args.min_pan_radius == fz.MIN_PAN_RADIUS_M
+    assert not args.no_deadband_comp and fz.controller_params().deadband_comp
+    g = fz.stage_centre(DIE_TO_ZONE, fz._stage_index(args.grasp_stage, DIE_TO_ZONE))
+    assert g == pytest.approx(S2_ZONE_SIDE) and fz.pan_radius(g, PAN_XY) > 0.19
+    pos = fz.trial_positions(DIE_TO_ZONE, [0, 1, 2], 60, seed=7, pan_xy=PAN_XY, min_pan_radius=fz.MIN_PAN_RADIUS_M)
+    # S2 (both strips) is redrawn outside the band; S0 / S1, shrunk by the die's footprint, lie wholly inside it (at
+    # most 0.125 m from the pan axis): their draws are kept and the trials end too_close_to_base
+    assert all(p["pan_radius_m"] >= fz.MIN_PAN_RADIUS_M for p in pos if p["stage"] == "S2")
+    assert all(p["pan_radius_m"] < fz.MIN_PAN_RADIUS_M for p in pos if p["stage"] != "S2")
+    # S2 shrunk by the footprint is wholly outside (>= 0.139 m): the rule never redraws it, the seed fixes the same list
+    plain = fz.trial_positions(DIE_TO_ZONE, [2], 20, seed=7)
+    ruled = fz.trial_positions(DIE_TO_ZONE, [2], 20, seed=7, pan_xy=PAN_XY, min_pan_radius=fz.MIN_PAN_RADIUS_M)
+    assert [p["xy"] for p in plain] == [p["xy"] for p in ruled]
+    # a radius no S2 point meets: every draw is redrawn until the tries run out, then kept
+    far = fz.trial_positions(DIE_TO_ZONE, [2], 3, seed=7, pan_xy=PAN_XY, min_pan_radius=1.0, tries=5)
+    assert all(p["pan_radius_m"] < 1.0 for p in far)
+
+
 # ------------------------------------------------------------------------------------------------ refusals
 
 
@@ -281,7 +424,7 @@ def _fake_run(tmp_path, p, *extra, after=None):
 @pytest.mark.slow
 @pytest.mark.timeout(300)
 def test_die_not_seen_before_the_grasp_halts(tmp_path, command_log, perception):
-    p = perception(xyz=(0.138, -0.06, 0.0035), visible=False)
+    p = perception(xyz=(0.21, -0.099, 0.0035), visible=False)
     code, run, trials, summary, seen = _fake_run(tmp_path, p, "--trials", "3")
     assert code == fz.EXIT_HALTED and seen == [0] and trials == []
     assert summary["halt_reason"] == "die_not_seen" and summary["scripted"]["status"] == "INCOMPLETE"
@@ -293,7 +436,7 @@ def test_die_not_seen_before_the_grasp_halts(tmp_path, command_log, perception):
 def test_tracker_unknown_during_a_trial_halts(tmp_path, command_log, perception):
     """Visible during the pre-grasp window, then never again: the trial ends at --max-steps with the die UNKNOWN on
     > 50 % of its steps, and the run stops after it (the fake servo has no die: nothing is ever grasped)."""
-    p = perception(xyz=(0.138, -0.06, 0.0035))
+    p = perception(xyz=(0.21, -0.099, 0.0035))
 
     def hide(_k):
         time.sleep(0.6)  # after the 0.3 s window
@@ -303,7 +446,7 @@ def test_tracker_unknown_during_a_trial_halts(tmp_path, command_log, perception)
     assert code == fz.EXIT_HALTED and seen == [0] and len(trials) == 1
     t = trials[0]
     assert t["steps"] == 12 and t["visible_fraction"] < 0.5 and not t["success"] and not t["tripped"]
-    assert t["window"]["visible"] == t["window"]["reads"] and t["die_start_xyz"] == pytest.approx([0.138, -0.06, 0.0035], abs=1e-4)
+    assert t["window"]["visible"] == t["window"]["reads"] and t["die_start_xyz"] == pytest.approx([0.21, -0.099, 0.0035], abs=1e-4)
     assert summary["halt_reason"] == "tracker_unknown" and command_log[-1] == "HOLD"
 
 
@@ -312,7 +455,7 @@ def test_tracker_unknown_during_a_trial_halts(tmp_path, command_log, perception)
 def test_perception_stopping_inside_a_trial_halts(tmp_path, command_log, perception):
     """The perception process dies during trial 0: once its record is > 1 s old the trial stops at once
     (``perception_stale``), long before --max-steps; the last command is HOLD."""
-    p = perception(xyz=(0.138, -0.06, 0.0035))
+    p = perception(xyz=(0.21, -0.099, 0.0035))
 
     def kill(_k):
         time.sleep(0.6)
@@ -351,8 +494,8 @@ class TwinChild:
         return self.proc.wait()
 
 
-def _twin_run(tmp_path, *args, seed: int = 0, operator_delay_s: float = 0.0):
-    twin = TwinChild(tmp_path)
+def _twin_run(tmp_path, *args, seed: int = 0, operator_delay_s: float = 0.0, twin_args: tuple[str, ...] = ()):
+    twin = TwinChild(tmp_path, *twin_args)
     run_root = tmp_path / "feas"
     stop, placed = threading.Event(), []
     th = threading.Thread(target=_twin_module().auto_operator, args=(run_root, twin.control, stop),
@@ -372,25 +515,43 @@ def _twin_run(tmp_path, *args, seed: int = 0, operator_delay_s: float = 0.0):
 
 @pytest.mark.slow
 @pytest.mark.timeout(600)
-def test_full_loop_on_the_mujoco_twin_s0_and_a_grasp_height(tmp_path, command_log):
-    """The plan's measurement in sim: the scripted controller fed by the object table (perception's window average,
-    no yaw: the die is placed at a random yaw) succeeds from S0 for a fixed seed on CPU MuJoCo through the servo shm,
-    and the grasp-height protocol lifts a resting die at 12 mm. Every trial waited for the operator (thread)."""
+def test_full_loop_on_the_mujoco_twin_s2_and_a_grasp_height(tmp_path, command_log):
+    """The plan's measurement in sim, with the twin's default servo deadband (the measured values) and the default
+    deadband compensation: the scripted controller fed by the object table (perception's window average, no yaw: the
+    die is placed at a random yaw) succeeds from the default start S2 for a fixed seed on CPU MuJoCo through the servo
+    shm, and the grasp-height protocol lifts a resting die at 12 mm at the default grasp stage (S2's zone-side
+    centre). Every trial waited for the operator (thread)."""
     code, run, trials, summary, placed = _twin_run(tmp_path, "--protocol", "grasp-height,scripted", "--trials", "2",
-                                                   "--starts", "S0", "--grasp-heights", "0.012", "--seed", "7")  # fmt: skip
+                                                   "--grasp-heights", "0.012", "--seed", "7")  # fmt: skip
     assert code == fz.EXIT_OK, summary.get("halted")
     assert [k for k, _t, _p in placed] == [0, 1, 2] and all(p is not None for _k, _t, p in placed)
     g, *scripted = trials
-    assert g["protocol"] == "grasp-height" and g["grasp_success"] and g["die_rise_while_held_m"] > 0.02
-    assert not g["tripped"] and g["end_phase"] == "DONE"
+    assert g["protocol"] == "grasp-height" and g["grasp_success"] and g["die_rise_while_held_m"] > 0.015
+    assert not g["tripped"] and g["end_phase"] == "DONE" and g["stage"] == "S2"
     assert summary["grasp_height"]["lowest_lifted_grasp_h_m"] == 0.012
+    assert summary["trial_plan"]["controller"]["deadband_comp"] is True
     for t in scripted:
-        assert t["stage"] == "S0" and t["success"] and t["grasp_success"] and not t["pushed"] and not t["tripped"]
+        assert t["stage"] == "S2" and t["success"] and t["grasp_success"] and not t["pushed"] and not t["tripped"]
         assert t["visible_fraction"] == 1.0 and t["window"]["visible"] == t["window"]["reads"]
         assert t["placement_error_m"] < 0.002 and t["zone_error_m"] < 0.03
     s = summary["scripted"]
     assert s["status"] == "PASS" and s["successes"] == 2 and summary["servo"]["real"] is False
     assert command_log[-1] == "HOLD" and not (run / "die_target.json").exists()
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(600)
+def test_twin_without_the_compensation_reproduces_the_open_above_timeout(tmp_path, command_log):
+    """The first real session on the twin (its default servo deadband): ``--no-deadband-comp`` (the session's
+    controller) never lines up over the die at the default grasp stage, ``open_above_timeout``, no lift, no trip; the
+    run itself ends normally (exit 0)."""
+    code, _run, trials, summary, _placed = _twin_run(tmp_path, "--protocol", "grasp-height", "--grasp-heights", "0.0145",
+                                                     "--no-deadband-comp")  # fmt: skip
+    assert code == fz.EXIT_OK, summary.get("halted")
+    (g,) = trials
+    assert g["end_reason"] == "open_above_timeout" and g["end_phase"] == "OPEN_ABOVE" and not g["grasp_success"]
+    assert not g["tripped"] and summary["grasp_height"]["lowest_lifted_grasp_h_m"] is None
+    assert summary["trial_plan"]["controller"]["deadband_comp"] is False
 
 
 @pytest.mark.slow

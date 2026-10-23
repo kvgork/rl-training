@@ -243,3 +243,140 @@ def test_collect_demos_writes_the_training_transition_format(cpu_env):
         if e > start:
             assert torch.allclose(nxt[start:e], obs[start + 1 : e + 1])
         start = e + 1
+
+
+# ------------------------------------------------------------------------------------------------ deadband compensation
+# (plan §10 2026-10-23): a kinematic plant whose present follows the goal through the D-BACKLASH hysteresis
+# (sim/sysid/params.apply_deadband, the measured band) and nothing else
+def _comp_ctl(cfg_cal, n=1, comp=True, **kw):
+    import dataclasses
+
+    from so101_rl.rl.feasibility import controller_params
+
+    cfg, cal = cfg_cal
+    p = dataclasses.replace(controller_params(deadband_comp=comp), **kw)
+    return ScriptedDieController.from_calibration(cfg, cal, n, params=p)
+
+
+class _BandPlant:
+    def __init__(self, start, band) -> None:
+        self.held = np.array(start, np.int64).reshape(-1, 6).copy()
+        self.band = np.asarray(band, np.int64)
+
+    def step(self, goal: np.ndarray) -> np.ndarray:
+        g, h, b = np.asarray(goal, np.int64), self.held, self.band
+        self.held = np.where(g > h + b, g - b, np.where(g < h - b, g + b, h))
+        return self.held.copy()
+
+
+def _drive(ctl, die_xy, steps, band, start=HOME):
+    from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS
+
+    n = ctl.n
+    goal = np.array([start] * n, np.int64)
+    plant = _BandPlant(goal, MEASURED_DEADBAND_TICKS if band else (0,) * 6)
+    present = goal.copy()
+    die = torch.tensor([[die_xy[0], die_xy[1], ctl.p.table_z_m + 0.008]] * n, dtype=torch.float64)
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * n, dtype=torch.float64)
+    md = np.asarray(ctl.max_delta.cpu().numpy())
+    phases, outs = [], []
+    for _ in range(steps):
+        a = ctl.act(torch.as_tensor(goal), torch.as_tensor(present), die, quat).numpy()
+        outs.append(a)
+        goal = np.clip(goal + np.round(a * md).astype(np.int64), ctl.tick_lo.numpy(), ctl.tick_hi.numpy())
+        present = plant.step(goal)
+        phases.append(ctl.phase.clone())
+    return torch.stack(phases), np.stack(outs), goal, present
+
+
+S2_ZONE_SIDE = (0.2105, -0.099)  # the centre of S2's zone-side strip, 0.20 m from the pan axis
+
+
+def test_deadband_plant_reproduces_the_open_above_timeout_and_the_compensation_lines_up(cfg_cal):
+    """The real session in miniature: with the measured deadband the uncompensated controller never leaves
+    OPEN_ABOVE (pan parks short of the pre-grasp point and the 15-tick "at rest" never holds); with the compensation it
+    descends within the 60-step timeout. On an ideal servo both line up at the same step."""
+    ph_off, *_ = _drive(_comp_ctl(cfg_cal, comp=False), S2_ZONE_SIDE, 60, band=True)
+    assert (ph_off == int(Phase.OPEN_ABOVE)).all()
+    ph_on, *_ = _drive(_comp_ctl(cfg_cal), S2_ZONE_SIDE, 60, band=True)
+    assert (ph_on[-1] >= int(Phase.DESCEND)).all()
+    first = [int(torch.nonzero(p[:, 0] != int(Phase.OPEN_ABOVE))[0]) for p, _o, _g, _pr in
+             (_drive(_comp_ctl(cfg_cal, comp=c), S2_ZONE_SIDE, 40, band=False) for c in (False, True))]  # fmt: skip
+    assert first[0] == first[1]
+
+
+def test_deadband_offset_is_bounded_and_resets_on_a_phase_change(cfg_cal):
+    """A joint that never moves (present frozen): the offset grows to comp_max_scale x the measured deadband and no
+    further, the command stays inside the joint limits; a phase change zeroes it."""
+    from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS
+
+    ctl = _comp_ctl(cfg_cal)
+    bound = np.floor(1.5 * np.asarray(MEASURED_DEADBAND_TICKS[:5]))
+    assert ctl.comp_bound.tolist() == bound.astype(int).tolist()
+    goal = np.array([HOME], np.int64)
+    frozen = goal.copy()
+    die = torch.tensor([[S2_ZONE_SIDE[0], S2_ZONE_SIDE[1], ctl.p.table_z_m + 0.008]], dtype=torch.float64)
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    md = ctl.max_delta.numpy()
+    seen = np.zeros(5)
+    for _ in range(80):
+        a = ctl.act(torch.as_tensor(goal), torch.as_tensor(frozen), die, quat).numpy()
+        goal = goal + np.round(a * md).astype(np.int64)
+        assert ((goal[0, :5] >= ctl.tick_lo[:5].numpy()) & (goal[0, :5] <= ctl.tick_hi[:5].numpy())).all()
+        off = ctl.comp_offset[0].numpy()
+        assert (np.abs(off) <= bound).all()
+        seen = np.maximum(seen, np.abs(off))
+        assert int(ctl.phase[0]) == Phase.OPEN_ABOVE  # the present never reaches the die
+    assert (seen == bound).sum() >= 3  # the joints with a large error saturate at the bound
+    tgt = torch.as_tensor(goal[:, :5]) - ctl.comp_offset
+    cmd = ctl._deadband_offset(tgt, torch.as_tensor(frozen[:, :5]), torch.tensor([int(Phase.DESCEND)]))  # a new phase
+    assert int(ctl.comp_offset.abs().max()) == 0 and torch.equal(cmd, tgt)
+    ctl.comp_offset += 7
+    ctl.reset()
+    assert int(ctl.comp_offset.abs().max()) == 0
+
+
+def test_deadband_comp_batched_equals_act_np(cfg_cal):
+    """Two worlds in one batched controller == two single-world controllers through act_np, step by step, with the
+    compensation on (the numpy path is the batched code)."""
+    from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS
+
+    dies = [S2_ZONE_SIDE, (0.20, 0.0)]
+    batched = _comp_ctl(cfg_cal, n=2)
+    singles = [_comp_ctl(cfg_cal) for _ in dies]
+    goal = np.array([HOME, HOME], np.int64)
+    plant = _BandPlant(goal, MEASURED_DEADBAND_TICKS)
+    present = goal.copy()
+    die = torch.tensor([[x, y, batched.p.table_z_m + 0.008] for x, y in dies], dtype=torch.float64)
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2, dtype=torch.float64)
+    md = batched.max_delta.numpy()
+    used = 0
+    for _ in range(40):
+        a = batched.act(torch.as_tensor(goal), torch.as_tensor(present), die, quat).numpy()
+        for w, c in enumerate(singles):
+            np.testing.assert_array_equal(c.act_np(goal[w], present[w], die[w].numpy(), quat[w].numpy()), a[w])
+        used = max(used, int(batched.comp_offset.abs().max()))
+        goal = goal + np.round(a * md).astype(np.int64)
+        present = plant.step(goal)
+    assert used > 0  # the compensation was exercised
+
+
+def test_deadband_comp_is_off_by_default(cfg_cal):
+    cfg, cal = cfg_cal
+    c = ScriptedDieController.from_calibration(cfg, cal, 1)
+    assert c.p.deadband_comp is False
+    with pytest.raises(ValueError):
+        _comp_ctl(cfg_cal, deadband_ticks=(1, 2, 3))
+
+
+@pytest.mark.parametrize("stage", [0, 3])
+def test_cpu_episode_with_the_compensation_on_an_ideal_servo(cpu_env, stage):
+    """The batched CPU env (no deadband): the compensated controller still succeeds at S0 and S3 without a trip."""
+    import dataclasses
+
+    from so101_rl.rl.scripted import ScriptedDieConfig, ScriptedDiePolicy
+
+    cpu_env.set_start_stage(stage)
+    pol = ScriptedDiePolicy(cpu_env, params=dataclasses.replace(ScriptedDieConfig(), deadband_comp=True))
+    st = run_scripted_episodes(cpu_env, 2, policy=pol)
+    assert st["successes"] == 2 and st["trip_episodes"] == 0

@@ -12,14 +12,16 @@ small protocols, run in this order by ``--protocol all`` (each alone with ``--pr
    records the reach error (FK of the present ticks vs the point). Plus a kinematic check without motion: the
    scripted controller's IK for the grasp point at the pre-grasp and the grasp height over each point (position
    residual, gripper-axis tilt).
-2. **grasp-height** (minimum graspable height): the operator places the die at the ``--grasp-stage`` centre; per height
+2. **grasp-height** (minimum graspable height): the operator places the die at the ``--grasp-stage`` centre (default
+   S2: the centre of its zone-side strip, 0.20 m from the pan axis; plan §10 2026-10-23); per height
    in ``--grasp-heights`` (default 22, 18, 14.5, 12 mm of the grasp point over the table, highest first) the scripted
    controller grasps the die at that height, lifts it to the carry height, puts it back down where it was and
    retreats. Reported: per height lifted or not, trips, clamped steps; ``lowest_lifted_grasp_h_m``. A trip (e.g. STUCK
    from a jaw pressed into the table) ends the sweep (halt rule below), so the lowest height is the last one that lifted
    before it.
 3. **scripted** (the 30 % gate): ``--trials`` (20) scripted pick-and-place trials from the start regions ``--starts``
-   (S0, S1, S2 in turn; ``--tray`` adds the well, a placeholder until H9). Success is the env's own die predicate
+   (default S2, both strips; ``S0,S1,S2`` in turn as before; ``--tray`` adds the well, a placeholder until H9). Target
+   points closer than ``--min-pan-radius`` to the pan axis are re-drawn (below). Success is the env's own die predicate
    (``So101GoalEnv`` / ``env/tasks.py``: die visible, in the zone, settled, debounced). **PASS** when every planned
    trial ran (no halt) and successes / trials >= ``--pass-rate`` (0.30, the plan); the Wilson 95 % interval is
    reported beside it; FAIL when complete and below; INCOMPLETE after a halt.
@@ -33,6 +35,20 @@ older than one policy period + two camera frames, fiducial OK); the detections w
 averaged (a stray frame does not count); fewer than half the reads among them stops the run (``die_not_seen``). Then one env episode (``So101GoalEnv`` with the die task and the
 object table, through the servo shm and its full safety chain, 10 Hz) with actions from
 ``ScriptedDieController.act_np`` (scaled by ``--speed-scale``).
+
+**Near-base blind spot** (plan §10 2026-10-23): with the die closer than ~0.13 m to the shoulder_pan axis (x =
+0.039 m in the base frame) the wrist_flex limit (2960) keeps the gripper from pointing down at the pre-grasp height,
+and the controller never lines up. S0 and S1, shrunk by the die's footprint, lie wholly in that band (at most 0.125 m
+out), S2 wholly outside it (at least 0.139 m), hence the S2 defaults. Trial targets are drawn at least
+``--min-pan-radius`` (0.135 m) from the pan axis (rejection sampling inside the stage rectangles; a stage with no such
+area keeps its draw), a ``--grasp-stage`` whose centre is closer is refused, and a trial whose perceived die (the window average, or a re-read after a missed
+grasp) is closer ends at once with ``end_reason`` ``too_close_to_base`` (no motion; a failure in the gate count,
+reported apart as ``too_close_to_base``).
+
+**Deadband compensation** (plan §10 2026-10-23; ``--no-deadband-comp`` turns it off): the controller runs with
+``ScriptedDieConfig.deadband_comp`` (``rl/scripted.py``: a bounded per-joint offset, closed loop on the present ticks,
+up to 1.5x the measured deadband), because the STS3215 deadband left pan ~22 ticks (7 mm at 0.22 m) short of the
+pre-grasp point and every grasp-height trial of the first real session ended ``open_above_timeout``.
 
 **What the controller sees** (it was written for privileged sim state; here it is fed perception):
 
@@ -93,6 +109,7 @@ import numpy as np
 __all__ = [
     "DEFAULT_GRASP_HEIGHTS_M",
     "MIN_GRASP_H_M",
+    "MIN_PAN_RADIUS_M",
     "PASS_RATE",
     "DieSample",
     "build_parser",
@@ -119,9 +136,15 @@ WINDOW_MIN_VISIBLE: Final[float] = 0.5
 WINDOW_MAX_SPREAD_M: Final[float] = 0.005
 MAX_STEPS: Final[int] = 200  # 20 s at 10 Hz (the sim controller succeeds in ~50 steps)
 DONE_STEPS: Final[int] = 20  # the controller back home this long without a success: the trial ends
-# OPEN_ABOVE this long without lining up (seen in sim with a die estimate < ~0.13 m from the base axis, where the
-# wrist_flex limit keeps the gripper from pointing down at the pre-grasp height): the trial ends
+# OPEN_ABOVE this long without lining up (seen in sim with a die estimate < ~0.13 m from the pan axis, where the
+# wrist_flex limit keeps the gripper from pointing down at the pre-grasp height, and on the real arm from the servo
+# deadband before the compensation): the trial ends
 OPEN_ABOVE_TIMEOUT_STEPS: Final[int] = 60
+# the near-base blind spot (module docstring): no die trial closer than this to the shoulder_pan axis
+MIN_PAN_RADIUS_M: Final[float] = 0.135
+DEFAULT_STARTS: Final[str] = "S2"
+DEFAULT_GRASP_STAGE: Final[str] = "S2"
+TOO_CLOSE: Final[str] = "too_close_to_base"
 EPILOGUE_MAX_STEPS: Final[int] = 40  # open + retreat home after a trial that did not end at home
 MAX_ATTEMPTS: Final[int] = 3
 LIFT_MIN_M: Final[float] = 0.008
@@ -164,10 +187,17 @@ def _shrunk(rect: tuple[float, float, float, float], m: float) -> tuple[float, f
     return x0 + m, x1 - m, y0 + m, y1 - m
 
 
-def trial_positions(task: Any, stages: Sequence[int], n: int, seed: int) -> list[dict[str, Any]]:
+def pan_radius(xy: Sequence[float], pan_xy: Sequence[float]) -> float:
+    """Horizontal distance (m) of ``xy`` from the shoulder_pan axis at ``pan_xy`` (base frame)."""
+    return float(math.hypot(float(xy[0]) - float(pan_xy[0]), float(xy[1]) - float(pan_xy[1])))
+
+
+def trial_positions(task: Any, stages: Sequence[int], n: int, seed: int, *, pan_xy: Sequence[float] | None = None,
+                    min_pan_radius: float = 0.0, tries: int = 200) -> list[dict[str, Any]]:  # fmt: skip
     """Per trial ``i``: stage ``stages[i % len]``; the target xy uniform in one of the stage's rectangles (picked by
-    area) shrunk by the die's worst-case footprint half extent (any yaw fits), rounded to 1 mm; the well stage is the
-    well centre. Depends only on the seed, the task and the stage list."""
+    area) shrunk by the die's worst-case footprint half extent (any yaw fits), rounded to 1 mm, re-drawn (up to
+    ``tries`` times, else the last draw is kept) while closer than ``min_pan_radius`` to the pan axis ``pan_xy``; the
+    well stage is the well centre. Depends only on the seed, the task, the stage list and the radius rule."""
     from so101_rl.env.tasks import DIE_MAX_FOOTPRINT_HALF_M
 
     rng = np.random.default_rng(seed)
@@ -180,10 +210,16 @@ def trial_positions(task: Any, stages: Sequence[int], n: int, seed: int) -> list
         else:
             reg = ds.table_stages[k]
             a = reg.areas
-            r = reg.rects_xy_m[int(rng.choice(len(a), p=a / a.sum()))]
-            x0, x1, y0, y1 = _shrunk(r, DIE_MAX_FOOTPRINT_HALF_M)
-            xy = np.array([rng.uniform(x0, x1), rng.uniform(y0, y1)])
-        out.append({"stage": STAGE_NAMES[k], "stage_name": ds.stage_name(k), "xy": [round(float(v), 3) for v in xy]})
+            for _ in range(max(1, tries if pan_xy is not None and min_pan_radius > 0 else 1)):
+                r = reg.rects_xy_m[int(rng.choice(len(a), p=a / a.sum()))]
+                x0, x1, y0, y1 = _shrunk(r, DIE_MAX_FOOTPRINT_HALF_M)
+                xy = np.array([rng.uniform(x0, x1), rng.uniform(y0, y1)]).round(3)
+                if pan_xy is None or pan_radius(xy, pan_xy) >= min_pan_radius:
+                    break
+        row = {"stage": STAGE_NAMES[k], "stage_name": ds.stage_name(k), "xy": [round(float(v), 3) for v in xy]}
+        if pan_xy is not None:
+            row["pan_radius_m"] = round(pan_radius(xy, pan_xy), 4)
+        out.append(row)
     return out
 
 
@@ -327,12 +363,14 @@ def yaw_quat(yaw: float) -> np.ndarray:
     return np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
 
 
-def controller_params(*, grasp_h: float | None = None, place_xy: Sequence[float] | None = None) -> Any:
-    """The scripted controller's parameters for the real arm: the jaw-midpoint grasp point (unknown yaw), optionally a
-    grasp height and a place point (the grasp-height protocol puts the die back where it was)."""
+def controller_params(*, grasp_h: float | None = None, place_xy: Sequence[float] | None = None,
+                      deadband_comp: bool = True) -> Any:  # fmt: skip
+    """The scripted controller's parameters for the real arm: the jaw-midpoint grasp point (unknown yaw), the servo
+    deadband compensation (``deadband_comp``, plan §10 2026-10-23), optionally a grasp height and a place point (the
+    grasp-height protocol puts the die back where it was)."""
     from so101_rl.rl.scripted import JAW_MIDPOINT_GRIPPER, ScriptedDieConfig
 
-    p = ScriptedDieConfig(grasp_point_gripper=JAW_MIDPOINT_GRIPPER)
+    p = ScriptedDieConfig(grasp_point_gripper=JAW_MIDPOINT_GRIPPER, deadband_comp=bool(deadband_comp))
     if grasp_h is not None:
         p = dataclasses.replace(p, grasp_h=float(grasp_h))
     if place_xy is not None:
@@ -376,6 +414,7 @@ class TrialSettings:
     done_steps: int = DONE_STEPS
     open_above_timeout: int = OPEN_ABOVE_TIMEOUT_STEPS
     stale_s: float = 1.0
+    min_pan_radius: float = MIN_PAN_RADIUS_M
 
 
 def _gp(ctl: Any, ticks: np.ndarray) -> np.ndarray:
@@ -390,7 +429,9 @@ def run_die_trial(env: Any, ctl: Any, die0: Sequence[float], st: TrialSettings, 
     ``die0`` (perception's window average). Returns the trial record (module docstring); a perception failure inside
     the trial sets ``halt`` / ``halt_reason`` (the caller stops). ``table``: the object table, checked every step for a
     stale record or a failed fiducial. ``zone_success`` False (grasp-height protocol): the env's zone success is
-    recorded but the trial runs until the controller is done."""
+    recorded but the trial runs until the controller is done. A die estimate closer than ``st.min_pan_radius`` to the
+    pan axis (:meth:`ScriptedDieController.pan_axis_xy`) ends the trial with ``end_reason`` ``too_close_to_base``: at
+    once (no motion) for the window average, after the re-read for a restarted attempt."""
     from so101_rl.perception.object_table import new_object_table
     from so101_rl.rl.scripted import Phase
     from so101_rl.safety.types import SmState
@@ -416,7 +457,12 @@ def run_die_trial(env: Any, ctl: Any, die0: Sequence[float], st: TrialSettings, 
     phase = int(ctl.phase[0])
     end_phase = phase
     end_reason = "max_steps"
-    while steps < st.max_steps:
+    pan_xy = ctl.pan_axis_xy()
+    r0 = pan_radius(start[:2], pan_xy)
+    too_close = r0 < st.min_pan_radius
+    if too_close:
+        end_reason = TOO_CLOSE
+    while not too_close and steps < st.max_steps:
         rec = env._st[0]
         goal = rec["goal_ticks"].astype(np.int64)
         present = rec["present_ticks"].astype(np.int64)
@@ -428,6 +474,9 @@ def run_die_trial(env: Any, ctl: Any, die0: Sequence[float], st: TrialSettings, 
             attempts += 1
             if last_vis is not None:
                 est = last_vis.copy()
+                if pan_radius(est[:2], pan_xy) < st.min_pan_radius:
+                    end_phase, end_reason = phase, TOO_CLOSE
+                    break
         phase = new_phase
         closed_once = closed_once or phase == int(Phase.CLOSE)
         if attempts > st.max_attempts:
@@ -495,7 +544,7 @@ def run_die_trial(env: Any, ctl: Any, die0: Sequence[float], st: TrialSettings, 
     # open the jaws and retreat (RETREAT: straight up with the gripper opening, then home), so the next home reset
     # never closes the gripper on a die still between the jaws (seen in sim: ResetFailed, gripper blocked)
     epilogue_steps = 0
-    if end_phase != int(Phase.DONE) and not (tripped or stalled) and halt is None:
+    if end_phase != int(Phase.DONE) and not (tripped or stalled) and halt is None and steps > 0:
         ctl.phase[:] = int(Phase.RETREAT)
         ctl.phase_steps[:] = 0
         while epilogue_steps < EPILOGUE_MAX_STEPS and int(ctl.phase[0]) != int(Phase.DONE):
@@ -514,6 +563,7 @@ def run_die_trial(env: Any, ctl: Any, die0: Sequence[float], st: TrialSettings, 
     grasp_success = held and (max_rise >= LIFT_MIN_M or max_moved_held >= MOVED_WHILE_HELD_M or success)
     out: dict[str, Any] = {
         "die_start_xyz": [round(float(v), 4) for v in start],
+        "die_pan_radius_m": round(r0, 4),
         "success": success,
         "grasp_success": bool(grasp_success),
         "held": bool(held),
@@ -606,6 +656,8 @@ def summarize_scripted(trials: Sequence[dict[str, Any]], planned: int, *, halted
         "pushed": sum(bool(t["pushed"]) for t in trials),
         "left_zone_after_success": sum(bool(t["success"]) and t.get("final_in_zone") is False for t in trials),
         "knocked": sum(bool(t["knocked"]) for t in trials),
+        "too_close_to_base": sum(t.get("end_reason") == TOO_CLOSE for t in trials),
+        "open_above_timeout": sum(t.get("end_reason") == "open_above_timeout" for t in trials),
         "trip_trials": sum(bool(t["tripped"]) or bool(t["servo_stalled"]) for t in trials),
         "visible_fraction_mean": float(np.mean([t["visible_fraction"] for t in trials])) if trials else None,
         "zone_error_m_p50": float(np.median(errs)) if errs else None,
@@ -617,8 +669,9 @@ def summarize_scripted(trials: Sequence[dict[str, Any]], planned: int, *, halted
 def summarize_grasp_heights(trials: Sequence[dict[str, Any]]) -> dict[str, Any]:
     lifted = [t["grasp_h_m"] for t in trials if t["grasp_success"] and not t["tripped"]]
     return {"trials": len(trials), "lowest_lifted_grasp_h_m": min(lifted) if lifted else None,
-            "per_height": [{k: t[k] for k in ("grasp_h_m", "grasp_success", "die_rise_while_held_m", "tripped",
-                                              "trips", "clamped_steps", "end_phase")} for t in trials]}  # fmt: skip
+            "per_height": [{k: t.get(k) for k in ("grasp_h_m", "grasp_success", "die_rise_while_held_m", "tripped",
+                                                  "trips", "clamped_steps", "end_phase", "end_reason")}
+                           for t in trials]}  # fmt: skip
 
 
 def summarize_reach(points: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -643,8 +696,8 @@ def _table(summary: dict[str, Any]) -> str:
         lines.append("grasp height sweep (grasp point over the table):")
         for t in g["per_height"]:
             lines.append(f"  {t['grasp_h_m'] * 1e3:5.1f} mm  {'LIFTED' if t['grasp_success'] else 'no lift':8} "
-                         f"rise {t['die_rise_while_held_m'] * 1e3:5.1f} mm  clamped {t['clamped_steps']:3d}"
-                         + (f"  TRIP {t['trips']:#x}" if t["tripped"] else ""))  # fmt: skip
+                         f"rise {t['die_rise_while_held_m'] * 1e3:5.1f} mm  clamped {t['clamped_steps']:3d}  "
+                         f"{t.get('end_reason') or ''}" + (f"  TRIP {t['trips']:#x}" if t["tripped"] else ""))  # fmt: skip
         low = g["lowest_lifted_grasp_h_m"]
         lines.append(f"  lowest lifted: {'none' if low is None else f'{low * 1e3:.1f} mm'}")
     s = summary.get("scripted")
@@ -653,7 +706,8 @@ def _table(summary: dict[str, Any]) -> str:
         rate = "n/a" if s["success_rate"] is None else f"{s['success_rate']:.3f}"
         lines.append(f"scripted: {s['successes']}/{s['n']} (planned {s['planned']}) rate {rate} wilson95 [{lo:.3f}, "
                      f"{hi:.3f}]  grasped {s['grasp_successes']} pushed {s['pushed']} knocked {s['knocked']} "
-                     f"left-zone-after-success {s['left_zone_after_success']} trips {s['trip_trials']}")  # fmt: skip
+                     f"left-zone-after-success {s['left_zone_after_success']} trips {s['trip_trials']} too-close "
+                     f"{s['too_close_to_base']} open-above-timeout {s['open_above_timeout']}")  # fmt: skip
         for k, v in s["per_stage"].items():
             lines.append(f"  {k}: {v['successes']}/{v['n']}")
         lines.append(f"  gate (>= {s['pass_rate']:.0%} of {s['planned']}): {s['status']}")
@@ -671,7 +725,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="feasibility-gate", description=__doc__.splitlines()[0])
     ap.add_argument("--protocol", default="all", help="all, or a comma list of reach, grasp-height, scripted")
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help="scripted trials (20)")
-    ap.add_argument("--starts", default="S0,S1,S2", help="scripted start stages, in turn (S0,S1,S2; S3 = the well)")
+    ap.add_argument("--starts", default=DEFAULT_STARTS, help="scripted start stages, in turn (default S2; S0,S1,S2; "
+                    "S3 = the well)")  # fmt: skip
     ap.add_argument("--tray", action="store_true", help="add the well (placeholder until H9) to the starts and the "
                     "reach points")  # fmt: skip
     ap.add_argument("--seed", type=int, default=7, help="the trial positions")
@@ -682,7 +737,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--yaw-deg", type=float, default=0.0, help="--yaw fixed: the jaw yaw (deg)")
     ap.add_argument("--grasp-heights", default=",".join(f"{h:g}" for h in DEFAULT_GRASP_HEIGHTS_M),
                     help="grasp-height sweep: grasp point over the table (m), highest first")
-    ap.add_argument("--grasp-stage", default="S0", help="grasp-height sweep: the die at this stage's centre")
+    ap.add_argument("--grasp-stage", default=DEFAULT_GRASP_STAGE, help="grasp-height sweep: the die at this stage's "
+                    "centre (its first rectangle; default S2 = the zone-side strip)")  # fmt: skip
+    ap.add_argument("--min-pan-radius", type=float, default=MIN_PAN_RADIUS_M, help="no die trial closer than this to "
+                    "the shoulder_pan axis (m; the near-base blind spot)")  # fmt: skip
+    ap.add_argument("--no-deadband-comp", action="store_true", help="run the scripted controller without the servo "
+                    "deadband compensation (the first real session's controller)")  # fmt: skip
     ap.add_argument("--grasp-repeats", type=int, default=1, help="trials per grasp height")
     ap.add_argument("--reach-policy", type=Path, default=DEFAULT_REACH_POLICY)
     ap.add_argument("--reach-height", type=float, default=REACH_HEIGHT_M, help="reach points above the table (m)")
@@ -860,12 +920,18 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         def make_ctl(params: Any) -> Any:
             return ScriptedDieController.from_calibration(cfg, rs.calibration, 1, params=params)
 
-        base_params = controller_params()
+        comp = not args.no_deadband_comp
+        base_params = controller_params(deadband_comp=comp)
         ctl = make_ctl(base_params)
         place_xy = place_point(ctl.p)
-        positions = trial_positions(task, starts, args.trials, args.seed) if "scripted" in protocols else []
+        pan_xy = ctl.pan_axis_xy()
+        positions = (trial_positions(task, starts, args.trials, args.seed, pan_xy=pan_xy,
+                                     min_pan_radius=args.min_pan_radius) if "scripted" in protocols else [])  # fmt: skip
         g_xy = stage_centre(task, grasp_stage)
-        height_ctls = ([(h, make_ctl(controller_params(grasp_h=h, place_xy=g_xy))) for h in heights
+        if "grasp-height" in protocols and pan_radius(g_xy, pan_xy) < args.min_pan_radius:
+            raise ValueError(f"--grasp-stage {args.grasp_stage}: its centre is {pan_radius(g_xy, pan_xy):.3f} m from the "
+                             f"pan axis (< --min-pan-radius {args.min_pan_radius}): the near-base blind spot")  # fmt: skip
+        height_ctls = ([(h, make_ctl(controller_params(grasp_h=h, place_xy=g_xy, deadband_comp=comp))) for h in heights
                         for _ in range(args.grasp_repeats)] if "grasp-height" in protocols else [])  # fmt: skip
         rpts = reach_points(task, place_xy, tray=args.tray, table_z=float(ctl.p.table_z_m), height=args.reach_height)
         if tip is not None:
@@ -876,6 +942,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
             "scripted_positions": positions, "grasp_heights_m": heights, "grasp_xy": [round(float(v), 3) for v in g_xy],
             "reach_points": [{"name": n, "xyz": [round(float(v), 4) for v in p]} for n, p in rpts] if tip else [],
             "place_xy": [round(float(v), 4) for v in place_xy], "controller": dataclasses.asdict(ctl.p),
+            "pan_axis_xy": [round(float(v), 4) for v in pan_xy], "min_pan_radius_m": args.min_pan_radius,
         })  # fmt: skip
         out.mkdir(parents=True, exist_ok=False)
         _write_json(out / "summary.json", _doc(None))
@@ -895,7 +962,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         return EXIT_REFUSED
 
     st = TrialSettings(max_steps=args.max_steps, speed=args.speed_scale, yaw_mode=args.yaw, yaw_deg=args.yaw_deg,
-                       max_attempts=args.max_attempts)  # fmt: skip
+                       max_attempts=args.max_attempts, min_pan_radius=args.min_pan_radius)  # fmt: skip
     gate = dp.DieResetGate(out, _log)
     home = np.asarray(cfg.safe_state.home_ticks)
     counter = [0]
@@ -958,7 +1025,8 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
                     tr = die_trial(f, "grasp-height", c, tgt, zone_success=False)
                     results["grasp-height"].append(tr)
                     print(f"grasp height {h * 1e3:.1f} mm: {'LIFTED' if tr['grasp_success'] else 'no lift'} (rise "
-                          f"{tr['die_rise_while_held_m'] * 1e3:.1f} mm, {tr['steps']} steps)", flush=True)  # fmt: skip
+                          f"{tr['die_rise_while_held_m'] * 1e3:.1f} mm, {tr['steps']} steps, {tr['end_reason']})",
+                          flush=True)  # fmt: skip
                     _raise_halt(tr)
                 for pos in positions:
                     tr = die_trial(f, "scripted", ctl, pos, zone_success=True)
@@ -966,8 +1034,8 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
                     e = "n/a" if tr["zone_error_m"] is None else f"{tr['zone_error_m'] * 1e3:.0f} mm"
                     print(f"trial {tr['trial']} {pos['stage']}: {'SUCCESS' if tr['success'] else 'fail   '} grasp "
                           f"{'yes' if tr['grasp_success'] else 'no '} zone err {e} visible {tr['visible_fraction']:.2f} "
-                          f"steps {tr['steps']} attempts {tr['attempts']}" + (f" TRIP {tr['trips']:#x}" if tr["tripped"]
-                                                                              else ""), flush=True)  # fmt: skip
+                          f"steps {tr['steps']} attempts {tr['attempts']} {tr['end_reason']}"
+                          + (f" TRIP {tr['trips']:#x}" if tr["tripped"] else ""), flush=True)  # fmt: skip
                     _raise_halt(tr)
             except Halt as exc:
                 halt, halt_reason = str(exc), exc.reason

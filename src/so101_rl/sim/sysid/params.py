@@ -71,6 +71,7 @@ __all__ = [
     "FRICTIONLOSS_RANGE",
     "INT_FIELDS",
     "MAX_DELAY_TICKS",
+    "MEASURED_DEADBAND_TICKS",
     "PER_JOINT_FIELDS",
     "SCALAR_FIELDS",
     "SERVO_GROUP_FIELDS",
@@ -92,6 +93,9 @@ __all__ = [
 SIM_PARAMS_VERSION: Final[int] = 2  # 2 (2026-10-06): + servo_group, dr, meta.unidentified
 MAX_DELAY_TICKS: Final[int] = 6  # the sysid delay grid is 0..MAX_DELAY_TICKS (FS7)
 MAX_DEADBAND_TICKS: Final[int] = 64  # sanity bound only (measured 9..32 ticks on the arm, plan §10 2026-10-11)
+# the measured STS3215 deadband per joint (pan, lift, elbow, wrist_flex, wrist_roll, gripper), plan §10 2026-10-11:
+# the feasibility twin's default (scripts/feasibility_sim_servo.py) and the scripted controller's compensation bound
+MEASURED_DEADBAND_TICKS: Final[tuple[int, ...]] = (32, 14, 16, 12, 9, 9)
 
 PER_JOINT_FIELDS: Final[tuple[str, ...]] = ("kp", "kv", "damping", "frictionloss", "armature", "forcerange")
 SCALAR_FIELDS: Final[tuple[str, ...]] = ("die_mass_kg", "die_friction", "table_friction")
