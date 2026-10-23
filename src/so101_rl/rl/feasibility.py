@@ -905,7 +905,7 @@ def _main(args: argparse.Namespace, stopping: list[bool]) -> int:
         k = counter[0]
         counter[0] += 1
         backend.reset(home)  # arm home, then held while the operator places the die
-        with dp.hold_keepalive(backend):
+        with dp.zero_delta_keepalive(backend):  # not HOLD: STUCK after 3 s in RUN (2026-10-23)
             _write_json(out / TARGET_FILE, {"trial": k, "protocol": protocol, **target})
             print(f"trial {k} ({protocol}, {target.get('stage', '')} {target.get('stage_name', '')}): place the die at "
                   f"x = {target['xy'][0]:.3f}, y = {target['xy'][1]:.3f} m (any yaw)", flush=True)  # fmt: skip

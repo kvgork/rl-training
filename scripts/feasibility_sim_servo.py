@@ -57,7 +57,7 @@ def place_request(control: Path, x: float, y: float, yaw: float, timeout_s: floa
 
 
 def auto_operator(run_root: Path, control: Path, stop: threading.Event, *, seed: int = 0,
-                  log: list | None = None) -> None:  # fmt: skip
+                  log: list | None = None, delay_s: float = 0.0) -> None:  # fmt: skip
     """The operator for every run under ``run_root``: on ``die_reset_waiting`` place the die at ``die_target.json``'s
     xy with a random yaw, then create ``die_ready``. ``log`` collects ``(trial, target, placed)``."""
     rng = np.random.default_rng(seed)
@@ -71,6 +71,7 @@ def auto_operator(run_root: Path, control: Path, stop: threading.Event, *, seed:
                 continue
             if (w.parent.name, k) in done or tgt.get("trial") != k:
                 continue
+            stop.wait(delay_s)  # a human takes seconds: the arm must stay held (and not trip STUCK) meanwhile
             placed = place_request(control, float(tgt["xy"][0]), float(tgt["xy"][1]), float(rng.uniform(0, math.pi / 2)))
             done.add((w.parent.name, k))
             if log is not None:

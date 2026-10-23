@@ -351,12 +351,12 @@ class TwinChild:
         return self.proc.wait()
 
 
-def _twin_run(tmp_path, *args, seed: int = 0):
+def _twin_run(tmp_path, *args, seed: int = 0, operator_delay_s: float = 0.0):
     twin = TwinChild(tmp_path)
     run_root = tmp_path / "feas"
     stop, placed = threading.Event(), []
     th = threading.Thread(target=_twin_module().auto_operator, args=(run_root, twin.control, stop),
-                          kwargs={"seed": seed, "log": placed}, daemon=True)  # fmt: skip
+                          kwargs={"seed": seed, "log": placed, "delay_s": operator_delay_s}, daemon=True)  # fmt: skip
     th.start()
     try:
         code = fz.main(["--shm-name", twin.name, "--object-table", twin.table, "--out-root", str(run_root),
@@ -406,3 +406,38 @@ def test_reach_protocol_on_the_mujoco_twin(tmp_path, command_log):
         assert t["ik"]["grasp"]["pos_residual_mm"] < 1.0 and t["ik"]["grasp"]["axis_tilt_deg"] < 5.0
     assert summary["reach"]["successes"] == 6 and "scripted" not in summary
     assert np.isfinite(summary["reach"]["reach_error_m_max"])
+
+
+
+def test_the_operator_wait_holds_with_zero_delta_run_commands_not_hold():
+    """2026-10-23 on the real arm: the manual-reset wait held the arm with HOLD inside RUN; the stuck monitor saw the
+    reset's last delta with the arm still and tripped STUCK 3.6 s later. (The mujoco twin cannot reproduce it: its
+    servo never reports every joint still.) The wait must send zero-delta RUN commands only."""
+    import inspect
+
+    from so101_rl.rl import deploy_policy as dp
+
+    class Backend:
+        episode = 3
+
+        def __init__(self):
+            self.sent = []
+
+        def read_state(self, out):
+            out["seq"][0] = 42
+            return True
+
+        def send_delta(self, delta, seq, episode):
+            self.sent.append(("RUN", np.asarray(delta).copy(), seq, episode))
+
+        def send_hold(self, *a):
+            self.sent.append(("HOLD",))
+
+    b = Backend()
+    with dp.zero_delta_keepalive(b, period_s=0.02):
+        time.sleep(0.15)
+    assert len(b.sent) >= 4 and all(c[0] == "RUN" for c in b.sent)
+    assert all(not c[1].any() and c[2] == 42 and c[3] == 3 for c in b.sent)
+    src = inspect.getsource(fz) + inspect.getsource(dp)
+    assert "zero_delta_keepalive(backend):  # not HOLD" in inspect.getsource(fz)
+    assert "with hold_keepalive(backend):\n                            gate.wait" not in src
