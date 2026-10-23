@@ -594,10 +594,11 @@ minimum graspable height, and scripted IK seeds at >= 30 % success on the real a
   4. **reach** (no die needed): the tip goes 4 cm above the zone centre, the place point, the S2, S1 and S0 centres in
      turn and holds 1 s at each. Watch S0 (nearest the base).
   5. **grasp-height:** for each height (22, 18, 14.5, 12 mm) the arm goes home and the tool prints `place the die at
-     x = ..., y = ...` (the S0 centre). Put the die there (any yaw, roughly: perception measures it), take your hand
+     x = ..., y = ...` (since 2026-10-23 the S2 zone-side centre (0.211, -0.099), 0.20 m from the pan axis; was S0). Put the die there (any yaw, roughly: perception measures it), take your hand
      out of the camera view, press Enter in terminal 2 (or `touch <run dir>/die_ready`). The arm grasps, lifts, puts
      the die back and retreats. Cut power at once if a jaw presses into the table.
-  6. **scripted:** 20 trials, S0 / S1 / S2 in turn; place the die at each printed target the same way. Do not touch
+  6. **scripted:** 20 trials, by default all from S2 (both strips; since 2026-10-23, was S0 / S1 / S2 in turn); place
+     the die at each printed target the same way. Do not touch
      the die during a trial, even when it is pushed off.
   7. When it ends (or halts), Ctrl-C the servo (normal shutdown to rest), then perception.
 - **Halts (exit 1; a human must look, then start a new run):** any trip or stalled servo, perception stale (> 1 s) or
@@ -617,7 +618,34 @@ minimum graspable height, and scripted IK seeds at >= 30 % success on the real a
   STUCK trip (plan §10 2026-10-21). If the scripted gate fails with most failures `knocked` /
   `attempts_exhausted` on one side, the joint camera + joint-zero calibration (plan §10 2026-10-21 H8 row) is the fix.
 - **Shown-to-fail:** step 2 without `--attended` against the feetech servo must refuse (exit 2) with no motion;
-  `--grasp-heights 0.009` must refuse (exit 2).
+  `--grasp-heights 0.009` must refuse (exit 2); `--protocol grasp-height --grasp-stage S0` must refuse (exit 2: the
+  S0 centre lies in the near-base band).
+- **First real session (2026-10-23) and what changed (plan §10 2026-10-23 "Scripted grasp: deadband compensation;
+  twin deadband; near-base refusal; plane check ignores the arm"; ARCHITECTURE 0.67):**
+  - reach passed 6/6 (2.4-6.0 mm). Every grasp-height trial ended `open_above_timeout` with the die 0.226 m from the
+    pan axis: the tick log (`runs/feasibility/ticks-20261023-163741.bin`) holds a steady commanded-minus-present error
+    of pan +22, lift ~0, elbow -22, wrist_flex +10 ticks through the OPEN_ABOVE hold (the servo deadband, measured
+    [32, 14, 16, 12, 9, 9] ticks; 22 pan ticks = 7 mm at 0.22 m > the 6 mm alignment tolerance). The sim twin had no
+    deadband, so sim showed 9/9.
+  - **Deadband compensation** (`rl/scripted.py`, on by default in `feasibility-gate`; `--no-deadband-comp` = the
+    session's controller): a per-joint offset on the command, closed loop on the measured present ticks, bounded by
+    1.5x the measured deadband and the joint limits, never pushing the grasp point below 12.5 mm over the table; reset
+    on a phase change. Expect a short pause over the die (the offset steps every other policy step) before the
+    descent, and the jaws to close a few mm higher than the commanded grasp height when lift / elbow park in their
+    deadband. The **twin now has the measured deadband by default** (`feasibility_sim_servo.py --deadband-ticks`,
+    `--no-deadband` for the ideal servo): the dry run reproduces `open_above_timeout` with `--no-deadband-comp` and
+    passes with the default.
+  - **Near-base blind spot:** a die closer than ~0.13 m to the shoulder_pan axis (base x = 0.039 m) cannot be
+    approached straight down (wrist_flex limit 2960); S0 and S1 lie wholly in that band. A trial whose perceived die is
+    closer than `--min-pan-radius` (0.135 m) now ends at once with `end_reason` `too_close_to_base` (no motion; counted
+    as a failure, reported apart). The defaults moved to S2 (`--starts S2`, `--grasp-stage S2`).
+  - **Plane check:** the camera-moved table-plane check latched a false "camera moved" (2.25 deg / 12.6 mm from 1741
+    points) while the arm was over the table. Perception now leaves the arm mask's pixels out of the plane refit (the
+    summary's `camera_check.table_plane.arm_masked_checks` counts it; keep the servo running so the mask is active).
+    `--plane-defers-to-fiducial` (off) would skip the plane check while the fiducial passes; it loses the plane's
+    height check (a 5 mm lift moves the marker < 1 px), so use it only if the masked plane still trips falsely.
+  - **Rerun:** perception first, then `pixi run -e cpu feasibility-gate --attended --accept-no-watchdog --protocol
+    grasp-height,scripted`, then the servo (step 3). The reach protocol already passed.
 
 ## HS6 - Zero-shot die-to-zone eval on the real arm (software ready, not runnable yet)
 

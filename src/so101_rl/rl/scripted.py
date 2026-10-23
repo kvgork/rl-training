@@ -30,6 +30,29 @@ target is clipped to ``cfg.joints`` (already the intersection with the calibrati
 ``max_delta_ticks`` (the direction is kept). The gripper moves on its own cap. Heights never go below ``grasp_h`` (jaw
 bottoms 4 mm above the table, lowest gripper floor point ~2.5 mm), so the box clamp's table floor is never commanded.
 
+**Deadband compensation** (``deadband_comp``, plan §10 2026-10-23; off by default = the sim demos unchanged, on in the
+real-arm feasibility gate): the STS3215 does not move while its goal is within its deadband of the present position
+(measured [32, 14, 16, 12, 9, 9] ticks pan..gripper, plan §10 2026-10-11), so a command at rest leaves a steady
+error (pan ~22 ticks = 7 mm of the grasp point at 0.22 m: more than ``tol_xy_m``, and the stall rule's "at rest"
+test, 15 ticks, never held: every grasp-height trial of the first real session ended ``open_above_timeout``). Closed
+loop on the PRESENT ticks, per arm joint: the IK target (the command without compensation) gets an offset; while
+that joint's target stays put (moved <= ``comp_rest_ticks`` since the last step), the joint has stopped (present
+moved <= ``comp_static_ticks``) and ``|target - present| > comp_band_ticks``, the offset grows by
+``round(comp_gain * (target - present))``, then waits ``comp_wait_steps`` steps for the servo to answer. Bounds:
+``|offset| <= comp_max_scale x deadband_ticks[j]``; the command never passes the joint limits (``cfg.joints`` less
+``joint_margin_ticks``) and never puts ``G`` of the command lower than ``comp_min_h`` (12.5 mm) over the table, nor
+lower than ``G`` of the target when that is lower (the offsets are scaled by 1, 1/2, 1/4, 0: the safety box clamp
+would revert the whole command, and the same delta repeated against it trips STUCK after 3 s). The offset is 0
+again when the phase changes, when that joint's target moves, and outside ``OPEN_ABOVE`` / ``DESCEND`` / ``LIFT`` /
+``CARRY`` / ``LOWER``. The IK warm start and ``G`` of the command stay the command itself (the setpoint is the
+waypoint once ``G`` is within a step of it, so the offset does not feed back). Alignment is still decided on the
+present (measured) FK. With compensation on: "at rest" (the stall rule) is per joint "within 15 ticks of the command,
+OR stopped with its target still"; ``DESCEND`` -> ``CLOSE`` at ``tol_z_m`` / 2 (the compensated arm gets there; at
+``tol_z_m`` the deadband would close the jaws on the high side, a 22 mm grasp then holding ~1 mm of the die), or
+after ``stall_steps`` at rest with ``G`` of the command at the grasp height and the arm within 3 x ``tol_z_m`` (the
+floor above keeps the command from pushing lower), the same for ``LOWER`` -> ``RELEASE`` at the place height;
+``RETREAT`` -> ``DONE`` allows 30 ticks + the joint's deadband. Off: the controller is exactly the earlier one.
+
 **Inputs** (privileged, batched torch; :meth:`ScriptedDieController.act`): the commanded goal ticks (the servo
 chain's ``goal``), the present ticks, the die position and quaternion. :func:`env_state` reads them from a
 :class:`~so101_rl.env.batched_env.BatchedGoalEnv` (CUDA or the CPU stand-in): ``env.chain.goal``,
@@ -57,6 +80,7 @@ import torch
 from so101_rl.config import CENTER_TICK, JOINT_NAMES, N_JOINTS, TICKS_PER_REV, MotorCalibration, So101Config
 from so101_rl.env.tasks import TERMINAL_TRIPS
 from so101_rl.safety.fk import N_ARM_JOINTS, KinematicChain
+from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS
 
 __all__ = [
     "GRASP_POINT_GRIPPER",
@@ -136,6 +160,18 @@ class ScriptedDieConfig:
     # G in the gripper body frame (default: 4 mm off the fixed jaw, the sim demos; JAW_MIDPOINT_GRIPPER for an
     # unknown die yaw)
     grasp_point_gripper: tuple[float, float, float] = GRASP_POINT_GRIPPER
+    # deadband compensation (module docstring; plan §10 2026-10-23): off = the sim demo controller, unchanged
+    deadband_comp: bool = False
+    deadband_ticks: tuple[int, ...] = MEASURED_DEADBAND_TICKS  # [6] pan..gripper (the arm's 5 are used)
+    comp_gain: float = 0.5  # offset step per settled policy step, of the remaining present error
+    comp_max_scale: float = 1.5  # |offset| <= comp_max_scale x deadband_ticks[j]
+    comp_band_ticks: int = 3  # a present error at most this large is left alone
+    comp_rest_ticks: int = 2  # the joint's IK target moved at most this much: "the target is still"
+    comp_static_ticks: int = 1  # the joint's present moved at most this much since the last step: "stopped"
+    comp_wait_steps: int = 1  # policy steps after an offset step before that joint's next one (the servo answers)
+    # the offset never puts G of the command lower than this over the table (or than G of the target, if lower): the
+    # jaw bottoms (~10.5 mm below G) stay >= 2 mm over the table, 1 mm above the box's gripper floor
+    comp_min_h: float = 0.0125
 
 
 def gripper_fk(chain_T: tuple[torch.Tensor, torch.Tensor], q: torch.Tensor) -> torch.Tensor:
@@ -264,11 +300,26 @@ class ScriptedDieController:
         self._place_xy = torch.tensor([p.zone_xy_m[0] + p.place_offset_xy_m[0], p.zone_xy_m[1] + p.place_offset_xy_m[1]],
                                       dtype=f64, device=dev)  # fmt: skip
         self._h = {k: z + getattr(p, k) for k in ("grasp_h", "pregrasp_h", "carry_h", "place_h", "retreat_h")}
+        self._comp_min_z = z + p.comp_min_h
         self.phase = torch.zeros(self.n, dtype=torch.int64, device=dev)
         self.phase_steps = torch.zeros(self.n, dtype=torch.int64, device=dev)
         self.regrasps = torch.zeros(self.n, dtype=torch.int64, device=dev)
         self.yaw_target = torch.zeros(self.n, dtype=f64, device=dev)
         self.last_residual = torch.zeros((self.n, 7), dtype=f64, device=dev)
+        db = np.asarray(p.deadband_ticks, np.float64)
+        if db.shape != (N_JOINTS,) or (db < 0).any():
+            raise ValueError(f"deadband_ticks must be {N_JOINTS} values >= 0, got {list(p.deadband_ticks)}")
+        self.comp_bound = torch.as_tensor(np.floor(p.comp_max_scale * db[:N_ARM_JOINTS]), dtype=torch.int64, device=dev)
+        i64 = {"dtype": torch.int64, "device": dev}
+        self.comp_offset = torch.zeros((self.n, N_ARM_JOINTS), **i64)  # added to the arm command (deadband comp)
+        self._comp_prev_present = torch.zeros((self.n, N_ARM_JOINTS), **i64)
+        self._comp_prev_tgt = torch.zeros((self.n, N_ARM_JOINTS), **i64)
+        self._comp_still = torch.zeros((self.n, N_ARM_JOINTS), dtype=torch.bool, device=dev)  # last step's target still
+        self._comp_wait = torch.zeros((self.n, N_ARM_JOINTS), **i64)
+        self._comp_has_prev = torch.zeros(self.n, dtype=torch.bool, device=dev)
+        self._comp_phase = torch.full((self.n,), -1, **i64)
+        self._retreat_tol = torch.as_tensor(30 + (db[:N_ARM_JOINTS] if p.deadband_comp else 0.0), dtype=torch.int64,
+                                            device=dev)  # fmt: skip
 
     @classmethod
     def from_calibration(cls, cfg: So101Config, calibration: dict[str, MotorCalibration], n: int,
@@ -288,6 +339,11 @@ class ScriptedDieController:
     def _rad_to_ticks(self, q: torch.Tensor) -> torch.Tensor:
         return torch.round(q / (self._sign[: q.shape[-1]] * _RAD_PER_TICK) + CENTER_TICK).to(torch.int64)
 
+    def pan_axis_xy(self) -> np.ndarray:
+        """The shoulder_pan axis in the base frame, ``[2]`` (m): the origin of the chain's first joint frame."""
+        base_T, parent_T = self._chain_T
+        return (base_T @ parent_T[0])[:2, 3].cpu().numpy().astype(np.float64)
+
     def grasp_point(self, ticks: torch.Tensor) -> torch.Tensor:
         """``G`` [N,3] (base frame) for arm ticks ``[N, >=5]``."""
         T = gripper_fk(self._chain_T, self._ticks_to_rad(ticks[:, :N_ARM_JOINTS]))
@@ -300,6 +356,11 @@ class ScriptedDieController:
         self.phase.masked_fill_(m, int(Phase.OPEN_ABOVE))
         self.phase_steps.masked_fill_(m, 0)
         self.regrasps.masked_fill_(m, 0)
+        self.comp_offset.masked_fill_(m[:, None], 0)
+        self._comp_wait.masked_fill_(m[:, None], 0)
+        self._comp_still.masked_fill_(m[:, None], False)
+        self._comp_has_prev.masked_fill_(m, False)
+        self._comp_phase.masked_fill_(m, -1)
 
     # ------------------------------------------------------------------ control
     @torch.no_grad()
@@ -310,6 +371,7 @@ class ScriptedDieController:
         goal = goal_ticks.to(dev, torch.int64)
         present = present_ticks.to(dev, torch.int64)
         die = die_pos.to(dev, f64)
+        comp = p.deadband_comp
         g_now = self.grasp_point(goal)  # G of the command
         g_pres = self.grasp_point(present)  # G of the arm
         ph = self.phase
@@ -331,10 +393,23 @@ class ScriptedDieController:
         above = (d_xy < p.tol_xy_m) & ((g_pres[:, 2] - h["pregrasp_h"]).abs() < 2 * p.tol_z_m)
         # near the base the wrist_flex limit can keep G a few mm off the pregrasp point: once the command is at rest
         # for stall_steps, descend from there (DESCEND re-centres on the die)
-        at_rest = (goal[:, :N_ARM_JOINTS] - present[:, :N_ARM_JOINTS]).abs().amax(dim=1) <= 15
+        settled = (goal[:, :N_ARM_JOINTS] - present[:, :N_ARM_JOINTS]).abs() <= 15
+        if comp:  # in the deadband: a joint that stopped with its target still is at rest too
+            stopped = self._comp_has_prev[:, None] & self._comp_still \
+                & ((present[:, :N_ARM_JOINTS] - self._comp_prev_present).abs() <= p.comp_static_ticks)
+            settled = settled | stopped
+        at_rest = settled.all(dim=1)
         stalled = (self.phase_steps >= p.stall_steps) & at_rest & (d_xy < 2 * p.tol_xy_m)
         to(((above & yaw_ok) | stalled) & (grip >= self.gripper_open - 30), Phase.OPEN_ABOVE, Phase.DESCEND)
-        to((g_pres[:, 2] - h["grasp_h"]).abs() < p.tol_z_m, Phase.DESCEND, Phase.CLOSE)
+        # with the compensation the arm settles closer: close at half the tolerance (or parked, below); without it the
+        # deadband leaves the jaws on the high side of tol_z_m (a 22 mm grasp then holds only the die's top ~1 mm)
+        tol_close = p.tol_z_m / 2 if comp else p.tol_z_m
+        to((g_pres[:, 2] - h["grasp_h"]).abs() < tol_close, Phase.DESCEND, Phase.CLOSE)
+        if comp:  # parked in the deadband short of the bottom with the COMMAND there (the box keeps it from going lower)
+            parked = (self.phase_steps >= p.stall_steps) & at_rest
+            for frm, new, key in ((Phase.DESCEND, Phase.CLOSE, "grasp_h"), (Phase.LOWER, Phase.RELEASE, "place_h")):
+                cmd_there = (g_now[:, 2] - h[key]).abs() < p.tol_z_m
+                to(parked & cmd_there & ((g_pres[:, 2] - h[key]).abs() < 3 * p.tol_z_m), frm, new)
         to(d_xy > 2 * p.tol_xy_m, Phase.DESCEND, Phase.OPEN_ABOVE)  # the die moved away: line up again
         closed = self.phase_steps >= p.close_steps
         to(closed & (grip > self.gripper_empty), Phase.CLOSE, Phase.LIFT)
@@ -347,7 +422,7 @@ class ScriptedDieController:
         nxt = torch.where(lost, int(Phase.OPEN_ABOVE), nxt)
         self.regrasps += lost.to(torch.int64)
         to(self.phase_steps >= p.release_steps, Phase.RELEASE, Phase.RETREAT)
-        at_retreat = (present[:, :N_ARM_JOINTS] - self._retreat).abs().amax(dim=1) <= 30
+        at_retreat = ((present[:, :N_ARM_JOINTS] - self._retreat).abs() <= self._retreat_tol).all(dim=1)
         to(at_retreat, Phase.RETREAT, Phase.DONE)
         self.phase_steps = torch.where(nxt == ph, self.phase_steps + 1, torch.zeros_like(self.phase_steps))
         self.phase = ph = nxt
@@ -389,6 +464,8 @@ class ScriptedDieController:
         go_home = ((ph == int(Phase.RETREAT)) & (g_pres[:, 2] > h["retreat_h"] - 0.02)) | (ph == int(Phase.DONE))
         tgt = torch.where(go_home[:, None], self._retreat.expand(self.n, -1), tgt)
         tgt = torch.maximum(torch.minimum(tgt, self.tick_hi[:N_ARM_JOINTS]), self.tick_lo[:N_ARM_JOINTS])
+        if comp:
+            tgt = self._deadband_offset(tgt, present[:, :N_ARM_JOINTS], ph)
         delta = (tgt - goal[:, :N_ARM_JOINTS]).to(f64)
         md = self.max_delta[:N_ARM_JOINTS]
         scale = torch.clamp((md / delta.abs().clamp_min(1e-9)).amin(dim=1, keepdim=True), max=1.0)
@@ -403,6 +480,50 @@ class ScriptedDieController:
         out = torch.where((ph == int(Phase.DONE))[:, None] & (delta.abs().amax(1, keepdim=True) == 0),
                           torch.zeros_like(out), out)  # fmt: skip
         return out.clamp(-1.0, 1.0).to(torch.float32)
+
+    _COMP_PHASES: Final[tuple[int, ...]] = (int(Phase.OPEN_ABOVE), int(Phase.DESCEND), int(Phase.LIFT), int(Phase.CARRY),
+                                            int(Phase.LOWER))  # fmt: skip
+
+    def _deadband_offset(self, tgt: torch.Tensor, present: torch.Tensor, ph: torch.Tensor) -> torch.Tensor:
+        """The arm command ``tgt + offset`` of the deadband compensation (module docstring); updates the offset and
+        the previous-step state. ``tgt`` (the IK target, inside the joint limits) / ``present`` int64 ``[N, 5]``,
+        ``ph`` the new phase."""
+        p = self.p
+        active = torch.zeros_like(ph, dtype=torch.bool)
+        for k in self._COMP_PHASES:
+            active |= ph == k
+        keep = (active & (ph == self._comp_phase))[:, None]  # a new phase (or no compensation in it) starts at 0
+        still = self._comp_has_prev[:, None] & ((tgt - self._comp_prev_tgt).abs() <= p.comp_rest_ticks)
+        stopped = self._comp_has_prev[:, None] & ((present - self._comp_prev_present).abs() <= p.comp_static_ticks)
+        err = tgt - present
+        zero = torch.zeros_like(self.comp_offset)
+        on = keep & still
+        off = torch.where(on, self.comp_offset, zero)
+        wait = torch.where(on, (self._comp_wait - 1).clamp_min(0), zero)
+        grow = on & stopped & (wait == 0) & (err.abs() > p.comp_band_ticks)
+        off = torch.where(grow, off + torch.round(p.comp_gain * err.to(torch.float64)).to(torch.int64), off)
+        wait = torch.where(grow, p.comp_wait_steps, wait)
+        off = torch.maximum(torch.minimum(off, self.comp_bound), -self.comp_bound)
+        lo, hi = self.tick_lo[:N_ARM_JOINTS], self.tick_hi[:N_ARM_JOINTS]
+        # never put G of the command below comp_min_h over the table, nor below G of the target if that is lower
+        # (the box would revert the whole command): the largest of off x (1, 1/2, 1/4, 0) that keeps it there
+        z_floor = self.grasp_point(tgt)[:, 2].clamp_max(self._comp_min_z)
+        fracs = (1.0, 0.5, 0.25, 0.0)
+        cand = torch.stack([torch.maximum(torch.minimum(tgt + torch.round(off.to(torch.float64) * f).to(torch.int64), hi), lo)
+                            for f in fracs], dim=1)  # [N, 4, 5]  # fmt: skip
+        z = self.grasp_point(cand.reshape(-1, N_ARM_JOINTS))[:, 2].reshape(self.n, len(fracs))
+        ok = z >= z_floor[:, None] - 1e-9
+        ok[:, -1] = True  # the uncompensated target is always allowed
+        pick = ok.to(torch.int64).argmax(dim=1)  # the first (largest) allowed fraction
+        cmd = cand[torch.arange(self.n, device=self.device), pick]
+        self.comp_offset = cmd - tgt  # what was really added
+        self._comp_wait = wait
+        self._comp_still = still
+        self._comp_prev_present = present.clone()
+        self._comp_prev_tgt = tgt.clone()
+        self._comp_has_prev = torch.ones_like(self._comp_has_prev)
+        self._comp_phase = ph.clone()
+        return cmd
 
     def _jaw_yaw(self, ticks: torch.Tensor) -> torch.Tensor:
         T = gripper_fk(self._chain_T, self._ticks_to_rad(ticks[:, :N_ARM_JOINTS]))

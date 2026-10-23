@@ -445,3 +445,22 @@ def test_fiducial_of_another_camera_is_refused(tmp_path):
     code = pp.main(["--backend", "sim", "--fiducial-yaml", str(p), "--shm-name", _name(), "--summary", str(summary),
                     "--max-frames", "1"])  # fmt: skip
     assert code == pp.EXIT_CALIB and "recorded with camera 1" in json.loads(summary.read_text())["exit_reason"]
+
+
+def test_plane_defers_to_a_passing_fiducial_only_when_asked(calib, fid_frames):
+    """``--plane-defers-to-fiducial`` (off by default, plan §10 2026-10-23): a fiducial check of the same update that
+    found the marker and passed stands in for the plane (a lifted camera then goes unseen while the marker is in view:
+    hence off by default); without that evidence the plane decides again, and a latched plane stays latched."""
+    f = fid_frames
+    lifted = f["depth"] + 0.02
+    default = pp.CameraMovedGate(pp.TablePlaneCheck(calib), f["check"]())
+    assert not default.plane_defers_to_fiducial and not default.update(lifted, f["on"])
+    gate = pp.CameraMovedGate(pp.TablePlaneCheck(calib), f["check"](), plane_defers_to_fiducial=True)
+    assert gate.update(lifted, f["on"]) and gate.deferred == 1 and gate.checks == 0
+    assert not gate.update(lifted, f["gone"])  # no marker: the plane runs and fails
+    assert gate.update(lifted, f["on"])  # deferred again (not latched: 1 failure)
+    rep = gate.report()["table_plane"]
+    assert rep["defers_to_fiducial"] and rep["deferred"] == 2 and rep["fails"] == 1
+    for _ in range(pp.PLANE_TRIP_AFTER):
+        gate.update(lifted, f["gone"])
+    assert gate.tripped and not gate.update(lifted, f["on"])  # latched: a fiducial pass does not clear it

@@ -252,3 +252,39 @@ def test_goal_clipped_to_calibrated_position_limits(bus, calibration):
     tight = ctrl()[0]
     assert tight == pytest.approx(bus.ticks_to_q(lo + 10)[0], abs=1e-12)
     assert tight != pytest.approx(above[0], abs=1e-6)
+
+
+def test_deadband_is_the_sysid_target_hysteresis(calibration, cfg):
+    """``deadband_ticks`` (the feasibility twin, plan §10 2026-10-23): the held goal starts at the present position,
+    moves only when the written goal leaves ±band around it and then follows it to the band edge -- exactly
+    ``sim/sysid/params.apply_deadband`` on the written stream; the default (None) is the ideal servo."""
+    from so101_rl.sim.sysid.params import MEASURED_DEADBAND_TICKS, apply_deadband
+
+    band = np.asarray(MEASURED_DEADBAND_TICKS)
+    model, data = load_model()
+    b = MujocoBus(model, data, calibration, cfg, deadband_ticks=band)
+    b.connect()
+    b.reset_to_keyframe("home")
+    start = _hold_ticks(b).astype(np.int64)
+    rng = np.random.default_rng(0)
+    steps = np.cumsum(rng.integers(-25, 26, size=(40, 6)), axis=0)
+    goals = np.clip(start + steps, 1000, 3000)
+    lo = np.array([calibration[n].range_min for n in JOINT_NAMES])
+    hi = np.array([calibration[n].range_max for n in JOINT_NAMES])
+    goals = np.clip(goals, lo, hi)
+    want = apply_deadband(goals, band, initial=start)
+    ctrl_lo, ctrl_hi = model.actuator_ctrlrange[b.act_ids].T
+    for g, w in zip(goals, want, strict=True):
+        assert b.write_goal(g.astype(np.int32))
+        np.testing.assert_allclose(b.data.ctrl[b.act_ids], np.clip(b.ticks_to_q(w), ctrl_lo, ctrl_hi), atol=1e-12)
+    # a goal inside the band of the held value does not move the actuator target
+    held = want[-1]
+    b.write_goal((held + band // 2).astype(np.int32))
+    np.testing.assert_allclose(b.data.ctrl[b.act_ids], np.clip(b.ticks_to_q(held), ctrl_lo, ctrl_hi), atol=1e-12)
+    # a keyframe reset starts the hysteresis again from the present position
+    b.reset_to_keyframe("home")
+    assert b._held is None
+    ideal = MujocoBus(model, mujoco.MjData(model), calibration, cfg)
+    assert not ideal.deadband_ticks.any()
+    with pytest.raises(ValueError):
+        MujocoBus(model, data, calibration, cfg, deadband_ticks=[1, 2, 3])
